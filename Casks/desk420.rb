@@ -1,6 +1,6 @@
 cask "desk420" do
   version "0.1.0"
-  sha256 :no_check # Updated automatically by .github/workflows/release.yml on each v* tag
+  sha256 "96831f4696d54197c7c8d757850a2be4e058cc1e7601cb12ac2881f6beeecd07"
 
   url "https://github.com/netdur/desk420/releases/download/v#{version}/Desk420-#{version}-arm64.dmg"
   name "Desk420"
