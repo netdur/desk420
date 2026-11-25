@@ -1,0 +1,21 @@
+// src/main.cplus — Desk420 macOS entry point.
+//
+// Hands straight off to `app::run`; `facet_runtime` selects the AppKit backend
+// automatically, and `src/app.cplus` wires the windows, menus, and agent surface.
+
+import "stdlib/env" as env;
+import "stdlib/option" as option;
+
+import "./app" as app;
+
+fn main() -> i32 {
+    var require_consent: bool = false;
+    if env::argc() >= (2 as usize) {
+        if let option::Option::Some(flag) = env::arg(1 as usize) {
+            if flag.equals("--require-consent") {
+                require_consent = true;
+            }
+        }
+    }
+    return app::run(require_consent: require_consent);
+}

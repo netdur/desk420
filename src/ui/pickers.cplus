@@ -1,0 +1,175 @@
+// src/ui/pickers.cplus — what the Model / Effort / Approvals / Project chips
+// offer and which entry is current, said once for Home and Conversation.
+//
+// Each `fill_*` writes the popup behind a chip (style::picker_chip) and its
+// visible value label, and returns the values the indices stand for, which
+// the screen keeps to answer its own selection handler.
+
+import "facet/popup" as m_popup;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "../engine/runtime" as engine;
+import "../store/conversation" as conversation;
+import "../store/sessions" as sessions;
+import "./style" as style;
+
+// Separators and the folder chooser ride in the same value list as the
+// projects, so a selection handler can tell them apart.
+const SEP: str = "__sep__";
+const CHOOSE: str = "__choose__";
+
+// Prompt for a folder, remember it as a project, select it, and start a fresh run there.
+fn choose_and_open_project() {
+    if let option::Option::Some(dir) = runtime::choose_directory() {
+        sessions::add_project(dir.view());
+        sessions::set_selected_project(dir.view());
+        engine::new_chat(cwd: dir.view());
+    }
+}
+
+fn _install(key: str, take names: vocab::TextList, selected: i64, shown: str) {
+    if let option::Option::Some(p) = m_popup::find(key) {
+        let _p: m_popup::Popup = p.set_items(names).set_selected_index(selected);
+    }
+    let value_key: text::Text = "${key}:value";
+    style::set_label(value_key.view(), shown);
+}
+
+// Model or Effort, from the active session's config options, else the
+// defaults Grok 1.0.92 offers, with the choice made on Home (if any) current.
+fn fill_config(key: str, config_id: str) -> vec::Vec[text::Text] {
+    var names: vocab::TextList = vocab::TextList::new();
+    var values: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var sel: i64 = -1 as i64;
+    var shown: text::Text = text::from_str("");
+
+    let sid: text::Text = engine::active_session_id();
+    if !sid.is_empty() {
+        let opts: vec::Vec[types::ConfigOption] = conversation::config_options(sid.view());
+        var ci: usize = 0 as usize;
+        while ci < opts.count() {
+            if let option::Option::Some(co) = opts.at_ptr(ci) {
+                if (*co).id.equals(config_id) {
+                    var j: usize = 0 as usize;
+                    while j < (*co).choices.count() {
+                        if let option::Option::Some(ch) = (*co).choices.at_ptr(j) {
+                            let _ = names.add((*ch).name.view());
+                            let _ = values.append((*ch).value.clone());
+                            if (*ch).value.equals((*co).current_value.view()) {
+                                sel = j as i64;
+                                shown = (*ch).name.clone();
+                            }
+                        }
+                        j = j +% (1 as usize);
+                    }
+                }
+            }
+            ci = ci +% (1 as usize);
+        }
+    }
+
+    if values.count() == (0 as usize) {
+        if config_id == "model" {
+            let _ = names.add("Grok 4.7"); let _ = values.append(text::from_str("grok-4.7"));
+            let _ = names.add("Grok 4.7 Fast"); let _ = values.append(text::from_str("grok-4.7-build-fast"));
+            let _ = names.add("Grok 4.6"); let _ = values.append(text::from_str("grok-4.6"));
+            let _ = names.add("Grok 4.5"); let _ = values.append(text::from_str("grok-4.5"));
+        } else {
+            let _ = names.add("Extra High"); let _ = values.append(text::from_str("xhigh"));
+            let _ = names.add("High"); let _ = values.append(text::from_str("high"));
+            let _ = names.add("Medium"); let _ = values.append(text::from_str("medium"));
+            let _ = names.add("Low"); let _ = values.append(text::from_str("low"));
+        }
+        let want: text::Text = engine::pending_config(config_id);
+        let fallback: i64 = if config_id == "model" { 0 as i64 } else { 1 as i64 };
+        sel = fallback;
+        var k: usize = 0 as usize;
+        while k < values.count() {
+            if let option::Option::Some(vp) = values.at_ptr(k) {
+                if !want.is_empty() && (*vp).equals(want.view()) { sel = k as i64; }
+            }
+            k = k +% (1 as usize);
+        }
+        shown = text::from_str(names.at(sel as usize));
+    }
+
+    _install(key, names, sel, shown.view());
+    return values;
+}
+
+// Approvals: the engine's mode, in the order ApprovalMode::from_index reads.
+fn fill_mode(key: str) {
+    var names: vocab::TextList = vocab::TextList::new();
+    let _ = names.add("Ask");
+    let _ = names.add("Auto-approve");
+    let _ = names.add("Custom");
+    let idx: i64 = engine::approval_mode().to_index();
+    let shown: str = mode_name(engine::approval_mode());
+    _install(key, names, idx, shown);
+}
+
+fn mode_name(m: engine::ApprovalMode) -> str {
+    return match m {
+        engine::ApprovalMode::Ask => "Ask",
+        engine::ApprovalMode::AutoApprove => "Auto-approve",
+        engine::ApprovalMode::Custom => "Custom",
+    };
+}
+
+// Project: "General chat", every known folder, then "Choose folder…".
+fn fill_project(key: str) -> vec::Vec[text::Text] {
+    let cur_cwd: text::Text = engine::active_cwd();
+    let sel_proj: text::Text = sessions::selected_project();
+    let effective: text::Text = if !cur_cwd.is_empty() && !cur_cwd.contains(".desk420/") {
+        cur_cwd
+    } else {
+        sel_proj
+    };
+
+    let all_projs: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+    var names: vocab::TextList = vocab::TextList::new();
+    var paths: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var sel: i64 = 0 as i64;
+    var shown: text::Text = text::from_str("General chat");
+
+    let _ = names.add("General chat");
+    let _ = paths.append(text::from_str(""));
+    if all_projs.count() > (0 as usize) {
+        let _ = names.add("");
+        let _ = paths.append(text::from_str(SEP));
+        var pi: usize = 0 as usize;
+        while pi < all_projs.count() {
+            if let option::Option::Some(pp) = all_projs.at_ptr(pi) {
+                let slot: i64 = paths.count() as i64;
+                let _ = names.add((*pp).name.view());
+                let _ = paths.append((*pp).path.clone());
+                if !effective.is_empty() && (*pp).path.equals(effective.view()) {
+                    sel = slot;
+                    shown = (*pp).name.clone();
+                }
+            }
+            pi = pi +% (1 as usize);
+        }
+    }
+    let _ = names.add("");
+    let _ = paths.append(text::from_str(SEP));
+    let _ = names.add("Choose folder…");
+    let _ = paths.append(text::from_str(CHOOSE));
+
+    _install(key, names, sel, shown.view());
+    return paths;
+}
+
+// The value at a popup's current index, or empty.
+fn picked(key: str, values: vec::Vec[text::Text]) -> text::Text {
+    guard let option::Option::Some(p) = m_popup::find(key) else { return text::from_str(""); };
+    let idx: i64 = p.selected_index();
+    if idx < (0 as i64) { return text::from_str(""); }
+    guard let option::Option::Some(vp) = values.at_ptr(idx as usize) else { return text::from_str(""); };
+    return (*vp).clone();
+}

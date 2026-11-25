@@ -1,0 +1,1136 @@
+// src/browser/mcp_server.cplus — loopback HTTP MCP server (`desk420-browser`).
+//
+// Exposes the Desk420 built-in Browser pane to `grok agent stdio` over
+// loopback HTTP (`http://127.0.0.1:<port>/mcp`) with a per-launch Bearer token,
+// following the exact HTTP MCP protocol recorded in `fixtures/acp/grok-1.0.92-main.jsonl`.
+//
+// Tool execution hops to the main UI thread via `services::run_on_main`, drives
+// `BrowserPane` + `facet/web_driver`, and returns results over a one-shot
+// channel so the main thread never blocks on network I/O.
+
+import "facet/facet" as core;
+import "facet/services" as services;
+import "facet/web_driver" as web_driver;
+import "json/json" as json;
+import "stdlib/base64" as base64;
+import "stdlib/box" as box;
+import "stdlib/channel" as channel;
+import "stdlib/crypto" as crypto;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/net" as net;
+import "stdlib/option" as option;
+import "stdlib/process" as process;
+import "stdlib/result" as result;
+import "stdlib/string_set" as string_set;
+import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/time" as time;
+import "stdlib/url" as url;
+import "stdlib/vec" as vec;
+
+import "../ui/browser_pane" as browser_pane;
+
+// ───────────────────────────── origin safety policy ─────────────────────────────
+
+fn _is_loopback_host(host: str) -> bool {
+    let low: text::Text = text::from_str(host).lowercased();
+    let h: str = low.view();
+    return h == "localhost" || h == "127.0.0.1" || h == "::1";
+}
+
+fn _contains_parent_traversal(s: str) -> bool {
+    return s.contains("/../") || s.has_suffix("/..") || s.has_prefix("../") || s == "..";
+}
+
+// Return the normalized lowercased origin ("scheme://host[:port]") for an
+// http(s) URL, or "" if `raw_url` cannot be parsed or has no host.
+fn extract_origin(raw_url: str) -> text::Text {
+    guard let option::Option::Some(u) = url::parse(raw_url.trim()) else {
+        return text::from_str("");
+    };
+    if !u.is_web() || u.host.is_empty() {
+        return text::from_str("");
+    }
+    let sch: text::Text = text::from_str(u.scheme).lowercased();
+    let host: text::Text = text::from_str(u.host).lowercased();
+    let host_part: text::Text = if host.contains(":") {
+        "[${host.view()}]"
+    } else {
+        host
+    };
+    if u.port > (0 as u16) {
+        return "${sch.view()}://${host_part.view()}:${u.port}";
+    }
+    return "${sch.view()}://${host_part.view()}";
+}
+
+// Check whether the agent may open `raw_url` under the current approval mode and
+// conversation working directory. Returns "" when allowed, or a human-readable
+// refusal reason when blocked.
+fn check_url_policy(raw_url: str, cwd: str, auto_approve: bool) -> text::Text {
+    let trimmed: str = raw_url.trim();
+    if trimmed.is_empty() { return text::from_str("Refused: empty URL."); }
+    let low: text::Text = text::from_str(trimmed).lowercased();
+    if low.view().has_prefix("javascript:") || low.view().has_prefix("data:") {
+        return text::from_str("Refused: javascript: and data: URLs are not permitted.");
+    }
+    guard let option::Option::Some(u) = url::parse(trimmed) else {
+        return text::from_str("Refused: malformed URL.");
+    };
+    if u.is_scheme("file") {
+        if cwd.is_empty() {
+            return text::from_str("Refused: file:// URLs require an active project folder.");
+        }
+        if _contains_parent_traversal(trimmed) || _contains_parent_traversal(u.path) {
+            return text::from_str("Refused: file:// path traversal is not permitted.");
+        }
+        let decoded_path: text::Text = url::decode(u.path);
+        if _contains_parent_traversal(decoded_path.view()) {
+            return text::from_str("Refused: file:// path traversal is not permitted.");
+        }
+        let prefix: text::Text = "file://${cwd}";
+        if !trimmed.has_prefix(prefix.view()) {
+            return text::from_str("Refused: file:// URLs are restricted to the conversation's project folder.");
+        }
+        return text::from_str("");
+    }
+    if !u.is_web() || u.host.is_empty() {
+        return text::from_str("Refused: only http://, https://, and project-local file:// URLs are supported.");
+    }
+    if _is_loopback_host(u.host) {
+        return text::from_str("");
+    }
+    if auto_approve {
+        return text::from_str("");
+    }
+    return text::from_str("Origin blocked in Ask mode (localhost and 127.0.0.1 are always allowed). Switch Approvals to Auto-approve or open this URL directly in the Browser tab.");
+}
+
+// ───────────────────────────── JS scripts ─────────────────────────────
+
+const SNAPSHOT_JS: str = "(function(){var sels='a[href],button,input,textarea,select,[role=\"button\"],[role=\"link\"],[tabindex]';var nodes=Array.prototype.slice.call(document.querySelectorAll(sels));var els=[];var n=0;for(var i=0;i<nodes.length&&els.length<60;i++){var el=nodes[i];var r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)continue;n++;var ref='e'+n;el.setAttribute('data-d420-ref',ref);var tag=el.tagName.toLowerCase();var lbl=(el.getAttribute('aria-label')||el.innerText||el.value||el.placeholder||el.getAttribute('title')||'').replace(/\\s+/g,' ').trim().slice(0,80);var extra='';if(tag==='input'){extra=' type='+(el.type||'text');if(el.value)extra+=' val='+JSON.stringify(String(el.value).slice(0,40));}els.push('['+ref+'] '+tag+extra+(lbl?' \"'+lbl+'\"':''));}var txt=(document.body?document.body.innerText:'').replace(/\\n{3,}/g,'\\n\\n').trim();if(txt.length>4000)txt=txt.slice(0,4000)+'\\n...[truncated]';return JSON.stringify({title:document.title||'',url:location.href||'',text:txt,elements:els});})()";
+
+const CONSOLE_DRAIN_JS: str = "(function(){var out=(window.__d420_logs||[]).slice();window.__d420_logs=[];return JSON.stringify(out);})()";
+
+const NETWORK_DRAIN_JS: str = "(function(){var out=(window.__d420_net||[]).slice();window.__d420_net=[];return JSON.stringify(out);})()";
+
+const VIEWPORT_SIZE_JS: str = "(function(){return JSON.stringify({width:window.innerWidth||0,height:window.innerHeight||0,url:location.href||''});})()";
+
+fn _js_escape(s: str) -> text::Text {
+    return json::Value::text(s).to_text();
+}
+
+fn _click_js(ref_id: str) -> text::Text {
+    let q: text::Text = _js_escape(ref_id);
+    return "(function(){var el=document.querySelector('[data-d420-ref='+${q.view()}+']');if(!el)return JSON.stringify({ok:false,error:'Element '+${q.view()}+' not found. Run browser_snapshot first.'});el.scrollIntoView({block:'center',inline:'center'});var prevO=el.style.outline,prevOff=el.style.outlineOffset,prevSh=el.style.boxShadow;el.style.outline='2px solid #c9f257';el.style.outlineOffset='2px';el.style.boxShadow='0 0 0 4px rgba(201,242,87,0.35)';setTimeout(function(){el.style.outline=prevO;el.style.outlineOffset=prevOff;el.style.boxShadow=prevSh;},650);el.click();return JSON.stringify({ok:true,tag:el.tagName.toLowerCase(),text:(el.innerText||el.value||'').trim().slice(0,80),url:location.href,title:document.title});})()";
+}
+
+fn _press_js(key_name: str) -> text::Text {
+    let qk: text::Text = _js_escape(key_name);
+    return "(function(){var k=${qk.view()};var el=document.activeElement||document.body;var ev={key:k,code:k,bubbles:true,cancelable:true};el.dispatchEvent(new KeyboardEvent('keydown',ev));el.dispatchEvent(new KeyboardEvent('keypress',ev));if(k==='Enter'){if(el&&el.form){if(el.form.requestSubmit)el.form.requestSubmit();else el.form.submit();}else if(el&&(el.tagName==='BUTTON'||el.tagName==='A')){el.click();}}else if(k===' '&&el&&el.tagName==='BUTTON'){el.click();}el.dispatchEvent(new KeyboardEvent('keyup',ev));return JSON.stringify({ok:true,key:k,target:el?el.tagName.toLowerCase():'',url:location.href,title:document.title});})()";
+}
+
+fn _contains_text_js(needle: str) -> text::Text {
+    let qn: text::Text = _js_escape(needle);
+    return "(function(){var t=(document.body?document.body.innerText:'')||'';return t.indexOf(${qn.view()})>=0?'1':'0';})()";
+}
+
+fn _type_js(ref_id: str, value: str, submit: bool) -> text::Text {
+    let q_ref: text::Text = _js_escape(ref_id);
+    let q_val: text::Text = _js_escape(value);
+    let sub: str = if submit { "true" } else { "false" };
+    return "(function(){var el=document.querySelector('[data-d420-ref='+${q_ref.view()}+']');if(!el)return JSON.stringify({ok:false,error:'Element '+${q_ref.view()}+' not found. Run browser_snapshot first.'});el.scrollIntoView({block:'center',inline:'center'});el.focus();var val=${q_val.view()};var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set){desc.set.call(el,val);}else{el.value=val;}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));if(${sub}){el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true}));if(el.form){if(el.form.requestSubmit)el.form.requestSubmit();else el.form.submit();}}return JSON.stringify({ok:true,value:String(el.value||''),url:location.href});})()";
+}
+
+fn _eval_wrap_js(code: str) -> text::Text {
+    let q: text::Text = _js_escape(code);
+    return "(function(){try{var __r=(0,eval)(${q.view()});if(__r===undefined)return 'undefined';if(typeof __r==='string')return __r;return JSON.stringify(__r);}catch(e){return 'Error: '+(e&&e.message?e.message:String(e));}})()";
+}
+
+// ───────────────────────────── main-thread bridge ─────────────────────────────
+
+struct _ToolReply {
+    ok: bool,
+    is_image: bool,
+    data: text::Text,
+    policy_cwd: text::Text,
+    policy_sid: text::Text,
+    policy_auto: bool,
+}
+
+fn _reply_text(ok: bool, data: str) -> _ToolReply {
+    return _ToolReply {
+        ok: ok,
+        is_image: false,
+        data: text::from_str(data),
+        policy_cwd: text::from_str(""),
+        policy_sid: text::from_str(""),
+        policy_auto: false,
+    };
+}
+
+enum _MainOp {
+    OpenUrl(text::Text, bool),           // url, new_tab
+    EvalJs(text::Text),                  // js
+    Screenshot,
+    CheckLoading,
+    ResizeViewport(f64, f64),            // width, height
+    RequestOriginApproval(text::Text),   // origin
+    TabsOp(text::Text, i64, text::Text), // action, index, url
+    ReadPolicy(text::Text),              // origin
+    RememberOrigin(text::Text, text::Text), // sid, origin
+}
+
+struct _MainWork {
+    op: _MainOp,
+    tx: channel::Channel[_ToolReply],
+}
+
+fn _on_js_reply(ok: bool, res: str, raw_ctx: *u8) {
+    if raw_ctx.is_null() { return; }
+    let ch: channel::Channel[_ToolReply] = box::from_raw::[channel::Channel[_ToolReply]](raw_ctx).unwrap();
+    let _ = ch.send(_reply_text(ok, res));
+}
+
+fn _on_snap_reply(ok: bool, bytes: *u8, len: usize, raw_ctx: *u8) {
+    if raw_ctx.is_null() { return; }
+    let ch: channel::Channel[_ToolReply] = box::from_raw::[channel::Channel[_ToolReply]](raw_ctx).unwrap();
+    if !ok || bytes.is_null() || len == (0 as usize) {
+        let _ = ch.send(_reply_text(false, "Failed to capture browser screenshot."));
+        return;
+    }
+    let b64: text::Text = base64::encode_bytes(bytes, len);
+    let _ = ch.send(_ToolReply {
+        ok: true,
+        is_image: true,
+        data: b64,
+        policy_cwd: text::from_str(""),
+        policy_sid: text::from_str(""),
+        policy_auto: false,
+    });
+}
+
+fn _on_origin_decision(allowed: bool, raw_ctx: *u8) {
+    if raw_ctx.is_null() { return; }
+    let ch: channel::Channel[_ToolReply] = box::from_raw::[channel::Channel[_ToolReply]](raw_ctx).unwrap();
+    let _ = ch.send(_reply_text(allowed, if allowed { "allowed" } else { "denied" }));
+}
+
+fn _run_main_work(raw: *u8) {
+    if raw.is_null() { return; }
+    let work: _MainWork = box::from_raw::[_MainWork](raw).unwrap();
+    match work.op {
+        _MainOp::CheckLoading => {
+            let loading: bool = browser_pane::is_loading();
+            let _ = work.tx.send(_reply_text(true, if loading { "1" } else { "0" }));
+            return;
+        }
+        _MainOp::ReadPolicy(origin) => {
+            let cwd: text::Text = _current_cwd_main();
+            let sid: text::Text = _current_sid_main();
+            let auto_ok: bool = _current_auto_main() || _origin_allowed_main(sid.view(), origin.view());
+            let _ = work.tx.send(_ToolReply {
+                ok: true,
+                is_image: false,
+                data: text::from_str(""),
+                policy_cwd: cwd,
+                policy_sid: sid,
+                policy_auto: auto_ok,
+            });
+            return;
+        }
+        _MainOp::RememberOrigin(sid, origin) => {
+            _remember_origin_main(sid.view(), origin.view());
+            let _ = work.tx.send(_reply_text(true, "ok"));
+            return;
+        }
+        _MainOp::OpenUrl(target_url, new_tab) => {
+            if browser_pane::is_taken_over() {
+                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
+                return;
+            }
+            browser_pane::agent_open_url(target_url.view(), new_tab: new_tab);
+            let _ = work.tx.send(_reply_text(true, "opened"));
+            return;
+        }
+        _MainOp::TabsOp(act, idx, u) => {
+            if browser_pane::is_taken_over() {
+                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
+                return;
+            }
+            let res_json: text::Text = browser_pane::agent_tabs_op(act.view(), idx, u.view());
+            let _ = work.tx.send(_reply_text(true, res_json.view()));
+            return;
+        }
+        _MainOp::RequestOriginApproval(origin) => {
+            if browser_pane::is_taken_over() {
+                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
+                return;
+            }
+            browser_pane::show_for_agent();
+            if !browser_pane::has_active_browser() {
+                let _ = work.tx.send(_reply_text(false, "no_browser"));
+                return;
+            }
+            match box::new::[channel::Channel[_ToolReply]](work.tx.clone()) {
+                option::Option::Some(b) => {
+                    browser_pane::request_origin_approval(origin.view(), _on_origin_decision, b.into_raw() as *u8);
+                }
+                option::Option::None => {
+                    let _ = work.tx.send(_reply_text(false, "out of memory"));
+                }
+            }
+            return;
+        }
+        _MainOp::ResizeViewport(w, h) => {
+            if browser_pane::is_taken_over() {
+                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
+                return;
+            }
+            browser_pane::show_for_agent();
+            if browser_pane::web_node().is_null() {
+                let _ = work.tx.send(_reply_text(false, "No active conversation browser tab is mounted."));
+                return;
+            }
+            browser_pane::set_viewport_size(w, h);
+            let _ = work.tx.send(_reply_text(true, "resized"));
+            return;
+        }
+        _MainOp::EvalJs(js) => {
+            if browser_pane::is_taken_over() {
+                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
+                return;
+            }
+            browser_pane::show_for_agent();
+            let wn: *core::Node = browser_pane::web_node();
+            if wn.is_null() {
+                let _ = work.tx.send(_reply_text(false, "No active conversation browser tab is mounted."));
+                return;
+            }
+            match box::new::[channel::Channel[_ToolReply]](work.tx.clone()) {
+                option::Option::Some(b) => {
+                    web_driver::eval_js(wn, js.view(), _on_js_reply, b.into_raw() as *u8);
+                }
+                option::Option::None => {
+                    let _ = work.tx.send(_reply_text(false, "out of memory"));
+                }
+            }
+            return;
+        }
+        _MainOp::Screenshot => {
+            if browser_pane::is_taken_over() {
+                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
+                return;
+            }
+            browser_pane::show_for_agent();
+            let wn: *core::Node = browser_pane::web_node();
+            if wn.is_null() {
+                let _ = work.tx.send(_reply_text(false, "No active conversation browser tab is mounted."));
+                return;
+            }
+            match box::new::[channel::Channel[_ToolReply]](work.tx.clone()) {
+                option::Option::Some(b) => {
+                    web_driver::snapshot_png(wn, _on_snap_reply, b.into_raw() as *u8);
+                }
+                option::Option::None => {
+                    let _ = work.tx.send(_reply_text(false, "out of memory"));
+                }
+            }
+            return;
+        }
+    }
+}
+
+fn _call_main_timeout(take op: _MainOp, max_ms: i32) -> _ToolReply {
+    guard let option::Option::Some(ch) = channel::new::[_ToolReply]() else {
+        return _reply_text(false, "channel allocation failed");
+    };
+    let rx: channel::Channel[_ToolReply] = ch.clone();
+    match box::new::[_MainWork](_MainWork {
+        op: op,
+        tx: ch,
+    }) {
+        option::Option::Some(b) => {
+            services::run_on_main(_run_main_work, b.into_raw() as *u8);
+        }
+        option::Option::None => {
+            return _reply_text(false, "out of memory");
+        }
+    }
+    var waited: i32 = 0 as i32;
+    while waited < max_ms {
+        match rx.try_receive() {
+            channel::TryReceiveResult::Value(rep) => { return rep; }
+            _other => {}
+        }
+        time::sleep(20 as u64).wait();
+        waited = waited +% (20 as i32);
+    }
+    return _reply_text(false, "Timed out waiting for browser response.");
+}
+
+fn _call_main(take op: _MainOp) -> _ToolReply {
+    return _call_main_timeout(op, 8000 as i32);
+}
+
+fn _wait_for_load_settle() {
+    time::sleep(250 as u64).wait();
+    var waited: i32 = 0 as i32;
+    while waited < (4000 as i32) {
+        let rep: _ToolReply = _call_main(_MainOp::CheckLoading);
+        if rep.ok && rep.data.equals("0") {
+            time::sleep(150 as u64).wait();
+            return;
+        }
+        time::sleep(150 as u64).wait();
+        waited = waited +% (150 as i32);
+    }
+}
+
+// ───────────────────────────── policy context hooks (main thread only) ─────────────────────────────
+
+static CWD_FN: fn() -> text::Text = #zero::[fn() -> text::Text]();
+static AUTO_FN: fn() -> bool = #zero::[fn() -> bool]();
+static SID_FN: fn() -> text::Text = #zero::[fn() -> text::Text]();
+static _ALLOWED_ORIGINS: string_set::StringSet = #zero::[string_set::StringSet]();
+static _ALLOWED_INIT: bool = false;
+
+fn set_policy_hooks(cwd_fn: fn() -> text::Text, auto_fn: fn() -> bool, sid_fn: fn() -> text::Text) {
+    CWD_FN = cwd_fn;
+    AUTO_FN = auto_fn;
+    SID_FN = sid_fn;
+}
+
+fn _current_sid_main() -> text::Text {
+    let f: fn() -> text::Text = SID_FN;
+    if f.is_null() { return text::from_str(""); }
+    return f();
+}
+
+fn _origin_allowed_main(sid: str, origin: str) -> bool {
+    if !_ALLOWED_INIT || origin == "" { return false; }
+    let key: text::Text = "${sid}|${origin}";
+    return _ALLOWED_ORIGINS.contains(key.view());
+}
+
+fn _remember_origin_main(sid: str, origin: str) {
+    if origin == "" { return; }
+    if !_ALLOWED_INIT {
+        _ALLOWED_ORIGINS = string_set::new();
+        _ALLOWED_INIT = true;
+    }
+    let _ = _ALLOWED_ORIGINS.insert("${sid}|${origin}");
+}
+
+fn _current_cwd_main() -> text::Text {
+    let f: fn() -> text::Text = CWD_FN;
+    if f.is_null() { return text::from_str(""); }
+    return f();
+}
+
+fn _current_auto_main() -> bool {
+    let f: fn() -> bool = AUTO_FN;
+    if f.is_null() { return false; }
+    return f();
+}
+
+// ───────────────────────────── MCP JSON-RPC dispatch ─────────────────────────────
+
+fn _num_prop(desc: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("type", json::Value::text("number")));
+    let _ = m.append(json::Member::new("description", json::Value::text(desc)));
+    return json::Value::object(m);
+}
+
+fn _tool_schema_obj(take props: vec::Vec[json::Member], take req: vec::Vec[json::Value]) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("type", json::Value::text("object")));
+    let _ = m.append(json::Member::new("properties", json::Value::object(props)));
+    if req.count() > (0 as usize) {
+        let _ = m.append(json::Member::new("required", json::Value::array(req)));
+    }
+    return json::Value::object(m);
+}
+
+fn _str_prop(desc: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("type", json::Value::text("string")));
+    let _ = m.append(json::Member::new("description", json::Value::text(desc)));
+    return json::Value::object(m);
+}
+
+fn _bool_prop(desc: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("type", json::Value::text("boolean")));
+    let _ = m.append(json::Member::new("description", json::Value::text(desc)));
+    return json::Value::object(m);
+}
+
+fn _tool_def(name: str, desc: str, take schema: json::Value) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("name", json::Value::text(name)));
+    let _ = m.append(json::Member::new("description", json::Value::text(desc)));
+    let _ = m.append(json::Member::new("inputSchema", schema));
+    return json::Value::object(m);
+}
+
+fn _tools_list_result() -> json::Value {
+    var tools: vec::Vec[json::Value] = vec::new::[json::Value]();
+
+    // browser_open
+    var p1: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p1.append(json::Member::new("url", _str_prop("URL to open in the built-in browser (e.g. http://localhost:3000)")));
+    let _ = p1.append(json::Member::new("new_tab", _bool_prop("Set true to open the URL in a new browser tab")));
+    var r1: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = r1.append(json::Value::text("url"));
+    let _ = tools.append(_tool_def(
+        "browser_open",
+        "Open a URL in the Desk420 built-in browser tab, wait for it to load, and return page title, URL, visible text, and interactive element refs.",
+        _tool_schema_obj(p1, r1),
+    ));
+
+    // browser_snapshot
+    let _ = tools.append(_tool_def(
+        "browser_snapshot",
+        "Inspect the current Desk420 browser page: returns title, URL, visible text, and numbered interactive element refs ([e1], [e2], ...) for browser_click and browser_type.",
+        _tool_schema_obj(vec::new::[json::Member](), vec::new::[json::Value]()),
+    ));
+
+    // browser_click
+    var p3: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p3.append(json::Member::new("ref", _str_prop("Element ref from browser_snapshot, e.g. e1")));
+    var r3: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = r3.append(json::Value::text("ref"));
+    let _ = tools.append(_tool_def(
+        "browser_click",
+        "Click an interactive element in the Desk420 browser tab by its ref (e.g. e1 from browser_snapshot).",
+        _tool_schema_obj(p3, r3),
+    ));
+
+    // browser_type
+    var p4: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p4.append(json::Member::new("ref", _str_prop("Input element ref from browser_snapshot, e.g. e2")));
+    let _ = p4.append(json::Member::new("text", _str_prop("Text to type into the input element")));
+    let _ = p4.append(json::Member::new("submit", _bool_prop("Set true to press Enter / submit the form after typing")));
+    var r4: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = r4.append(json::Value::text("ref"));
+    let _ = r4.append(json::Value::text("text"));
+    let _ = tools.append(_tool_def(
+        "browser_type",
+        "Type text into an input or textarea in the Desk420 browser tab by its ref, optionally submitting.",
+        _tool_schema_obj(p4, r4),
+    ));
+
+    // browser_console
+    let _ = tools.append(_tool_def(
+        "browser_console",
+        "Read console.log, console.warn, console.error, uncaught exceptions, and failed fetch requests captured in the Desk420 browser tab since the last call.",
+        _tool_schema_obj(vec::new::[json::Member](), vec::new::[json::Value]()),
+    ));
+
+    // browser_eval
+    var p6: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p6.append(json::Member::new("js", _str_prop("JavaScript expression or snippet to evaluate in the page")));
+    var r6: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = r6.append(json::Value::text("js"));
+    let _ = tools.append(_tool_def(
+        "browser_eval",
+        "Evaluate JavaScript in the Desk420 built-in browser tab and return the serialized result.",
+        _tool_schema_obj(p6, r6),
+    ));
+
+    // browser_screenshot
+    let _ = tools.append(_tool_def(
+        "browser_screenshot",
+        "Take a PNG screenshot of the Desk420 built-in browser tab so you can visually inspect layout and rendering.",
+        _tool_schema_obj(vec::new::[json::Member](), vec::new::[json::Value]()),
+    ));
+
+    // browser_press
+    var p8: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p8.append(json::Member::new("key", _str_prop("Key name to press (e.g. Enter, Escape, Tab, ArrowDown)")));
+    var r8: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = r8.append(json::Value::text("key"));
+    let _ = tools.append(_tool_def(
+        "browser_press",
+        "Send a keyboard key press (Enter, Escape, Tab, etc.) to the focused element in the Desk420 browser tab.",
+        _tool_schema_obj(p8, r8),
+    ));
+
+    // browser_wait
+    var p9: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p9.append(json::Member::new("text", _str_prop("Wait until this text appears on the page (optional)")));
+    let _ = p9.append(json::Member::new("ms", _num_prop("Wait duration or timeout in milliseconds (max 5000)")));
+    let _ = tools.append(_tool_def(
+        "browser_wait",
+        "Wait for specific text to appear on the page or sleep for a given number of milliseconds.",
+        _tool_schema_obj(p9, vec::new::[json::Value]()),
+    ));
+
+    // browser_network
+    let _ = tools.append(_tool_def(
+        "browser_network",
+        "Read failed (HTTP >= 400 or network error) and slow (>= 500ms) fetch/XHR requests captured since the last call.",
+        _tool_schema_obj(vec::new::[json::Member](), vec::new::[json::Value]()),
+    ));
+
+    // browser_resize
+    var p11: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p11.append(json::Member::new("width", _num_prop("Target viewport width in points (0 resets to full pane)")));
+    let _ = p11.append(json::Member::new("height", _num_prop("Target viewport height in points (0 resets to full pane)")));
+    let _ = tools.append(_tool_def(
+        "browser_resize",
+        "Resize the Desk420 built-in browser viewport (e.g. 375x812 for phone layout, or 0x0 to reset to full pane).",
+        _tool_schema_obj(p11, vec::new::[json::Value]()),
+    ));
+
+    // browser_tabs
+    var p12: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = p12.append(json::Member::new("action", _str_prop("Tab action: list, new, select, or close")));
+    let _ = p12.append(json::Member::new("index", _num_prop("0-based tab index for select or close")));
+    let _ = p12.append(json::Member::new("url", _str_prop("Optional URL when action is new")));
+    var r12: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = r12.append(json::Value::text("action"));
+    let _ = tools.append(_tool_def(
+        "browser_tabs",
+        "List, open, switch between, or close tabs in the Desk420 built-in browser.",
+        _tool_schema_obj(p12, r12),
+    ));
+
+    var res: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = res.append(json::Member::new("tools", json::Value::array(tools)));
+    return json::Value::object(res);
+}
+
+fn _text_content_result(body: str, is_error: bool = false) -> json::Value {
+    var item: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = item.append(json::Member::new("type", json::Value::text("text")));
+    let _ = item.append(json::Member::new("text", json::Value::text(body)));
+    var content: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = content.append(json::Value::object(item));
+    var res: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = res.append(json::Member::new("content", json::Value::array(content)));
+    if is_error {
+        let _ = res.append(json::Member::new("isError", json::Value::boolean(true)));
+    }
+    return json::Value::object(res);
+}
+
+fn _image_content_result(b64_png: str) -> json::Value {
+    var item: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = item.append(json::Member::new("type", json::Value::text("image")));
+    let _ = item.append(json::Member::new("mimeType", json::Value::text("image/png")));
+    let _ = item.append(json::Member::new("data", json::Value::text(b64_png)));
+    var content: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = content.append(json::Value::object(item));
+    var res: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = res.append(json::Member::new("content", json::Value::array(content)));
+    return json::Value::object(res);
+}
+
+fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
+    if name == "browser_open" {
+        let raw_url: text::Text = args.field_str("url", "");
+        let norm_url: text::Text = browser_pane::normalize_url(raw_url.view());
+        let origin: text::Text = extract_origin(norm_url.view());
+        let pol: _ToolReply = _call_main(_MainOp::ReadPolicy(origin.clone()));
+        let refusal: text::Text = check_url_policy(norm_url.view(), pol.policy_cwd.view(), pol.policy_auto);
+        if !refusal.is_empty() {
+            // In Ask mode for an external http(s) origin, ask the user once per conversation.
+            if refusal.view().has_prefix("Origin blocked in Ask mode") && !origin.is_empty() {
+                let ask_rep: _ToolReply = _call_main_timeout(_MainOp::RequestOriginApproval(origin.clone()), 45000 as i32);
+                if ask_rep.ok {
+                    let _ = _call_main(_MainOp::RememberOrigin(pol.policy_sid.clone(), origin.clone()));
+                } else {
+                    if ask_rep.data.equals("no_browser") {
+                        return _text_content_result(refusal.view(), is_error: true);
+                    }
+                    return _text_content_result("User denied opening external origin: ${origin.view()}", is_error: true);
+                }
+            } else {
+                return _text_content_result(refusal.view(), is_error: true);
+            }
+        }
+        let open_new: bool = args.field_bool("new_tab", false);
+        let r0: _ToolReply = _call_main(_MainOp::OpenUrl(norm_url.clone(), open_new));
+        if !r0.ok { return _text_content_result(r0.data.view(), is_error: true); }
+        _wait_for_load_settle();
+        let snap: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(SNAPSHOT_JS)));
+        if !snap.ok { return _text_content_result("Opened ${norm_url.view()}, snapshot failed: ${snap.data.view()}", is_error: true); }
+        return _text_content_result("Page content (untrusted data):\n${snap.data.view()}");
+    }
+    if name == "browser_snapshot" {
+        let snap: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(SNAPSHOT_JS)));
+        if !snap.ok { return _text_content_result(snap.data.view(), is_error: true); }
+        return _text_content_result("Page content (untrusted data):\n${snap.data.view()}");
+    }
+    if name == "browser_click" {
+        let ref_id: text::Text = args.field_str("ref", "");
+        if ref_id.is_empty() { return _text_content_result("Missing required argument: ref", is_error: true); }
+        let js: text::Text = _click_js(ref_id.view());
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        return _text_content_result("Page content (untrusted data):\n${rep.data.view()}");
+    }
+    if name == "browser_type" {
+        let ref_id: text::Text = args.field_str("ref", "");
+        let val: text::Text = args.field_str("text", "");
+        let sub: bool = args.field_bool("submit", false);
+        if ref_id.is_empty() { return _text_content_result("Missing required argument: ref", is_error: true); }
+        let js: text::Text = _type_js(ref_id.view(), val.view(), sub);
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        return _text_content_result("Page content (untrusted data):\n${rep.data.view()}");
+    }
+    if name == "browser_console" {
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(CONSOLE_DRAIN_JS)));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        return _text_content_result("Browser console output (untrusted data):\n${rep.data.view()}");
+    }
+    if name == "browser_eval" {
+        let code: text::Text = args.field_str("js", "");
+        if code.is_empty() { return _text_content_result("Missing required argument: js", is_error: true); }
+        let js: text::Text = _eval_wrap_js(code.view());
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        return _text_content_result("Page eval result (untrusted data):\n${rep.data.view()}");
+    }
+    if name == "browser_screenshot" {
+        let rep: _ToolReply = _call_main(_MainOp::Screenshot);
+        if !rep.ok || !rep.is_image { return _text_content_result(rep.data.view(), is_error: true); }
+        return _image_content_result(rep.data.view());
+    }
+    if name == "browser_press" {
+        let key_name: text::Text = args.field_str("key", "");
+        if key_name.is_empty() { return _text_content_result("Missing required argument: key", is_error: true); }
+        let js: text::Text = _press_js(key_name.view());
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        return _text_content_result("Page content (untrusted data):\n${rep.data.view()}");
+    }
+    if name == "browser_wait" {
+        let needle: text::Text = args.field_str("text", "");
+        var ms: i64 = (args.field_number("ms", 0.0f64) as i64);
+        if ms <= (0 as i64) { ms = if needle.is_empty() { 500 as i64 } else { 3000 as i64 }; }
+        if ms > (5000 as i64) { ms = 5000 as i64; }
+        if needle.is_empty() {
+            time::sleep(ms as u64).wait();
+            return _text_content_result("Waited ${ms} ms.");
+        }
+        let check_js: text::Text = _contains_text_js(needle.view());
+        var elapsed: i64 = 0 as i64;
+        while elapsed <= ms {
+            let rep: _ToolReply = _call_main(_MainOp::EvalJs(check_js.clone()));
+            if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+            if rep.data.equals("1") {
+                return _text_content_result("Text appeared after ${elapsed} ms: ${needle.view()}");
+            }
+            time::sleep(150 as u64).wait();
+            elapsed = elapsed +% (150 as i64);
+        }
+        return _text_content_result("Timed out after ${ms} ms waiting for text: ${needle.view()}", is_error: true);
+    }
+    if name == "browser_network" {
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(NETWORK_DRAIN_JS)));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        return _text_content_result("Browser network log (untrusted data):\n${rep.data.view()}");
+    }
+    if name == "browser_resize" {
+        var w: i64 = (args.field_number("width", 0.0f64) as i64);
+        var h: i64 = (args.field_number("height", 0.0f64) as i64);
+        if w < (0 as i64) { w = 0 as i64; }
+        if h < (0 as i64) { h = 0 as i64; }
+        let r0: _ToolReply = _call_main(_MainOp::ResizeViewport(w as f64, h as f64));
+        if !r0.ok { return _text_content_result(r0.data.view(), is_error: true); }
+        time::sleep(120 as u64).wait();
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(VIEWPORT_SIZE_JS)));
+        if !rep.ok { return _text_content_result("Resized viewport to ${w}x${h}"); }
+        return _text_content_result("Viewport resized:\n${rep.data.view()}");
+    }
+    if name == "browser_tabs" {
+        let act: text::Text = args.field_str("action", "");
+        if act.is_empty() { return _text_content_result("Missing required argument: action", is_error: true); }
+        let idx: i64 = (args.field_number("index", 0.0f64) as i64);
+        let raw_u: text::Text = args.field_str("url", "");
+        var norm_u: text::Text = text::from_str("");
+        if act.equals("new") && !raw_u.is_empty() {
+            norm_u = browser_pane::normalize_url(raw_u.view());
+            let orig: text::Text = extract_origin(norm_u.view());
+            let pol: _ToolReply = _call_main(_MainOp::ReadPolicy(orig.clone()));
+            let ref_msg: text::Text = check_url_policy(norm_u.view(), pol.policy_cwd.view(), pol.policy_auto);
+            if !ref_msg.is_empty() { return _text_content_result(ref_msg.view(), is_error: true); }
+        }
+        let rep: _ToolReply = _call_main(_MainOp::TabsOp(act.clone(), idx, norm_u.clone()));
+        if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
+        if act.equals("new") && !norm_u.is_empty() { _wait_for_load_settle(); }
+        return _text_content_result("Browser tabs:\n${rep.data.view()}");
+    }
+    return _text_content_result("Unknown tool: ${name}", is_error: true);
+}
+
+fn _ok_envelope(take id_val: json::Value, take res: json::Value) -> text::Text {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("jsonrpc", json::Value::text("2.0")));
+    let _ = m.append(json::Member::new("id", id_val));
+    let _ = m.append(json::Member::new("result", res));
+    return json::Value::object(m).to_text();
+}
+
+fn _err_envelope(take id_val: json::Value, code: i64, msg: str) -> text::Text {
+    var em: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = em.append(json::Member::new("code", json::Value::number(code as f64)));
+    let _ = em.append(json::Member::new("message", json::Value::text(msg)));
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("jsonrpc", json::Value::text("2.0")));
+    let _ = m.append(json::Member::new("id", id_val));
+    let _ = m.append(json::Member::new("error", json::Value::object(em)));
+    return json::Value::object(m).to_text();
+}
+
+// Dispatch one JSON-RPC MCP message. Returns `None` for notifications (no `id`),
+// which the HTTP layer answers with 202 Accepted.
+fn handle_jsonrpc(raw: str) -> option::Option[text::Text] {
+    guard let result::Result::Ok(msg) = json::Value::parse(source: raw) else {
+        return option::Option[text::Text]::Some(
+            _err_envelope(json::Value::null(), -32700 as i64, "Parse error"),
+        );
+    };
+    guard let option::Option::Some(id_val) = msg.value(for_key: "id") else {
+        // Notification (e.g. notifications/initialized) -> 202 Accepted.
+        return option::Option[text::Text]::None;
+    };
+    let meth: text::Text = msg.field_str("method", "");
+    let mv: str = meth.view();
+    if mv == "initialize" {
+        var proto: text::Text = text::from_str("2025-11-25");
+        if let option::Option::Some(pv) = msg.value(for_key: "params") {
+            let asked: text::Text = pv.field_str("protocolVersion", "");
+            if !asked.is_empty() { proto = asked; }
+        }
+        var caps: vec::Vec[json::Member] = vec::new::[json::Member]();
+        let _ = caps.append(json::Member::new("tools", json::Value::object(vec::new::[json::Member]())));
+        var info: vec::Vec[json::Member] = vec::new::[json::Member]();
+        let _ = info.append(json::Member::new("name", json::Value::text("desk420-browser")));
+        let _ = info.append(json::Member::new("version", json::Value::text("0.1.0")));
+        var r: vec::Vec[json::Member] = vec::new::[json::Member]();
+        let _ = r.append(json::Member::new("protocolVersion", json::Value::text(proto.view())));
+        let _ = r.append(json::Member::new("capabilities", json::Value::object(caps)));
+        let _ = r.append(json::Member::new("serverInfo", json::Value::object(info)));
+        return option::Option[text::Text]::Some(_ok_envelope(id_val, json::Value::object(r)));
+    }
+    if mv == "ping" {
+        return option::Option[text::Text]::Some(
+            _ok_envelope(id_val, json::Value::object(vec::new::[json::Member]())),
+        );
+    }
+    if mv == "tools/list" {
+        return option::Option[text::Text]::Some(_ok_envelope(id_val, _tools_list_result()));
+    }
+    if mv == "tools/call" {
+        guard let option::Option::Some(pv) = msg.value(for_key: "params") else {
+            return option::Option[text::Text]::Some(
+                _err_envelope(id_val, -32602 as i64, "Missing params"),
+            );
+        };
+        let tname: text::Text = pv.field_str("name", "");
+        let args: json::Value = match pv.value(for_key: "arguments") {
+            option::Option::Some(av) => av,
+            option::Option::None => json::Value::object(vec::new::[json::Member]()),
+        };
+        return option::Option[text::Text]::Some(_ok_envelope(id_val, _dispatch_tool_call(tname.view(), args)));
+    }
+    return option::Option[text::Text]::Some(
+        _err_envelope(id_val, -32601 as i64, "Method not found"),
+    );
+}
+
+// ───────────────────────────── minimal loopback HTTP/1.1 server ─────────────────────────────
+
+fn _find_header_end(buf: vec::Vec[u8]) -> option::Option[usize] {
+    let n: usize = buf.count();
+    if n < (4 as usize) { return option::Option[usize]::None; }
+    let s: u8[] = buf.as_slice();
+    var i: usize = 0 as usize;
+    while i +% (3 as usize) < n {
+        if s[i] == (13 as u8) && s[i +% (1 as usize)] == (10 as u8)
+            && s[i +% (2 as usize)] == (13 as u8) && s[i +% (3 as usize)] == (10 as u8) {
+            return option::Option[usize]::Some(i);
+        }
+        i = i +% (1 as usize);
+    }
+    return option::Option[usize]::None;
+}
+
+fn _write_http(ref stream: net::TcpStream, status_line: str, body: str) {
+    let blen: usize = body.count();
+    let resp: text::Text = "HTTP/1.1 ${status_line}\r\nContent-Type: application/json\r\nContent-Length: ${blen}\r\nConnection: close\r\n\r\n${body}";
+    var bytes: vec::Vec[u8] = vec::new::[u8]();
+    let rv: str = resp.view();
+    let _ = bytes.extend_from_raw({ #str_ptr(rv) }, rv.count());
+    let _ = stream.write_all(bytes);
+}
+
+fn _serve_conn(ref stream: net::TcpStream, expected_auth: str) {
+    var chunk: [u8; 4096] = #zero::[[u8; 4096]]();
+
+    var buf: vec::Vec[u8] = vec::new::[u8]();
+    var hdr_end: option::Option[usize] = option::Option[usize]::None;
+    var content_len: usize = 0 as usize;
+    var parsed_hdr: bool = false;
+    var method: text::Text = text::from_str("");
+    var auth_val: text::Text = text::from_str("");
+
+    var rounds: i32 = 0 as i32;
+    while rounds < (200 as i32) {
+        if parsed_hdr {
+            if let option::Option::Some(he) = hdr_end {
+                if buf.count() >= he +% (4 as usize) +% content_len { break; }
+            }
+        }
+        let n: isize = stream.read_some({ #addr_of(chunk[0]) }, 4096 as usize, 2000 as i32);
+        if n <= (0 as isize) { break; }
+        let _ = buf.extend_from_raw({ #addr_of(chunk[0]) }, n as usize);
+        if buf.count() > (4194304 as usize) { break; }
+        if !parsed_hdr {
+            hdr_end = _find_header_end(buf);
+            if let option::Option::Some(he) = hdr_end {
+                parsed_hdr = true;
+                let hdr_view: str = match buf.as_byte_view().slice(from: 0 as usize, to: he) {
+                    option::Option::Some(s) => s,
+                    option::Option::None => "",
+                };
+                let lines: vec::Vec[str] = hdr_view.split(separator: "\r\n");
+                if let option::Option::Some(req_line) = lines.at(0 as usize) {
+                    let parts: vec::Vec[str] = req_line.split(separator: " ");
+                    if let option::Option::Some(m0) = parts.at(0 as usize) {
+                        method = text::from_str(m0);
+                    }
+                }
+                var li: usize = 1 as usize;
+                while li < lines.count() {
+                    if let option::Option::Some(line) = lines.at(li) {
+                        let low: text::Text = text::from_str(line).lowercased();
+                        if low.view().has_prefix("content-length:") {
+                            if let option::Option::Some(rest) = line.slice(from: 15 as usize, to: line.count()) {
+                                if let option::Option::Some(cl) = rest.trim().to_i64() {
+                                    if cl > (0 as i64) { content_len = cl as usize; }
+                                }
+                            }
+                        } else if low.view().has_prefix("authorization:") {
+                            if let option::Option::Some(rest) = line.slice(from: 14 as usize, to: line.count()) {
+                                auth_val = text::from_str(rest.trim());
+                            }
+                        }
+                    }
+                    li = li +% (1 as usize);
+                }
+            }
+        }
+        rounds = rounds +% (1 as i32);
+    }
+
+    if !parsed_hdr {
+        _write_http(stream, "400 Bad Request", "{\"error\":\"malformed request\"}");
+        return;
+    }
+    if !_auth_equals(auth_val.view(), expected_auth) {
+        _write_http(stream, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
+        return;
+    }
+    if method.equals("GET") {
+        _write_http(stream, "405 Method Not Allowed", "");
+        return;
+    }
+    if method.equals("DELETE") {
+        _write_http(stream, "200 OK", "");
+        return;
+    }
+    if !method.equals("POST") {
+        _write_http(stream, "405 Method Not Allowed", "");
+        return;
+    }
+    var body_txt: text::Text = text::from_str("");
+    if let option::Option::Some(he) = hdr_end {
+        let start: usize = he +% (4 as usize);
+        var end: usize = start +% content_len;
+        if end > buf.count() { end = buf.count(); }
+        if let option::Option::Some(bs) = buf.as_byte_view().slice(from: start, to: end) {
+            body_txt = text::from_str(bs);
+        }
+    }
+    match handle_jsonrpc(body_txt.view()) {
+        option::Option::Some(reply) => {
+            _write_http(stream, "200 OK", reply.view());
+        }
+        option::Option::None => {
+            _write_http(stream, "202 Accepted", "");
+        }
+    }
+}
+
+fn _auth_equals(a: str, b: str) -> bool {
+    if a.count() != b.count() { return false; }
+    if a.count() == (0 as usize) { return true; }
+    return crypto::bytes_equal({ #str_ptr(a) }, { #str_ptr(b) }, a.count());
+}
+
+struct _ServerArgs {
+    listener: net::TcpListener,
+    auth: text::Text,
+}
+
+fn _server_main(take args: _ServerArgs) -> i32 {
+    var srv: _ServerArgs = args;
+    loop {
+        if thread::cancelled() { break; }
+        match srv.listener.accept() {
+            result::Result::Ok(stream) => {
+                var st: net::TcpStream = stream;
+                _serve_conn(st, srv.auth.view());
+                st.close();
+            }
+            result::Result::Err(_e) => {
+                if thread::cancelled() { break; }
+                time::sleep(20 as u64).wait();
+            }
+        }
+    }
+    srv.listener.close();
+    return 0 as i32;
+}
+
+// ───────────────────────────── lifecycle ─────────────────────────────
+
+static _RUNNING: bool = false;
+static _PORT: u16 = 0u16;
+static _TOKEN: text::Text = #zero::[text::Text]();
+
+fn start() -> bool {
+    if _RUNNING { return true; }
+    // Generate a 192-bit CSPRNG bearer token first; refuse to start if the
+    // platform RNG fails rather than falling back to a guessable token.
+    guard let option::Option::Some(tok) = crypto::random_hex(24 as usize) else {
+        return false;
+    };
+    let pid: i32 = process::current_id();
+    let base_port: u16 = (42100 + ((pid % 8000) as i32)) as u16;
+    var bound: option::Option[net::TcpListener] = option::Option[net::TcpListener]::None;
+    var chosen: u16 = 0u16;
+    var tries: u16 = 0u16;
+    while tries < 32u16 {
+        let p: u16 = base_port +% tries;
+        match net::listen_tcp(p) {
+            result::Result::Ok(l) => {
+                bound = option::Option[net::TcpListener]::Some(l);
+                chosen = p;
+                break;
+            }
+            result::Result::Err(_e) => {}
+        }
+        tries = tries +% 1u16;
+    }
+    guard let option::Option::Some(listener) = bound else { return false; };
+    _PORT = chosen;
+    _TOKEN = tok;
+    let auth_hdr: text::Text = "Bearer ${_TOKEN.view()}";
+    if let option::Option::Some(info_path) = env::var("DESK420_BROWSER_MCP_INFO") {
+        if !info_path.is_empty() {
+            var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+            let u: text::Text = "http://127.0.0.1:${_PORT}/mcp";
+            let _ = m.append(json::Member::new("url", json::Value::text(u.view())));
+            let _ = m.append(json::Member::new("auth", json::Value::text(auth_hdr.view())));
+            let _ = fs::write_string(info_path.view(), json::Value::object(m).to_text().view());
+        }
+    }
+    let _h: thread::JoinHandle[i32] = thread::spawn_with::[_ServerArgs, i32](
+        _ServerArgs { listener: listener, auth: auth_hdr },
+        _server_main,
+    );
+    _RUNNING = true;
+    return true;
+}
+
+fn is_running() -> bool { return _RUNNING; }
+
+fn mcp_url() -> text::Text {
+    if !_RUNNING { return text::from_str(""); }
+    return "http://127.0.0.1:${_PORT}/mcp";
+}
+
+fn auth_header() -> text::Text {
+    if !_RUNNING { return text::from_str(""); }
+    return "Bearer ${_TOKEN.view()}";
+}
+
+// Build the ACP `mcpServers` JSON array entry for `desk420-browser`.
+fn acp_mcp_server_entry() -> option::Option[json::Value] {
+    if !_RUNNING { return option::Option[json::Value]::None; }
+    var hdr: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = hdr.append(json::Member::new("name", json::Value::text("Authorization")));
+    let _ = hdr.append(json::Member::new("value", json::Value::text(auth_header().view())));
+    var hdrs: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = hdrs.append(json::Value::object(hdr));
+
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("type", json::Value::text("http")));
+    let _ = m.append(json::Member::new("name", json::Value::text("desk420-browser")));
+    let _ = m.append(json::Member::new("url", json::Value::text(mcp_url().view())));
+    let _ = m.append(json::Member::new("headers", json::Value::array(hdrs)));
+    return option::Option[json::Value]::Some(json::Value::object(m));
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn url_policy_allows_localhost_blocks_external_in_ask_and_confines_file_urls() {
+    assert check_url_policy("http://localhost:3000", "/repo", false).is_empty();
+    assert check_url_policy("http://127.0.0.1:8080/app", "/repo", false).is_empty();
+    assert check_url_policy("http://[::1]:3000/app", "/repo", false).is_empty();
+    assert !check_url_policy("http://localhost.evil.com", "/repo", false).is_empty();
+    assert !check_url_policy("http://localhost@evil.com/x", "/repo", false).is_empty();
+    assert extract_origin("https://Example.COM:8443/path?a=1").equals("https://example.com:8443");
+    assert extract_origin("http://127.0.0.1:3000/app#top").equals("http://127.0.0.1:3000");
+    assert extract_origin("http://[::1]:3000/app").equals("http://[::1]:3000");
+    assert !check_url_policy("https://example.com", "/repo", false).is_empty();
+    assert check_url_policy("https://example.com", "/repo", true).is_empty();
+    assert check_url_policy("file:///repo/index.html", "/repo", false).is_empty();
+    assert !check_url_policy("file:///etc/passwd", "/repo", true).is_empty();
+    assert !check_url_policy("file:///repo/../etc/passwd", "/repo", true).is_empty();
+    assert !check_url_policy("javascript:alert(1)", "/repo", true).is_empty();
+}
+
+#[test]
+fn mcp_dispatch_handles_initialize_tools_list_ping_and_unknown_method() {
+    // initialize
+    guard let option::Option::Some(r1) = handle_jsonrpc("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}") else {
+        assert false;
+        return;
+    };
+    assert r1.contains("desk420-browser") && r1.contains("2025-11-25");
+
+    // notification -> None (202)
+    let notif: option::Option[text::Text] = handle_jsonrpc("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+    let is_none: bool = match notif {
+        option::Option::None => true,
+        option::Option::Some(_x) => false,
+    };
+    assert is_none;
+
+    // tools/list
+    guard let option::Option::Some(r2) = handle_jsonrpc("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}") else {
+        assert false;
+        return;
+    };
+    assert r2.contains("browser_open") && r2.contains("browser_snapshot") && r2.contains("browser_screenshot")
+        && r2.contains("browser_press") && r2.contains("browser_wait") && r2.contains("browser_network")
+        && r2.contains("browser_resize") && r2.contains("browser_tabs");
+
+    // unknown method -> -32601 (e.g. Grok's server/discover probe)
+    guard let option::Option::Some(r3) = handle_jsonrpc("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"server/discover\"}") else {
+        assert false;
+        return;
+    };
+    assert r3.contains("-32601");
+}

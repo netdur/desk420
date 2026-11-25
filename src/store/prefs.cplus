@@ -1,0 +1,453 @@
+// src/store/prefs.cplus — the app's own preferences, in ~/.desk420/settings.json.
+//
+// Kept apart from the sessions store's state.json, which rewrites its whole
+// file and would drop keys it does not know. Main thread only; the file is
+// a few bytes, read once and written on change.
+//
+// Holds UI preferences:
+// - `appearance`: follow the system (the default), or always light, or always dark.
+// - `browser`: system default (the default), or a specific browser (Firefox,
+//   Safari, Chrome, Arc, Brave, Edge, Zen) applied via a small launcher script
+//   exported as `$BROWSER` so both Desk420 and `grok agent stdio` sign-in open
+//   in the chosen browser immediately without restarting the engine.
+
+import "json/json" as json;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/process" as process;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+enum AppearancePref {
+    System,
+    Light,
+    Dark,
+}
+
+impl AppearancePref {
+    fn to_index(this) -> i64 {
+        return match this {
+            AppearancePref::System => 0 as i64,
+            AppearancePref::Light => 1 as i64,
+            AppearancePref::Dark => 2 as i64,
+        };
+    }
+
+    fn from_index(i: i64) -> AppearancePref {
+        if i == (1 as i64) { return AppearancePref::Light; }
+        if i == (2 as i64) { return AppearancePref::Dark; }
+        return AppearancePref::System;
+    }
+
+    fn word(this) -> str {
+        return match this {
+            AppearancePref::System => "system",
+            AppearancePref::Light => "light",
+            AppearancePref::Dark => "dark",
+        };
+    }
+
+    fn from_word(w: str) -> AppearancePref {
+        if w == "light" { return AppearancePref::Light; }
+        if w == "dark" { return AppearancePref::Dark; }
+        return AppearancePref::System;
+    }
+}
+
+enum BrowserPref {
+    System,
+    Firefox,
+    Safari,
+    Chrome,
+    Arc,
+    Brave,
+    Edge,
+    Zen,
+}
+
+impl BrowserPref {
+    fn to_index(this) -> i64 {
+        return match this {
+            BrowserPref::System => 0 as i64,
+            BrowserPref::Firefox => 1 as i64,
+            BrowserPref::Safari => 2 as i64,
+            BrowserPref::Chrome => 3 as i64,
+            BrowserPref::Arc => 4 as i64,
+            BrowserPref::Brave => 5 as i64,
+            BrowserPref::Edge => 6 as i64,
+            BrowserPref::Zen => 7 as i64,
+        };
+    }
+
+    fn from_index(i: i64) -> BrowserPref {
+        if i == (1 as i64) { return BrowserPref::Firefox; }
+        if i == (2 as i64) { return BrowserPref::Safari; }
+        if i == (3 as i64) { return BrowserPref::Chrome; }
+        if i == (4 as i64) { return BrowserPref::Arc; }
+        if i == (5 as i64) { return BrowserPref::Brave; }
+        if i == (6 as i64) { return BrowserPref::Edge; }
+        if i == (7 as i64) { return BrowserPref::Zen; }
+        return BrowserPref::System;
+    }
+
+    fn word(this) -> str {
+        return match this {
+            BrowserPref::System => "system",
+            BrowserPref::Firefox => "firefox",
+            BrowserPref::Safari => "safari",
+            BrowserPref::Chrome => "chrome",
+            BrowserPref::Arc => "arc",
+            BrowserPref::Brave => "brave",
+            BrowserPref::Edge => "edge",
+            BrowserPref::Zen => "zen",
+        };
+    }
+
+    fn from_word(w: str) -> BrowserPref {
+        if w == "firefox" { return BrowserPref::Firefox; }
+        if w == "safari" { return BrowserPref::Safari; }
+        if w == "chrome" { return BrowserPref::Chrome; }
+        if w == "arc" { return BrowserPref::Arc; }
+        if w == "brave" { return BrowserPref::Brave; }
+        if w == "edge" { return BrowserPref::Edge; }
+        if w == "zen" { return BrowserPref::Zen; }
+        return BrowserPref::System;
+    }
+
+    fn label(this) -> str {
+        return match this {
+            BrowserPref::System => "System default",
+            BrowserPref::Firefox => "Firefox",
+            BrowserPref::Safari => "Safari",
+            BrowserPref::Chrome => "Google Chrome",
+            BrowserPref::Arc => "Arc",
+            BrowserPref::Brave => "Brave Browser",
+            BrowserPref::Edge => "Microsoft Edge",
+            BrowserPref::Zen => "Zen",
+        };
+    }
+
+    fn macos_app_name(this) -> str {
+        return match this {
+            BrowserPref::System => "",
+            BrowserPref::Firefox => "Firefox",
+            BrowserPref::Safari => "Safari",
+            BrowserPref::Chrome => "Google Chrome",
+            BrowserPref::Arc => "Arc",
+            BrowserPref::Brave => "Brave Browser",
+            BrowserPref::Edge => "Microsoft Edge",
+            BrowserPref::Zen => "Zen",
+        };
+    }
+
+    fn linux_command(this) -> str {
+        return match this {
+            BrowserPref::System => "xdg-open",
+            BrowserPref::Firefox => "firefox",
+            BrowserPref::Safari => "xdg-open",
+            BrowserPref::Chrome => "google-chrome",
+            BrowserPref::Arc => "xdg-open",
+            BrowserPref::Brave => "brave-browser",
+            BrowserPref::Edge => "microsoft-edge",
+            BrowserPref::Zen => "zen-browser",
+        };
+    }
+}
+
+enum SendKeyPref {
+    Return,
+    CmdReturn,
+}
+
+impl SendKeyPref {
+    fn to_index(this) -> i64 {
+        return match this {
+            SendKeyPref::Return => 0 as i64,
+            SendKeyPref::CmdReturn => 1 as i64,
+        };
+    }
+
+    fn from_index(i: i64) -> SendKeyPref {
+        if i == (1 as i64) { return SendKeyPref::CmdReturn; }
+        return SendKeyPref::Return;
+    }
+
+    fn word(this) -> str {
+        return match this {
+            SendKeyPref::Return => "return",
+            SendKeyPref::CmdReturn => "cmd_return",
+        };
+    }
+
+    fn from_word(s: str) -> SendKeyPref {
+        if s == "cmd_return" { return SendKeyPref::CmdReturn; }
+        return SendKeyPref::Return;
+    }
+}
+
+enum AgentAccessPref {
+    Open,
+    Ask,
+    Off,
+}
+
+impl AgentAccessPref {
+    fn to_index(this) -> i64 {
+        return match this {
+            AgentAccessPref::Open => 0 as i64,
+            AgentAccessPref::Ask => 1 as i64,
+            AgentAccessPref::Off => 2 as i64,
+        };
+    }
+
+    fn from_index(i: i64) -> AgentAccessPref {
+        if i == (1 as i64) { return AgentAccessPref::Ask; }
+        if i == (2 as i64) { return AgentAccessPref::Off; }
+        return AgentAccessPref::Open;
+    }
+
+    fn word(this) -> str {
+        return match this {
+            AgentAccessPref::Open => "open",
+            AgentAccessPref::Ask => "ask",
+            AgentAccessPref::Off => "off",
+        };
+    }
+
+    fn from_word(s: str) -> AgentAccessPref {
+        if s == "ask" { return AgentAccessPref::Ask; }
+        if s == "off" { return AgentAccessPref::Off; }
+        return AgentAccessPref::Open;
+    }
+}
+
+static _LIVE: bool = false;
+static _APPEARANCE: AppearancePref = #zero::[AppearancePref]();   // System — the first variant
+static _BROWSER: BrowserPref = #zero::[BrowserPref]();            // System — the first variant
+static _SEND_KEY: SendKeyPref = #zero::[SendKeyPref]();           // Return — the first variant
+static _EXPAND_THINKING: bool = false;
+static _AGENT_ACCESS: AgentAccessPref = #zero::[AgentAccessPref](); // Open — the first variant
+static _PATH: text::Text = #zero::[text::Text]();
+
+fn _desk420_dir() -> text::Text {
+    if let option::Option::Some(home) = env::var("HOME") {
+        return path::join(base: home.view(), child: ".desk420");
+    }
+    return text::from_str("/tmp/desk420");
+}
+
+fn _default_path() -> text::Text {
+    let dir: text::Text = _desk420_dir();
+    return path::join(base: dir.view(), child: "settings.json");
+}
+
+fn browser_launcher_path() -> text::Text {
+    let dir: text::Text = _desk420_dir();
+    return path::join(base: dir.view(), child: "open-browser.sh");
+}
+
+struct Prefs {
+    appearance: AppearancePref,
+    browser: BrowserPref,
+    send_key: SendKeyPref,
+    expand_thinking: bool,
+    agent_access: AgentAccessPref,
+}
+
+impl Prefs {
+    fn defaults() -> Prefs {
+        return Prefs {
+            appearance: AppearancePref::System,
+            browser: BrowserPref::System,
+            send_key: SendKeyPref::Return,
+            expand_thinking: false,
+            agent_access: AgentAccessPref::Open,
+        };
+    }
+}
+
+fn parse_prefs(raw: str) -> Prefs {
+    if raw == "" { return Prefs::defaults(); }
+    guard let result::Result::Ok(root) = json::Value::parse(source: raw) else {
+        return Prefs::defaults();
+    };
+    return Prefs {
+        appearance: AppearancePref::from_word(root.field_str("appearance", "").view()),
+        browser: BrowserPref::from_word(root.field_str("browser", "").view()),
+        send_key: SendKeyPref::from_word(root.field_str("send_key", "").view()),
+        expand_thinking: root.field_bool("expand_thinking", false),
+        agent_access: AgentAccessPref::from_word(root.field_str("agent_access", "").view()),
+    };
+}
+
+fn _ensure() {
+    if _LIVE { return; }
+    _LIVE = true;
+    _PATH = _default_path();
+    let raw: text::Text = _read(_PATH.view());
+    let loaded: Prefs = parse_prefs(raw.view());
+    _APPEARANCE = loaded.appearance;
+    _BROWSER = loaded.browser;
+    _SEND_KEY = loaded.send_key;
+    _EXPAND_THINKING = loaded.expand_thinking;
+    _AGENT_ACCESS = loaded.agent_access;
+}
+
+fn _read(p: str) -> text::Text {
+    return match fs::read_to_string(p) {
+        result::Result::Ok(t) => t,
+        _ => text::from_str(""),
+    };
+}
+
+fn render(a: AppearancePref, b: BrowserPref = BrowserPref::System, sk: SendKeyPref = SendKeyPref::Return, expand_think: bool = false, access: AgentAccessPref = AgentAccessPref::Open) -> text::Text {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("appearance", json::Value::text(a.word())));
+    let _ = m.append(json::Member::new("browser", json::Value::text(b.word())));
+    let _ = m.append(json::Member::new("send_key", json::Value::text(sk.word())));
+    let _ = m.append(json::Member::new("expand_thinking", json::Value::boolean(expand_think)));
+    let _ = m.append(json::Member::new("agent_access", json::Value::text(access.word())));
+    return json::Value::object(m).to_text();
+}
+
+fn _save() {
+    let dir: str = path::parent(_PATH.view());
+    if dir != "" { let _ = fs::create_dir_all(dir); }
+    let body: text::Text = render(_APPEARANCE, _BROWSER, _SEND_KEY, _EXPAND_THINKING, _AGENT_ACCESS);
+    let _ = fs::write_string(_PATH.view(), body.view());
+}
+
+fn agent_access() -> AgentAccessPref {
+    _ensure();
+    return _AGENT_ACCESS;
+}
+
+fn set_agent_access(v: AgentAccessPref) {
+    _ensure();
+    _AGENT_ACCESS = v;
+    _save();
+}
+
+fn send_key() -> SendKeyPref {
+    _ensure();
+    return _SEND_KEY;
+}
+
+fn set_send_key(sk: SendKeyPref) {
+    _ensure();
+    _SEND_KEY = sk;
+    _save();
+}
+
+fn expand_thinking() -> bool {
+    _ensure();
+    return _EXPAND_THINKING;
+}
+
+fn set_expand_thinking(v: bool) {
+    _ensure();
+    _EXPAND_THINKING = v;
+    _save();
+}
+
+fn appearance() -> AppearancePref {
+    _ensure();
+    return _APPEARANCE;
+}
+
+fn set_appearance(a: AppearancePref) {
+    _ensure();
+    _APPEARANCE = a;
+    _save();
+}
+
+fn browser() -> BrowserPref {
+    _ensure();
+    return _BROWSER;
+}
+
+fn render_launcher_script(b: BrowserPref) -> text::Text {
+    let app: str = b.macos_app_name();
+    let lin: str = b.linux_command();
+    if app == "" {
+        return text::from_str("#!/bin/sh\nif [ \"$(uname -s)\" = \"Darwin\" ]; then\n  exec /usr/bin/open \"$1\"\nelse\n  exec xdg-open \"$1\"\nfi\n");
+    }
+    return "#!/bin/sh\nif [ \"$(uname -s)\" = \"Darwin\" ]; then\n  exec /usr/bin/open -a \"${app}\" \"$1\"\nelse\n  exec ${lin} \"$1\"\nfi\n";
+}
+
+// Write ~/.desk420/open-browser.sh. `Supervisor::for_grok` launches the agent
+// with `BROWSER` pointing at this script via `/usr/bin/env`, so rewriting the
+// script takes effect on the very next sign-in or link click with no restart.
+fn apply_browser(b: BrowserPref) {
+    let dir: text::Text = _desk420_dir();
+    let _ = fs::create_dir_all(dir.view());
+    let script_path: text::Text = browser_launcher_path();
+    let script: text::Text = render_launcher_script(b);
+    let _ = fs::write_string(script_path.view(), script.view());
+    let _ = process::run(["/bin/chmod", "+x", script_path.view()]);
+}
+
+fn set_browser(b: BrowserPref) {
+    _ensure();
+    _BROWSER = b;
+    _save();
+    apply_browser(b);
+}
+
+fn open_url(url: str) {
+    if url == "" { return; }
+    _ensure();
+    apply_browser(_BROWSER);
+    let script_path: text::Text = browser_launcher_path();
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(script_path);
+    let _ = argv.append(text::from_str(url));
+    let _ = process::spawn(argv);
+}
+
+#[test]
+fn appearance_round_trips_and_defaults_to_system() {
+    assert parse_prefs("").appearance == AppearancePref::System;
+    assert parse_prefs("not json").appearance == AppearancePref::System;
+    assert parse_prefs("{\"appearance\":\"sepia\"}").appearance == AppearancePref::System;
+    let d: text::Text = render(AppearancePref::Dark);
+    assert parse_prefs(d.view()).appearance == AppearancePref::Dark;
+    let l: text::Text = render(AppearancePref::Light);
+    assert parse_prefs(l.view()).appearance == AppearancePref::Light;
+    assert AppearancePref::from_index(AppearancePref::Dark.to_index()) == AppearancePref::Dark;
+}
+
+#[test]
+fn browser_round_trips_and_renders_launcher_script() {
+    assert parse_prefs("").browser == BrowserPref::System;
+    assert parse_prefs("{\"appearance\":\"dark\"}").browser == BrowserPref::System;
+    assert parse_prefs("{\"browser\":\"unknown\"}").browser == BrowserPref::System;
+    let saved: text::Text = render(AppearancePref::Dark, BrowserPref::Firefox);
+    let p: Prefs = parse_prefs(saved.view());
+    assert p.appearance == AppearancePref::Dark;
+    assert p.browser == BrowserPref::Firefox;
+    assert BrowserPref::from_index(BrowserPref::Firefox.to_index()) == BrowserPref::Firefox;
+    let ff_sh: text::Text = render_launcher_script(BrowserPref::Firefox);
+    assert ff_sh.contains("open -a \"Firefox\"");
+    assert ff_sh.contains("exec firefox");
+    let sys_sh: text::Text = render_launcher_script(BrowserPref::System);
+    assert sys_sh.contains("exec /usr/bin/open \"$1\"");
+    assert !sys_sh.contains("-a");
+}
+
+#[test]
+fn send_key_and_expand_thinking_round_trip_with_defaults() {
+    let empty: Prefs = parse_prefs("");
+    assert empty.send_key == SendKeyPref::Return;
+    assert !empty.expand_thinking;
+    let saved: text::Text = render(AppearancePref::System, BrowserPref::System, SendKeyPref::CmdReturn, true, AgentAccessPref::Ask);
+    let p: Prefs = parse_prefs(saved.view());
+    assert p.send_key == SendKeyPref::CmdReturn;
+    assert p.expand_thinking;
+    assert p.agent_access == AgentAccessPref::Ask;
+    assert SendKeyPref::from_index(SendKeyPref::CmdReturn.to_index()) == SendKeyPref::CmdReturn;
+    assert AgentAccessPref::from_index(AgentAccessPref::Off.to_index()) == AgentAccessPref::Off;
+}

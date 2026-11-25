@@ -1,0 +1,1524 @@
+// src/store/conversation.cplus — main-thread conversation store.
+//
+// Owns all sessions and their message blocks, routed strictly by `session_id`
+// so concurrent turns never bleed into each other. Broadcasts typed
+// `StoreChange` events on an `events::Signal` so UI components (sidebar,
+// transcript, approvals, status bar) stay in sync without rebuilding.
+//
+// Threading rule: ONLY the main thread mutates the store (facet trap 15).
+// Background reader threads stage decoded events through a channel and hop
+// to the main thread before calling into this module.
+
+import "events/events" as events;
+import "json/json" as json;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "../acp/wire" as wire;
+
+// ───────────────────────────── blocks & state ─────────────────────────────
+
+struct ToolBlock {
+    tool_call_id: text::Text,
+    title: text::Text,
+    kind: types::ToolKind,
+    status: types::ToolStatus,
+    raw_input_json: text::Text,
+    output_text: text::Text,
+    diff_path: text::Text,
+    diff_old: text::Text,
+    diff_new: text::Text,
+    tool_not_run: text::Text,
+    family: text::Text,
+}
+
+struct PermissionBlock {
+    rpc_id: wire::JsonRpcId,
+    tool_call_id: text::Text,
+    title: text::Text,
+    kind: types::ToolKind,
+    command: text::Text,
+    description: text::Text,
+    options: vec::Vec[types::PermissionOption],
+    resolved_option: option::Option[text::Text],
+}
+
+enum BlockKind {
+    UserText,
+    AgentText,
+    AgentThought,
+    ToolCall,
+    Permission,
+    Unknown,
+}
+
+enum _TextChunkKind {
+    Agent,
+    Thought,
+    User,
+}
+
+enum Block {
+    UserText(text::Text),
+    AgentText(text::Text),
+    AgentThought(text::Text),
+    ToolCall(ToolBlock),
+    Permission(PermissionBlock),
+    Unknown(text::Text, text::Text),
+}
+
+impl Block {
+    fn is_agent_text(this) -> bool {
+        return match this {
+            Block::AgentText(_t) => true,
+            _ => false,
+        };
+    }
+
+    fn is_agent_thought(this) -> bool {
+        return match this {
+            Block::AgentThought(_t) => true,
+            _ => false,
+        };
+    }
+
+    fn is_user_text(this) -> bool {
+        return match this {
+            Block::UserText(_t) => true,
+            _ => false,
+        };
+    }
+
+    fn is_tool_call(this) -> bool {
+        return match this {
+            Block::ToolCall(_tb) => true,
+            _ => false,
+        };
+    }
+
+    fn is_permission(this) -> bool {
+        return match this {
+            Block::Permission(_pb) => true,
+            _ => false,
+        };
+    }
+
+    fn append_agent_text(this, ref acc: text::Text) {
+        match this {
+            Block::AgentText(t) => { let _ = acc.append(t.view()); }
+            _ => {}
+        }
+    }
+
+    fn append_user_text(this, ref acc: text::Text) {
+        match this {
+            Block::UserText(t) => { let _ = acc.append(t.view()); }
+            _ => {}
+        }
+    }
+
+    fn tool_id_equals(this, id: str) -> bool {
+        return match this {
+            Block::ToolCall(tb) => tb.tool_call_id.equals(id),
+            _ => false,
+        };
+    }
+
+    fn perm_tool_id_equals(this, id: str) -> bool {
+        return match this {
+            Block::Permission(pb) => pb.tool_call_id.equals(id),
+            _ => false,
+        };
+    }
+
+    fn kind(this) -> BlockKind {
+        return match this {
+            Block::UserText(_t) => BlockKind::UserText,
+            Block::AgentText(_t) => BlockKind::AgentText,
+            Block::AgentThought(_t) => BlockKind::AgentThought,
+            Block::ToolCall(_tb) => BlockKind::ToolCall,
+            Block::Permission(_pb) => BlockKind::Permission,
+            Block::Unknown(_k, _r) => BlockKind::Unknown,
+        };
+    }
+
+    fn text_body(this) -> text::Text {
+        return match this {
+            Block::UserText(t) => t.clone(),
+            Block::AgentText(t) => t.clone(),
+            Block::AgentThought(t) => t.clone(),
+            Block::ToolCall(tb) => if tb.title.is_empty() { text::from_str("Working…") } else { tb.title.clone() },
+            Block::Permission(pb) => if pb.title.is_empty() { text::from_str("Permission requested") } else { pb.title.clone() },
+            Block::Unknown(k, _r) => k.clone(),
+        };
+    }
+
+    fn clone_tool_block(this) -> option::Option[ToolBlock] {
+        return match this {
+            Block::ToolCall(tb) => option::Option[ToolBlock]::Some(ToolBlock {
+                tool_call_id: tb.tool_call_id.clone(),
+                title: tb.title.clone(),
+                kind: tb.kind.clone(),
+                status: tb.status.clone(),
+                raw_input_json: tb.raw_input_json.clone(),
+                output_text: tb.output_text.clone(),
+                diff_path: tb.diff_path.clone(),
+                diff_old: tb.diff_old.clone(),
+                diff_new: tb.diff_new.clone(),
+                tool_not_run: tb.tool_not_run.clone(),
+                family: tb.family.clone(),
+            }),
+            _ => option::Option[ToolBlock]::None,
+        };
+    }
+
+    fn clone_permission_block(this) -> option::Option[PermissionBlock] {
+        return match this {
+            Block::Permission(pb) => {
+                let res_opt: option::Option[text::Text] = match pb.resolved_option {
+                    option::Option::Some(t) => option::Option[text::Text]::Some(t.clone()),
+                    option::Option::None => option::Option[text::Text]::None,
+                };
+                option::Option[PermissionBlock]::Some(PermissionBlock {
+                    rpc_id: pb.rpc_id.clone(),
+                    tool_call_id: pb.tool_call_id.clone(),
+                    title: pb.title.clone(),
+                    kind: pb.kind.clone(),
+                    command: pb.command.clone(),
+                    description: pb.description.clone(),
+                    options: _clone_perm_options(pb.options),
+                    resolved_option: res_opt,
+                })
+            }
+            _ => option::Option[PermissionBlock]::None,
+        };
+    }
+}
+
+enum TurnState {
+    Idle,
+    Running,
+    WaitingPermission,
+    Error(text::Text),
+}
+
+impl TurnState {
+    fn is_idle(this) -> bool {
+        return match this {
+            TurnState::Idle => true,
+            _ => false,
+        };
+    }
+
+    fn is_running(this) -> bool {
+        return match this {
+            TurnState::Running => true,
+            _ => false,
+        };
+    }
+
+    fn is_waiting_permission(this) -> bool {
+        return match this {
+            TurnState::WaitingPermission => true,
+            _ => false,
+        };
+    }
+
+    fn error_message(this) -> text::Text {
+        return match this {
+            TurnState::Error(msg) => msg.clone(),
+            _ => text::from_str(""),
+        };
+    }
+}
+
+enum SessionLoadState {
+    Unloaded,
+    Loading,
+    Loaded,
+    Failed(text::Text),
+}
+
+impl SessionLoadState {
+    fn is_loading(this) -> bool {
+        return match this {
+            SessionLoadState::Loading => true,
+            _ => false,
+        };
+    }
+
+    fn is_loaded(this) -> bool {
+        return match this {
+            SessionLoadState::Loaded => true,
+            _ => false,
+        };
+    }
+
+    fn is_failed(this) -> bool {
+        return match this {
+            SessionLoadState::Failed(_m) => true,
+            _ => false,
+        };
+    }
+
+    fn error_message(this) -> text::Text {
+        return match this {
+            SessionLoadState::Failed(m) => m.clone(),
+            _ => text::from_str(""),
+        };
+    }
+}
+
+struct SessionState {
+    session_id: text::Text,
+    cwd: text::Text,
+    title: text::Text,
+    turn_state: TurnState,
+    load_state: SessionLoadState,
+    blocks: vec::Vec[Block],
+    config_options: vec::Vec[types::ConfigOption],
+    available_commands: vec::Vec[types::AvailableCommand],
+    plan_entries: vec::Vec[types::PlanEntry],
+    last_stop_reason: option::Option[types::StopReason],
+    total_tokens: i64,
+    input_tokens: i64,
+    model_id: text::Text,
+    unread: bool,
+}
+
+impl SessionState {
+    fn new(session_id: str, cwd: str) -> SessionState {
+        return SessionState {
+            session_id: text::from_str(session_id),
+            cwd: text::from_str(cwd),
+            title: text::from_str(""),
+            turn_state: TurnState::Idle,
+            load_state: SessionLoadState::Unloaded,
+            blocks: vec::new::[Block](),
+            config_options: vec::new::[types::ConfigOption](),
+            available_commands: vec::new::[types::AvailableCommand](),
+            plan_entries: vec::new::[types::PlanEntry](),
+            last_stop_reason: option::Option[types::StopReason]::None,
+            total_tokens: 0 as i64,
+            input_tokens: 0 as i64,
+            model_id: text::from_str(""),
+            unread: false,
+        };
+    }
+
+    fn block_count(this) -> usize {
+        return this.blocks.count();
+    }
+
+    fn was_cancelled(this) -> bool {
+        return match this.last_stop_reason {
+            option::Option::Some(sr) => sr.is_cancelled(),
+            option::Option::None => false,
+        };
+    }
+
+    fn all_agent_text(this) -> text::Text {
+        var acc: text::Text = text::new();
+        var i: usize = 0 as usize;
+        while i < this.blocks.count() {
+            if let option::Option::Some(bp) = this.blocks.at_ptr(i) {
+                (*bp).append_agent_text(acc);
+            }
+            i = i +% (1 as usize);
+        }
+        return acc;
+    }
+
+    fn all_user_text(this) -> text::Text {
+        var acc: text::Text = text::new();
+        var i: usize = 0 as usize;
+        while i < this.blocks.count() {
+            if let option::Option::Some(bp) = this.blocks.at_ptr(i) {
+                (*bp).append_user_text(acc);
+            }
+            i = i +% (1 as usize);
+        }
+        return acc;
+    }
+
+    fn tool_call_count(this) -> usize {
+        var c: usize = 0 as usize;
+        var i: usize = 0 as usize;
+        while i < this.blocks.count() {
+            if let option::Option::Some(bp) = this.blocks.at_ptr(i) {
+                if (*bp).is_tool_call() { c = c +% (1 as usize); }
+            }
+            i = i +% (1 as usize);
+        }
+        return c;
+    }
+}
+
+// ───────────────────────────── Vec clone helpers ─────────────────────────────
+
+fn _clone_perm_options(src: vec::Vec[types::PermissionOption]) -> vec::Vec[types::PermissionOption] {
+    var out: vec::Vec[types::PermissionOption] = vec::new::[types::PermissionOption]();
+    var i: usize = 0 as usize;
+    while i < src.count() {
+        if let option::Option::Some(p) = src.at_ptr(i) {
+            let _ = out.append((*p).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _clone_config_options(src: vec::Vec[types::ConfigOption]) -> vec::Vec[types::ConfigOption] {
+    var out: vec::Vec[types::ConfigOption] = vec::new::[types::ConfigOption]();
+    var i: usize = 0 as usize;
+    while i < src.count() {
+        if let option::Option::Some(p) = src.at_ptr(i) {
+            let _ = out.append((*p).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _clone_available_commands(src: vec::Vec[types::AvailableCommand]) -> vec::Vec[types::AvailableCommand] {
+    var out: vec::Vec[types::AvailableCommand] = vec::new::[types::AvailableCommand]();
+    var i: usize = 0 as usize;
+    while i < src.count() {
+        if let option::Option::Some(p) = src.at_ptr(i) {
+            let _ = out.append((*p).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _clone_plan_entries(src: vec::Vec[types::PlanEntry]) -> vec::Vec[types::PlanEntry] {
+    var out: vec::Vec[types::PlanEntry] = vec::new::[types::PlanEntry]();
+    var i: usize = 0 as usize;
+    while i < src.count() {
+        if let option::Option::Some(p) = src.at_ptr(i) {
+            let _ = out.append((*p).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+// ───────────────────────────── change broadcast ─────────────────────────────
+
+enum ChangeKind {
+    SessionAdded,
+    BlockAppended,
+    BlockUpdated,
+    TitleChanged,
+    TurnStateChanged,
+    ConfigChanged,
+    CommandsChanged,
+    PlanChanged,
+    PermissionRequested,
+    PermissionResolved,
+    ReadStateChanged,
+}
+
+struct StoreChange {
+    kind: ChangeKind,
+    session_index: usize,
+    block_index: usize,
+}
+
+// ───────────────────────────── store ─────────────────────────────
+
+struct ConversationStore {
+    sessions: vec::Vec[SessionState],
+    _changes: events::Signal[StoreChange],
+    batching: bool,
+    batch_dirty: bool,
+    batch_sidx: usize,
+}
+
+impl ConversationStore {
+    fn new() -> ConversationStore {
+        return ConversationStore {
+            sessions: vec::new::[SessionState](),
+            _changes: events::Signal[StoreChange]::new(),
+            batching: false,
+            batch_dirty: false,
+            batch_sidx: 0 as usize,
+        };
+    }
+
+    fn begin_batch(ref this) {
+        this.batching = true;
+        this.batch_dirty = false;
+    }
+
+    fn end_batch(ref this) {
+        this.batching = false;
+        if this.batch_dirty {
+            this.batch_dirty = false;
+            this._changes.emit(StoreChange {
+                kind: ChangeKind::BlockUpdated,
+                session_index: this.batch_sidx,
+                block_index: 0 as usize,
+            });
+        }
+    }
+
+    fn _emit(ref this, ch: StoreChange) {
+        if this.batching {
+            this.batch_dirty = true;
+            this.batch_sidx = ch.session_index;
+            return;
+        }
+        this._changes.emit(ch);
+    }
+
+    fn is_loaded(this, session_id: str) -> bool {
+        if let option::Option::Some(idx) = this.find_session_index(session_id) {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                return (*sp).load_state.is_loaded() || (*sp).blocks.count() > (0 as usize);
+            }
+        }
+        return false;
+    }
+
+    fn is_loading(this, session_id: str) -> bool {
+        if let option::Option::Some(idx) = this.find_session_index(session_id) {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                return (*sp).load_state.is_loading();
+            }
+        }
+        return false;
+    }
+
+    fn begin_load(ref this, session_id: str, cwd: str = "", title: str = "", clear_blocks: bool = false) {
+        let idx: usize = this.ensure_session(session_id, cwd: cwd);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            if clear_blocks {
+                (*sp).blocks.remove_all();
+                (*sp).plan_entries.remove_all();
+            }
+            (*sp).load_state = SessionLoadState::Loading;
+            (*sp).unread = false;
+            if title != "" && (*sp).title.is_empty() {
+                (*sp).title = text::from_str(title);
+            }
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::TurnStateChanged,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn mark_loaded(ref this, session_id: str) {
+        let idx: usize = this.ensure_session(session_id);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).load_state = SessionLoadState::Loaded;
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::TurnStateChanged,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn mark_load_failed(ref this, session_id: str, message: str) {
+        let idx: usize = this.ensure_session(session_id);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).load_state = SessionLoadState::Failed(text::from_str(message));
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::TurnStateChanged,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn watch(ref this, f: fn(StoreChange, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[StoreChange] {
+        return this._changes.on(f, ctx: ctx);
+    }
+
+    fn session_count(this) -> usize {
+        return this.sessions.count();
+    }
+
+    fn find_session_index(this, session_id: str) -> option::Option[usize] {
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                if (*sp).session_id.equals(session_id) {
+                    return option::Option[usize]::Some(i);
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return option::Option[usize]::None;
+    }
+
+    fn session_ptr(this, index: usize) -> option::Option[*SessionState] {
+        return this.sessions.at_ptr(index);
+    }
+
+    fn ensure_session(ref this, session_id: str, cwd: str = "") -> usize {
+        if let option::Option::Some(idx) = this.find_session_index(session_id) {
+            if cwd != "" {
+                if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                    if (*sp).cwd.is_empty() {
+                        (*sp).cwd = text::from_str(cwd);
+                    }
+                }
+            }
+            return idx;
+        }
+        let idx: usize = this.sessions.count();
+        let _ = this.sessions.append(SessionState::new(session_id, cwd));
+        this._emit(StoreChange {
+            kind: ChangeKind::SessionAdded,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+        return idx;
+    }
+
+    fn reset_session_blocks(ref this, session_id: str, cwd: str = "", title: str = "") {
+        let idx: usize = this.ensure_session(session_id, cwd: cwd);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).blocks.remove_all();
+            (*sp).turn_state = TurnState::Idle;
+            (*sp).unread = false;
+            if title != "" && (*sp).title.is_empty() {
+                (*sp).title = text::from_str(title);
+            }
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::BlockUpdated,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn mark_read(ref this, session_id: str) {
+        if let option::Option::Some(idx) = this.find_session_index(session_id) {
+            var changed: bool = false;
+            if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                if (*sp).unread {
+                    (*sp).unread = false;
+                    changed = true;
+                }
+            }
+            if changed {
+                this._emit(StoreChange {
+                    kind: ChangeKind::ReadStateChanged,
+                    session_index: idx,
+                    block_index: 0 as usize,
+                });
+            }
+        }
+    }
+
+    fn mark_unread(ref this, session_id: str) {
+        if let option::Option::Some(idx) = this.find_session_index(session_id) {
+            var changed: bool = false;
+            if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                if !(*sp).unread {
+                    (*sp).unread = true;
+                    changed = true;
+                }
+            }
+            if changed {
+                this._emit(StoreChange {
+                    kind: ChangeKind::ReadStateChanged,
+                    session_index: idx,
+                    block_index: 0 as usize,
+                });
+            }
+        }
+    }
+
+    fn set_config_options(ref this, session_id: str, take opts: vec::Vec[types::ConfigOption]) {
+        let idx: usize = this.ensure_session(session_id);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).config_options = opts;
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::ConfigChanged,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn set_config_value_optimistic(ref this, session_id: str, config_id: str, value: str) {
+        guard let option::Option::Some(idx) = this.find_session_index(session_id) else { return; };
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            var ci: usize = 0 as usize;
+            while ci < (*sp).config_options.count() {
+                if let option::Option::Some(co) = (*sp).config_options.at_ptr(ci) {
+                    if (*co).id.equals(config_id) {
+                        (*co).current_value = text::from_str(value);
+                        return;
+                    }
+                }
+                ci = ci +% (1 as usize);
+            }
+        }
+    }
+
+    fn begin_turn(ref this, session_id: str, user_text: str) {
+        let idx: usize = this.ensure_session(session_id);
+        var bidx: usize = 0 as usize;
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).turn_state = TurnState::Running;
+            (*sp).load_state = SessionLoadState::Loaded;
+            if user_text != "" {
+                bidx = (*sp).blocks.count();
+                let _ = (*sp).blocks.append(Block::UserText(text::from_str(user_text)));
+            }
+        }
+        if user_text != "" {
+            this._emit(StoreChange {
+                kind: ChangeKind::BlockAppended,
+                session_index: idx,
+                block_index: bidx,
+            });
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::TurnStateChanged,
+            session_index: idx,
+            block_index: bidx,
+        });
+    }
+
+    fn apply_prompt_result(ref this, session_id: str, res: types::PromptResult) {
+        let idx: usize = this.ensure_session(session_id);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).turn_state = TurnState::Idle;
+            (*sp).last_stop_reason = option::Option[types::StopReason]::Some(res.stop_reason.clone());
+            if res.total_tokens > (0 as i64) {
+                (*sp).total_tokens = res.total_tokens;
+            }
+            if res.input_tokens > (0 as i64) {
+                (*sp).input_tokens = res.input_tokens;
+            }
+            if !res.model_id.is_empty() {
+                (*sp).model_id = res.model_id.clone();
+            }
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::TurnStateChanged,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn apply_turn_error(ref this, session_id: str, message: str) {
+        let idx: usize = this.ensure_session(session_id);
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).turn_state = TurnState::Error(text::from_str(message));
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::TurnStateChanged,
+            session_index: idx,
+            block_index: 0 as usize,
+        });
+    }
+
+    fn apply_permission_request(ref this, req: types::PermissionRequest) {
+        let idx: usize = this.ensure_session(req.session_id.view());
+        var bidx: usize = 0 as usize;
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            (*sp).turn_state = TurnState::WaitingPermission;
+            bidx = (*sp).blocks.count();
+            let _ = (*sp).blocks.append(Block::Permission(PermissionBlock {
+                rpc_id: req.rpc_id.clone(),
+                tool_call_id: req.tool_call_id.clone(),
+                title: req.title.clone(),
+                kind: req.kind.clone(),
+                command: req.command.clone(),
+                description: req.description.clone(),
+                options: _clone_perm_options(req.options),
+                resolved_option: option::Option[text::Text]::None,
+            }));
+        }
+        this._emit(StoreChange {
+            kind: ChangeKind::PermissionRequested,
+            session_index: idx,
+            block_index: bidx,
+        });
+    }
+
+    fn resolve_permission(ref this, session_id: str, tool_call_id: str, option_id: str) {
+        guard let option::Option::Some(idx) = this.find_session_index(session_id) else { return; };
+        var bidx: usize = 0 as usize;
+        var found: bool = false;
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            var i: usize = (*sp).blocks.count();
+            while i > (0 as usize) {
+                i = i -% (1 as usize);
+                if let option::Option::Some(bp) = (*sp).blocks.at_ptr(i) {
+                    if (*bp).perm_tool_id_equals(tool_call_id) {
+                        if let option::Option::Some(old) = (*sp).blocks.replace(Block::UserText(text::from_str("")), at: i) {
+                            match old {
+                                Block::Permission(pb) => {
+                                    var updated: PermissionBlock = pb;
+                                    updated.resolved_option = option::Option[text::Text]::Some(text::from_str(option_id));
+                                    let _ = (*sp).blocks.set(Block::Permission(updated), i);
+                                }
+                                other => {
+                                    let _ = (*sp).blocks.set(other, i);
+                                }
+                            }
+                        }
+                        bidx = i;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                (*sp).turn_state = TurnState::Running;
+            }
+        }
+        if found {
+            this._emit(StoreChange {
+                kind: ChangeKind::PermissionResolved,
+                session_index: idx,
+                block_index: bidx,
+            });
+        }
+    }
+
+    fn _append_text_chunk(ref this, idx: usize, kind: _TextChunkKind, take chunk: text::Text) {
+        if chunk.is_empty() { return; }
+        var appended_new: bool = false;
+        var bidx: usize = 0 as usize;
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            let n: usize = (*sp).blocks.count();
+            var merged: bool = false;
+            if n > (0 as usize) {
+                let last_i: usize = n -% (1 as usize);
+                var same_kind: bool = false;
+                if let option::Option::Some(bp) = (*sp).blocks.at_ptr(last_i) {
+                    same_kind = match kind {
+                        _TextChunkKind::Agent => (*bp).is_agent_text(),
+                        _TextChunkKind::Thought => (*bp).is_agent_thought(),
+                        _TextChunkKind::User => (*bp).is_user_text(),
+                    };
+                }
+                if same_kind {
+                    if let option::Option::Some(old) = (*sp).blocks.remove_last() {
+                        match old {
+                            Block::AgentText(t) => {
+                                var nt: text::Text = t;
+                                let _ = nt.append(chunk.view());
+                                let _ = (*sp).blocks.append(Block::AgentText(nt));
+                            }
+                            Block::AgentThought(t) => {
+                                var nt: text::Text = t;
+                                let _ = nt.append(chunk.view());
+                                let _ = (*sp).blocks.append(Block::AgentThought(nt));
+                            }
+                            Block::UserText(t) => {
+                                var nt: text::Text = t;
+                                let _ = nt.append(chunk.view());
+                                let _ = (*sp).blocks.append(Block::UserText(nt));
+                            }
+                            other => {
+                                let _ = (*sp).blocks.append(other);
+                            }
+                        }
+                        bidx = last_i;
+                        merged = true;
+                    }
+                }
+            }
+            if !merged {
+                bidx = (*sp).blocks.count();
+                match kind {
+                    _TextChunkKind::Agent => { let _ = (*sp).blocks.append(Block::AgentText(chunk)); }
+                    _TextChunkKind::Thought => { let _ = (*sp).blocks.append(Block::AgentThought(chunk)); }
+                    _TextChunkKind::User => { let _ = (*sp).blocks.append(Block::UserText(chunk)); }
+                }
+                appended_new = true;
+            }
+        }
+        this._emit(StoreChange {
+            kind: if appended_new { ChangeKind::BlockAppended } else { ChangeKind::BlockUpdated },
+            session_index: idx,
+            block_index: bidx,
+        });
+    }
+
+    fn _upsert_tool_call(ref this, idx: usize, info: types::ToolCallInfo) {
+        var bidx: usize = 0 as usize;
+        var appended_new: bool = false;
+        if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+            var found_i: option::Option[usize] = option::Option[usize]::None;
+            var i: usize = (*sp).blocks.count();
+            while i > (0 as usize) {
+                i = i -% (1 as usize);
+                if let option::Option::Some(bp) = (*sp).blocks.at_ptr(i) {
+                    if (*bp).tool_id_equals(info.tool_call_id.view()) {
+                        found_i = option::Option[usize]::Some(i);
+                        break;
+                    }
+                }
+            }
+
+            match found_i {
+                option::Option::Some(fi) => {
+                    if let option::Option::Some(old) = (*sp).blocks.replace(Block::UserText(text::from_str("")), at: fi) {
+                        match old {
+                            Block::ToolCall(tb) => {
+                                var u: ToolBlock = tb;
+                                if !info.title.is_empty() { u.title = info.title.clone(); }
+                                if info.has_kind { u.kind = info.kind.clone(); }
+                                if info.has_status { u.status = info.status.clone(); }
+                                if !info.raw_input_json.is_empty() { u.raw_input_json = info.raw_input_json.clone(); }
+                                if !info.output_text.is_empty() { u.output_text = info.output_text.clone(); }
+                                if !info.diff_path.is_empty() {
+                                    u.diff_path = info.diff_path.clone();
+                                    u.diff_old = info.diff_old.clone();
+                                    u.diff_new = info.diff_new.clone();
+                                } else if !info.diff_old.is_empty() || !info.diff_new.is_empty() {
+                                    u.diff_old = info.diff_old.clone();
+                                    u.diff_new = info.diff_new.clone();
+                                }
+                                if !info.tool_not_run.is_empty() { u.tool_not_run = info.tool_not_run.clone(); }
+                                if !info.family.is_empty() { u.family = info.family.clone(); }
+                                let _ = (*sp).blocks.set(Block::ToolCall(u), fi);
+                            }
+                            other => {
+                                let _ = (*sp).blocks.set(other, fi);
+                            }
+                        }
+                    }
+                    bidx = fi;
+                }
+                option::Option::None => {
+                    bidx = (*sp).blocks.count();
+                    let _ = (*sp).blocks.append(Block::ToolCall(ToolBlock {
+                        tool_call_id: info.tool_call_id.clone(),
+                        title: info.title.clone(),
+                        kind: info.kind.clone(),
+                        status: info.status.clone(),
+                        raw_input_json: info.raw_input_json.clone(),
+                        output_text: info.output_text.clone(),
+                        diff_path: info.diff_path.clone(),
+                        diff_old: info.diff_old.clone(),
+                        diff_new: info.diff_new.clone(),
+                        tool_not_run: info.tool_not_run.clone(),
+                        family: info.family.clone(),
+                    }));
+                    appended_new = true;
+                }
+            }
+        }
+        this._emit(StoreChange {
+            kind: if appended_new { ChangeKind::BlockAppended } else { ChangeKind::BlockUpdated },
+            session_index: idx,
+            block_index: bidx,
+        });
+    }
+
+    fn apply_update(ref this, env: types::SessionUpdateEnvelope) {
+        let idx: usize = this.ensure_session(env.session_id.view());
+        match env.update {
+            types::SessionUpdate::AgentMessageChunk(t) => {
+                this._append_text_chunk(idx, _TextChunkKind::Agent, t.clone());
+            }
+            types::SessionUpdate::AgentThoughtChunk(t) => {
+                this._append_text_chunk(idx, _TextChunkKind::Thought, t.clone());
+            }
+            types::SessionUpdate::UserMessageChunk(t) => {
+                this._append_text_chunk(idx, _TextChunkKind::User, t.clone());
+            }
+            types::SessionUpdate::ToolCall(info) => {
+                this._upsert_tool_call(idx, info);
+            }
+            types::SessionUpdate::ToolCallUpdate(info) => {
+                this._upsert_tool_call(idx, info);
+            }
+            types::SessionUpdate::Plan(entries) => {
+                if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                    (*sp).plan_entries = _clone_plan_entries(entries);
+                }
+                this._emit(StoreChange {
+                    kind: ChangeKind::PlanChanged,
+                    session_index: idx,
+                    block_index: 0 as usize,
+                });
+            }
+            types::SessionUpdate::SessionInfoUpdate(title) => {
+                if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                    (*sp).title = title.clone();
+                }
+                this._emit(StoreChange {
+                    kind: ChangeKind::TitleChanged,
+                    session_index: idx,
+                    block_index: 0 as usize,
+                });
+            }
+            types::SessionUpdate::ConfigOptionUpdate(opts) => {
+                if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                    (*sp).config_options = _clone_config_options(opts);
+                }
+                this._emit(StoreChange {
+                    kind: ChangeKind::ConfigChanged,
+                    session_index: idx,
+                    block_index: 0 as usize,
+                });
+            }
+            types::SessionUpdate::AvailableCommandsUpdate(cmds) => {
+                if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                    (*sp).available_commands = _clone_available_commands(cmds);
+                }
+                this._emit(StoreChange {
+                    kind: ChangeKind::CommandsChanged,
+                    session_index: idx,
+                    block_index: 0 as usize,
+                });
+            }
+            types::SessionUpdate::Unknown(kind_name, raw) => {
+                var bidx: usize = 0 as usize;
+                if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                    bidx = (*sp).blocks.count();
+                    let _ = (*sp).blocks.append(Block::Unknown(kind_name.clone(), raw.clone()));
+                }
+                this._emit(StoreChange {
+                    kind: ChangeKind::BlockAppended,
+                    session_index: idx,
+                    block_index: bidx,
+                });
+            }
+        }
+    }
+}
+
+struct SessionSummarySnapshot {
+    found: bool,
+    title: text::Text,
+    first_user_line: text::Text,
+    is_waiting_permission: bool,
+    is_running: bool,
+    has_error: bool,
+    unread: bool,
+}
+
+impl SessionSummarySnapshot {
+    fn empty() -> SessionSummarySnapshot {
+        return SessionSummarySnapshot {
+            found: false,
+            title: text::from_str(""),
+            first_user_line: text::from_str(""),
+            is_waiting_permission: false,
+            is_running: false,
+            has_error: false,
+            unread: false,
+        };
+    }
+}
+
+impl ConversationStore {
+    fn summary_snapshot(this, session_id: str) -> SessionSummarySnapshot {
+        guard let option::Option::Some(idx) = this.find_session_index(session_id) else {
+            return SessionSummarySnapshot::empty();
+        };
+        guard let option::Option::Some(sp) = this.sessions.at_ptr(idx) else {
+            return SessionSummarySnapshot::empty();
+        };
+        var first_line: text::Text = text::from_str("");
+        if (*sp).title.is_empty() {
+            let first_user: text::Text = (*sp).all_user_text();
+            let trimmed: str = first_user.view().trim();
+            if !trimmed.is_empty() {
+                let lines: vec::Vec[str] = trimmed.split(separator: "\n");
+                if let option::Option::Some(l0) = lines.at(0 as usize) {
+                    first_line = text::from_str(l0);
+                }
+            }
+        }
+        let err: text::Text = (*sp).turn_state.error_message();
+        return SessionSummarySnapshot {
+            found: true,
+            title: (*sp).title.clone(),
+            first_user_line: first_line,
+            is_waiting_permission: (*sp).turn_state.is_waiting_permission(),
+            is_running: (*sp).turn_state.is_running(),
+            has_error: !err.is_empty(),
+            unread: (*sp).unread,
+        };
+    }
+
+    fn set_session_title(ref this, session_id: str, new_title: str) {
+        if let option::Option::Some(idx) = this.find_session_index(session_id) {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(idx) {
+                (*sp).title = text::from_str(new_title);
+            }
+        }
+    }
+}
+
+// ───────────────────────────── app-wide singleton surface ─────────────────────────────
+// Components watch and read through these module functions rather than naming
+// the static directly (facet SKILL §12.4).
+
+static _STORE_LIVE: bool = false;
+static _STORE: ConversationStore = #zero::[ConversationStore]();
+
+fn _ensure_global() {
+    if !_STORE_LIVE {
+        _STORE = ConversationStore::new();
+        _STORE_LIVE = true;
+    }
+}
+
+fn watch(f: fn(StoreChange, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[StoreChange] {
+    _ensure_global();
+    return _STORE.watch(f, ctx: ctx);
+}
+
+fn begin_batch() { _ensure_global(); _STORE.begin_batch(); }
+fn end_batch() { _ensure_global(); _STORE.end_batch(); }
+
+fn ensure_session(session_id: str, cwd: str = "") -> usize {
+    _ensure_global();
+    return _STORE.ensure_session(session_id, cwd: cwd);
+}
+
+fn session_index(session_id: str) -> option::Option[usize] {
+    _ensure_global();
+    return _STORE.find_session_index(session_id);
+}
+
+fn is_loaded(session_id: str) -> bool { _ensure_global(); return _STORE.is_loaded(session_id); }
+fn is_loading(session_id: str) -> bool { _ensure_global(); return _STORE.is_loading(session_id); }
+
+fn is_load_failed(session_id: str) -> bool {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return (*sp).load_state.is_failed();
+        }
+    }
+    return false;
+}
+
+fn load_error_message(session_id: str) -> text::Text {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return (*sp).load_state.error_message();
+        }
+    }
+    return text::from_str("");
+}
+
+fn begin_load(session_id: str, cwd: str = "", title: str = "", clear_blocks: bool = false) {
+    _ensure_global();
+    _STORE.begin_load(session_id, cwd: cwd, title: title, clear_blocks: clear_blocks);
+}
+
+fn mark_loaded(session_id: str) { _ensure_global(); _STORE.mark_loaded(session_id); }
+fn mark_load_failed(session_id: str, message: str) { _ensure_global(); _STORE.mark_load_failed(session_id, message); }
+fn reset_session_blocks(session_id: str, cwd: str = "", title: str = "") {
+    _ensure_global();
+    _STORE.reset_session_blocks(session_id, cwd: cwd, title: title);
+}
+fn mark_read(session_id: str) { _ensure_global(); _STORE.mark_read(session_id); }
+fn mark_unread(session_id: str) { _ensure_global(); _STORE.mark_unread(session_id); }
+fn set_config_options(session_id: str, take opts: vec::Vec[types::ConfigOption]) {
+    _ensure_global();
+    _STORE.set_config_options(session_id, opts);
+}
+fn set_config_value_optimistic(session_id: str, config_id: str, value: str) {
+    _ensure_global();
+    _STORE.set_config_value_optimistic(session_id, config_id, value);
+}
+fn begin_turn(session_id: str, user_text: str) { _ensure_global(); _STORE.begin_turn(session_id, user_text); }
+fn apply_prompt_result(session_id: str, res: types::PromptResult) { _ensure_global(); _STORE.apply_prompt_result(session_id, res); }
+fn apply_turn_error(session_id: str, message: str) { _ensure_global(); _STORE.apply_turn_error(session_id, message); }
+fn apply_permission_request(req: types::PermissionRequest) { _ensure_global(); _STORE.apply_permission_request(req); }
+fn resolve_permission(session_id: str, tool_call_id: str, option_id: str) {
+    _ensure_global();
+    _STORE.resolve_permission(session_id, tool_call_id, option_id);
+}
+fn apply_update(env: types::SessionUpdateEnvelope) { _ensure_global(); _STORE.apply_update(env); }
+fn set_session_title(session_id: str, new_title: str) { _ensure_global(); _STORE.set_session_title(session_id, new_title); }
+
+fn summary_snapshot(session_id: str) -> SessionSummarySnapshot {
+    _ensure_global();
+    return _STORE.summary_snapshot(session_id);
+}
+
+fn session_title(session_id: str) -> text::Text {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return (*sp).title.clone();
+        }
+    }
+    return text::from_str("");
+}
+
+fn session_cwd(session_id: str) -> text::Text {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return (*sp).cwd.clone();
+        }
+    }
+    return text::from_str("");
+}
+
+fn is_turn_active(session_id: str) -> bool {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return (*sp).turn_state.is_running() || (*sp).turn_state.is_waiting_permission();
+        }
+    }
+    return false;
+}
+
+fn session_block_count(sidx: usize) -> usize {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        return (*sp).blocks.count();
+    }
+    return 0 as usize;
+}
+
+fn session_block_kind(sidx: usize, bidx: usize) -> BlockKind {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bidx) {
+            return (*bp).kind();
+        }
+    }
+    return BlockKind::Unknown;
+}
+
+fn session_block_text_body(sidx: usize, bidx: usize) -> text::Text {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bidx) {
+            return (*bp).text_body();
+        }
+    }
+    return text::from_str("");
+}
+
+fn session_clone_tool_block(sidx: usize, bidx: usize) -> option::Option[ToolBlock] {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bidx) {
+            return (*bp).clone_tool_block();
+        }
+    }
+    return option::Option[ToolBlock]::None;
+}
+
+fn session_clone_permission_block(sidx: usize, bidx: usize) -> option::Option[PermissionBlock] {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bidx) {
+            return (*bp).clone_permission_block();
+        }
+    }
+    return option::Option[PermissionBlock]::None;
+}
+
+fn session_turn_is_idle_cancelled(sidx: usize) -> bool {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        return (*sp).turn_state.is_idle() && (*sp).was_cancelled();
+    }
+    return false;
+}
+
+fn session_turn_is_running(sidx: usize) -> bool {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        return (*sp).turn_state.is_running();
+    }
+    return false;
+}
+
+fn session_turn_error_message(sidx: usize) -> text::Text {
+    _ensure_global();
+    if let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) {
+        return (*sp).turn_state.error_message();
+    }
+    return text::from_str("");
+}
+
+fn config_options(session_id: str) -> vec::Vec[types::ConfigOption] {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return _clone_config_options((*sp).config_options);
+        }
+    }
+    return vec::new::[types::ConfigOption]();
+}
+
+fn available_commands(session_id: str) -> vec::Vec[types::AvailableCommand] {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return _clone_available_commands((*sp).available_commands);
+        }
+    }
+    return vec::new::[types::AvailableCommand]();
+}
+
+fn plan_entries(session_id: str) -> vec::Vec[types::PlanEntry] {
+    _ensure_global();
+    if let option::Option::Some(idx) = _STORE.find_session_index(session_id) {
+        if let option::Option::Some(sp) = _STORE.sessions.at_ptr(idx) {
+            return _clone_plan_entries((*sp).plan_entries);
+        }
+    }
+    return vec::new::[types::PlanEntry]();
+}
+
+fn pending_permission(session_id: str) -> option::Option[PermissionBlock] {
+    _ensure_global();
+    guard let option::Option::Some(sidx) = _STORE.find_session_index(session_id) else {
+        return option::Option[PermissionBlock]::None;
+    };
+    guard let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) else {
+        return option::Option[PermissionBlock]::None;
+    };
+    var i: usize = (*sp).blocks.count();
+    while i > (0 as usize) {
+        i = i -% (1 as usize);
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(i) {
+            if let option::Option::Some(pb) = (*bp).clone_permission_block() {
+                let open: bool = match pb.resolved_option {
+                    option::Option::None => true,
+                    _ => false,
+                };
+                if open { return option::Option[PermissionBlock]::Some(pb); }
+            }
+        }
+    }
+    return option::Option[PermissionBlock]::None;
+}
+
+fn last_answer_text(session_id: str) -> text::Text {
+    _ensure_global();
+    guard let option::Option::Some(sidx) = _STORE.find_session_index(session_id) else {
+        return text::from_str("");
+    };
+    guard let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) else {
+        return text::from_str("");
+    };
+    let n: usize = (*sp).blocks.count();
+    if n == (0 as usize) { return text::from_str(""); }
+    var chunks: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var i: usize = n;
+    while i > (0 as usize) {
+        i = i -% (1 as usize);
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(i) {
+            let k: BlockKind = (*bp).kind();
+            if k == BlockKind::AgentText {
+                let body: text::Text = (*bp).text_body();
+                if !body.is_empty() {
+                    let _ = chunks.append(body);
+                }
+            } else if k == BlockKind::UserText && chunks.count() > (0 as usize) {
+                break;
+            }
+        }
+    }
+    var out: text::Text = text::new();
+    var ci: usize = chunks.count();
+    while ci > (0 as usize) {
+        ci = ci -% (1 as usize);
+        if let option::Option::Some(cp) = chunks.at_ptr(ci) {
+            if !out.is_empty() { let _ = out.append("\n\n"); }
+            let _ = out.append((*cp).view());
+        }
+    }
+    return out;
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+fn _replay_fixture_into_store(ref store: ConversationStore, fixture_path: str) -> usize {
+    guard let result::Result::Ok(contents) = fs::read_to_string(fixture_path) else {
+        assert false;
+        return 0 as usize;
+    };
+    let lines: vec::Vec[str] = contents.view().split(separator: "\n");
+    var decoded: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if let option::Option::Some(line) = lines.at(i) {
+            let trimmed: str = line.trim();
+            if !trimmed.is_empty() {
+                if let result::Result::Ok(rec) = json::Value::parse(source: trimmed) {
+                    if let option::Option::Some(dir_v) = rec.value(for_key: "dir") {
+                        if let option::Option::Some(dir_t) = dir_v.as_text() {
+                            if dir_t.equals("<") {
+                                if let option::Option::Some(msg_v) = rec.value(for_key: "msg") {
+                                    let msg_line: text::Text = msg_v.to_text();
+                                    match wire::decode_line(msg_line.view()) {
+                                        wire::Envelope::Notification(n) => {
+                                            if n.method.equals("session/update") {
+                                                if let option::Option::Some(env) = types::decode_session_update(n.params) {
+                                                    store.apply_update(env);
+                                                    decoded = decoded +% (1 as usize);
+                                                }
+                                            }
+                                        }
+                                        wire::Envelope::Request(r) => {
+                                            if r.method.equals("session/request_permission") {
+                                                if let option::Option::Some(pr) = types::decode_permission_request(r.id, r.params) {
+                                                    store.apply_permission_request(pr);
+                                                    decoded = decoded +% (1 as usize);
+                                                }
+                                            }
+                                        }
+                                        wire::Envelope::Response(_resp) => {}
+                                        wire::Envelope::Invalid(_e) => { assert false; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return decoded;
+}
+
+fn _block_has_completed_diff(b: Block, expected_new: str) -> bool {
+    return match b {
+        Block::ToolCall(tb) => !tb.diff_path.is_empty() && tb.diff_new.equals(expected_new) && tb.status.is_completed(),
+        _ => false,
+    };
+}
+
+fn _block_has_completed_bash_containing(b: Block, needle: str) -> bool {
+    return match b {
+        Block::ToolCall(tb) => tb.family.equals("Bash") && tb.output_text.contains(needle) && tb.status.is_completed(),
+        _ => false,
+    };
+}
+
+fn _block_is_rejected_tool(b: Block) -> bool {
+    return match b {
+        Block::ToolCall(tb) => tb.status.is_failed() && tb.tool_not_run.equals("rejected"),
+        _ => false,
+    };
+}
+
+fn _block_is_completed_tool(b: Block) -> bool {
+    return match b {
+        Block::ToolCall(tb) => tb.status.is_completed(),
+        _ => false,
+    };
+}
+
+fn _session_permission_count(s: SessionState) -> usize {
+    var c: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < s.blocks.count() {
+        if let option::Option::Some(bp) = s.blocks.at_ptr(i) {
+            if (*bp).is_permission() { c = c +% (1 as usize); }
+        }
+        i = i +% (1 as usize);
+    }
+    return c;
+}
+
+#[test]
+fn fixture_main_decodes_tools_diffs_and_messages() {
+    var store: ConversationStore = ConversationStore::new();
+    let n: usize = _replay_fixture_into_store(store, "fixtures/acp/grok-1.0.92-main.jsonl");
+    assert n > (50 as usize);
+    assert store.session_count() == (2 as usize);
+
+    guard let option::Option::Some(sp) = store.session_ptr(0 as usize) else { assert false; return; };
+    assert !(*sp).title.is_empty();
+    assert (*sp).tool_call_count() >= (2 as usize);
+    assert (*sp).config_options.count() >= (2 as usize);
+    assert !(*sp).all_agent_text().is_empty();
+
+    var saw_diff: bool = false;
+    var saw_bash_ok: bool = false;
+    var bi: usize = 0 as usize;
+    while bi < (*sp).blocks.count() {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bi) {
+            if _block_has_completed_diff(*bp, "hi") { saw_diff = true; }
+            if _block_has_completed_bash_containing(*bp, "spike-ok") { saw_bash_ok = true; }
+        }
+        bi = bi +% (1 as usize);
+    }
+    assert saw_diff;
+    assert saw_bash_ok;
+}
+
+#[test]
+fn fixture_permission_decodes_permission_requests_and_rejection() {
+    var store: ConversationStore = ConversationStore::new();
+    let n: usize = _replay_fixture_into_store(store, "fixtures/acp/grok-1.0.92-permission.jsonl");
+    assert n > (20 as usize);
+    assert store.session_count() == (1 as usize);
+
+    guard let option::Option::Some(sp) = store.session_ptr(0 as usize) else { assert false; return; };
+    assert _session_permission_count(*sp) == (2 as usize);
+    assert (*sp).turn_state.is_waiting_permission();
+
+    var saw_rejected: bool = false;
+    var bi: usize = 0 as usize;
+    while bi < (*sp).blocks.count() {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bi) {
+            if _block_is_rejected_tool(*bp) { saw_rejected = true; }
+        }
+        bi = bi +% (1 as usize);
+    }
+    assert saw_rejected;
+}
+
+#[test]
+fn fixture_session_load_decodes_replayed_history_and_finished_tools() {
+    var store: ConversationStore = ConversationStore::new();
+    let n: usize = _replay_fixture_into_store(store, "fixtures/acp/grok-1.0.92-session-load.jsonl");
+    assert n > (15 as usize);
+    assert store.session_count() == (1 as usize);
+
+    guard let option::Option::Some(sp) = store.session_ptr(0 as usize) else { assert false; return; };
+    assert (*sp).all_user_text().contains("hello.txt");
+    assert (*sp).tool_call_count() == (5 as usize);
+
+    var completed: usize = 0 as usize;
+    var bi: usize = 0 as usize;
+    while bi < (*sp).blocks.count() {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(bi) {
+            if _block_is_completed_tool(*bp) { completed = completed +% (1 as usize); }
+        }
+        bi = bi +% (1 as usize);
+    }
+    assert completed == (5 as usize);
+}
+
+#[test]
+fn fixture_mcp_tool_turn_decodes_cleanly() {
+    var store: ConversationStore = ConversationStore::new();
+    let n: usize = _replay_fixture_into_store(store, "fixtures/acp/grok-1.0.92-mcp-tool-turn.jsonl");
+    assert n > (20 as usize);
+    assert store.session_count() == (1 as usize);
+    guard let option::Option::Some(sp) = store.session_ptr(0 as usize) else { assert false; return; };
+    assert !(*sp).all_agent_text().is_empty();
+    assert (*sp).tool_call_count() == (2 as usize);
+}

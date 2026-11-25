@@ -1,0 +1,822 @@
+// src/ui/home_view.cplus — what the main window shows when no run is open.
+//
+// Centre: "What should Grok work on?", the composer with its Project /
+// Model / Effort / Approvals chips and "Start run", every run that is
+// waiting on an approval (answerable right here), and the projects grid.
+// Right: the engine's connection and the plan's usage.
+//
+// Starting a run is a prompt sent with no active session: the engine makes
+// the session first, and the main screen swaps to the conversation when
+// the session becomes active.
+
+import "events/events" as events;
+import "facet/collection" as m_collection;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/list" as m_list;
+import "facet/mount" as mount;
+import "facet/popup" as m_popup;
+import "facet/split" as m_split;
+import "facet/text_area" as text_area;
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "../acp/wire" as wire;
+import "../engine/runtime" as engine;
+import "../store/account" as account;
+import "../store/conversation" as conversation;
+import "../store/prefs" as prefs;
+import "../store/sessions" as sessions;
+import "./attachments" as attachments;
+import "./composer_popup" as composer_popup;
+import "./panels" as panels;
+import "./pickers" as pickers;
+import "./style" as style;
+
+const NEEDS_ROW_H: f64 = 96.0f64;
+
+// One run waiting on the user, with the approval it is waiting on.
+struct NeedsItem {
+    session_id: text::Text,
+    cwd: text::Text,
+    title: text::Text,
+    command: text::Text,
+    rpc_id: wire::JsonRpcId,
+    tool_call_id: text::Text,
+    allow_id: text::Text,
+    deny_id: text::Text,
+}
+
+// One project tile: the folder, what its runs need, and its latest run.
+struct ProjectItem {
+    name: text::Text,
+    path: text::Text,
+    status: text::Text,
+    needs_you: bool,
+    latest_title: text::Text,
+    latest_sid: text::Text,
+}
+
+const EV_HOME_SLASH: str = "desk420.home.slash";
+
+fn _option_of_kind(opts: vec::Vec[types::PermissionOption], allow: bool) -> text::Text {
+    var i: usize = 0 as usize;
+    while i < opts.count() {
+        if let option::Option::Some(op) = opts.at_ptr(i) {
+            let hit: bool = match (*op).kind {
+                types::PermissionKind::AllowOnce => allow,
+                types::PermissionKind::RejectOnce => !allow,
+                _ => false,
+            };
+            if hit { return (*op).option_id.clone(); }
+        }
+        i = i +% (1 as usize);
+    }
+    return text::from_str("");
+}
+
+struct HomeView {
+    needs: vec::Vec[NeedsItem],
+    projects: vec::Vec[ProjectItem],
+    model_values: vec::Vec[text::Text],
+    effort_values: vec::Vec[text::Text],
+    project_paths: vec::Vec[text::Text],
+    files: attachments::Attachments,
+    popup: composer_popup::ComposerPopup,
+    panel: panels::TrailingPanel,
+    composer_has_text: bool,
+    sessions_sub: events::SignalSubscription[sessions::SessionsChange],
+    status_sub: events::SignalSubscription[engine::EngineStateEvent],
+    account_sub: events::SignalSubscription[account::AccountChange],
+    slash_sub: events::Subscription,
+}
+
+impl HomeView {
+    fn new() -> HomeView {
+        return HomeView {
+            needs: vec::new::[NeedsItem](),
+            projects: vec::new::[ProjectItem](),
+            model_values: vec::new::[text::Text](),
+            effort_values: vec::new::[text::Text](),
+            project_paths: vec::new::[text::Text](),
+            files: attachments::Attachments::new("home", stage_key: "home:center", floating: false),
+            popup: composer_popup::ComposerPopup::new("home", "home:composer", stage_key: "home:center"),
+            panel: panels::TrailingPanel::new("home:split", 320.0f64),
+            composer_has_text: false,
+            sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
+            status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+            account_sub: events::SignalSubscription[account::AccountChange]::none(),
+            slash_sub: events::Subscription::none(),
+        };
+    }
+
+    // ---- model ----------------------------------------------------------------
+
+    fn _rebuild_needs(ref this) {
+        this.needs.remove_all();
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if (*rp).task_state == sessions::TaskState::NeedsYou {
+                    if let option::Option::Some(pb) = conversation::pending_permission((*rp).session_id.view()) {
+                        let cmd: text::Text = if !pb.command.is_empty() {
+                            pb.command.clone()
+                        } else if !pb.description.is_empty() {
+                            pb.description.clone()
+                        } else {
+                            pb.title.clone()
+                        };
+                        let _ = this.needs.append(NeedsItem {
+                            session_id: (*rp).session_id.clone(),
+                            cwd: (*rp).cwd.clone(),
+                            title: (*rp).title.clone(),
+                            command: cmd,
+                            rpc_id: pb.rpc_id.clone(),
+                            tool_call_id: pb.tool_call_id.clone(),
+                            allow_id: _option_of_kind(pb.options, true),
+                            deny_id: _option_of_kind(pb.options, false),
+                        });
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    fn _project_index(ref this, path: str) -> i64 {
+        var i: usize = 0 as usize;
+        while i < this.projects.count() {
+            if let option::Option::Some(pp) = this.projects.at_ptr(i) {
+                if (*pp).path.equals(path) { return i as i64; }
+            }
+            i = i +% (1 as usize);
+        }
+        return -1 as i64;
+    }
+
+    fn _rebuild_projects(ref this) {
+        this.projects.remove_all();
+        // Rows arrive needs-you first, so the first row seen for a folder is
+        // the one that says the most about it.
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if !(*rp).is_general() {
+                    let at: i64 = this._project_index((*rp).cwd.view());
+                    let st: sessions::TaskState = (*rp).task_state;
+                    if at < (0 as i64) {
+                        let label: str = match st {
+                            sessions::TaskState::NeedsYou => "Needs you",
+                            sessions::TaskState::Running => "Running",
+                            sessions::TaskState::Failed => "Failed",
+                            _ => "Idle",
+                        };
+                        let _ = this.projects.append(ProjectItem {
+                            name: (*rp).folder_name.clone(),
+                            path: (*rp).cwd.clone(),
+                            status: text::from_str(label),
+                            needs_you: st == sessions::TaskState::NeedsYou,
+                            latest_title: (*rp).title.clone(),
+                            latest_sid: (*rp).session_id.clone(),
+                        });
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        // Folders added by hand that have no run yet.
+        let folders: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+        var f: usize = 0 as usize;
+        while f < folders.count() {
+            if let option::Option::Some(fp) = folders.at_ptr(f) {
+                if this._project_index((*fp).path.view()) < (0 as i64) {
+                    let _ = this.projects.append(ProjectItem {
+                        name: (*fp).name.clone(),
+                        path: (*fp).path.clone(),
+                        status: text::from_str("Idle"),
+                        needs_you: false,
+                        latest_title: text::from_str("No runs yet"),
+                        latest_sid: text::from_str(""),
+                    });
+                }
+            }
+            f = f +% (1 as usize);
+        }
+    }
+
+    // ---- syncing the live tree --------------------------------------------------
+
+    fn _sync_lists(ref this) {
+        this._rebuild_needs();
+        this._rebuild_projects();
+        let n: usize = this.needs.count();
+        style::show("home:needs_section", n > (0 as usize));
+        if let option::Option::Some(ln) = mount::find("home:needs") {
+            core::set_height(ln, (n as f64) * NEEDS_ROW_H);
+        }
+        if let option::Option::Some(l) = m_list::find("home:needs") {
+            let _l: m_list::List = l.set_count(n);
+        }
+        let pc: usize = this.projects.count();
+        if let option::Option::Some(c) = m_collection::find("home:projects") {
+            let _c: m_collection::Collection = c.set_count(pc);
+        }
+        style::show("home:projects_section", pc > (0 as usize));
+    }
+
+    fn _sync_pickers(ref this) {
+        this.model_values = pickers::fill_config("home:model", "model");
+        this.effort_values = pickers::fill_config("home:effort", "reasoning_effort");
+        this.project_paths = pickers::fill_project("home:cwd");
+        pickers::fill_mode("home:mode");
+    }
+
+    fn _sync_engine(ref this) {
+        let kind: engine::StatusKind = engine::status_kind();
+        let ready: bool = match kind { engine::StatusKind::Ready => true, _ => false };
+        let status_txt: text::Text = if ready {
+            text::from_str("Connected")
+        } else {
+            let d: text::Text = engine::status_detail();
+            if d.is_empty() { text::from_str("Starting…") } else { d }
+        };
+        style::set_label("home:engine_status", status_txt.view());
+        if let option::Option::Some(dn) = mount::find("home:engine_dot") {
+            core::set_background_color(dn, if ready { style::ok_green() } else { style::faint() });
+        }
+        let ver: text::Text = engine::cli_version();
+        style::set_label("home:version", if ver.is_empty() { "—" } else { ver.view() });
+        let plan: text::Text = account::plan_label();
+        let conn: text::Text = "${plan.view()} via Grok CLI (ACP)";
+        style::set_label("home:connection", conn.view());
+        style::set_label("home:approvals", pickers::mode_name(engine::approval_mode()));
+    }
+
+    fn _sync_usage(ref this) {
+        let pct: text::Text = account::usage_percent_label();
+        let phrase: text::Text = if pct.view().has_suffix("%") {
+            account::usage_period_phrase()
+        } else {
+            text::from_str("")
+        };
+        let reset: text::Text = account::usage_reset_pretty();
+        let prepaid: text::Text = account::prepaid_label();
+        style::set_label("home:usage_pct", pct.view());
+        style::set_label("home:usage_period", phrase.view());
+        style::set_label("home:usage_reset", reset.view());
+        style::set_label("home:usage_prepaid", prepaid.view());
+        style::set_bar("home:usage_bar", account::usage_fraction());
+    }
+
+    // ---- recycled sources ---------------------------------------------------------
+
+    fn needs_height(ref this, _index: usize) -> f64 { return NEEDS_ROW_H; }
+
+    fn build_needs_row(ref this, index: usize) -> core::Node {
+        guard let option::Option::Some(it) = this.needs.at_ptr(index) else {
+            return @ui { column {} };
+        };
+        let title: text::Text = (*it).title.clone();
+        let cmd: text::Text = (*it).command.clone();
+        let allow_key: text::Text = "home:allow:${index}";
+        let deny_key: text::Text = "home:deny:${index}";
+        let open_key: text::Text = "home:open:${index}";
+        let title_key: text::Text = "home:needs:${index}";
+        let body: core::Node = @ui {
+            hstack {
+                column {
+                    label(title.view(), key: title_key.view(),
+                    font_size: 15.0f64,
+                    font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                    label(cmd.view(),
+                    font_family: ftheme::MONOSPACE,
+                    font_size: 13.5f64,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .gap(8.0f64)
+                style::primary_button("Allow once", allow_key.view(), on_click: this.on_allow)
+                style::outline_button("Deny", deny_key.view(), on_click: this.on_deny)
+                style::outline_button("Open", open_key.view(), on_click: this.on_open)
+            }
+            .align(flex::Align::Center)
+                .gap(10.0f64)
+                .padding_edge(flex::Edge::Horizontal, 18.0f64)
+                .padding_edge(flex::Edge::Vertical, 14.0f64)
+        };
+        return @ui {
+            column {
+                style::card_box("", body, radius: 14.0f64, accent: true)
+            }
+            .padding_edge(flex::Edge::Bottom, 12.0f64)
+        };
+    }
+
+    fn build_project_tile(ref this, index: usize) -> core::Node {
+        guard let option::Option::Some(it) = this.projects.at_ptr(index) else {
+            return @ui { column {} };
+        };
+        let name: text::Text = (*it).name.clone();
+        let status: text::Text = (*it).status.clone();
+        let latest: text::Text = (*it).latest_title.clone();
+        let name_key: text::Text = "home:project:${index}";
+        let tile_key: text::Text = "home:project_tile:${index}";
+        let status_col: vocab::Color = if (*it).needs_you { style::ink() } else { style::muted() };
+        let is_left: bool = (index % (2 as usize)) == (0 as usize);
+        let pad_l: f64 = if is_left { 0.0f64 } else { 6.0f64 };
+        let pad_r: f64 = if is_left { 6.0f64 } else { 0.0f64 };
+        let body: core::Node = @ui {
+            column {
+                hstack {
+                    label(name.view(), key: name_key.view(),
+                    font_size: 17.0f64,
+                    font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                    label(status.view(), font_size: 13.0f64, text_color: status_col)
+                        .shrink(0.0f64)
+                }
+                .align(flex::Align::Center)
+                    .gap(8.0f64)
+                    .min_width(0.0f64)
+                label(latest.view(),
+                font_size: 14.0f64,
+                text_color: style::muted(),
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                    .shrink(1.0f64)
+                    .min_width(0.0f64)
+            }
+            .gap(14.0f64)
+                .min_width(0.0f64)
+                .padding_edge(flex::Edge::Horizontal, 18.0f64)
+                .padding_edge(flex::Edge::Vertical, 18.0f64)
+                .set_input_transparent(true)
+        };
+        return @ui {
+            column {
+                style::card_box(tile_key.view(), body, radius: 14.0f64)
+                    .grow(1.0f64)
+                    .min_width(0.0f64)
+                    .set_input_transparent(true)
+            }
+            .padding_edge(flex::Edge::Left, pad_l)
+                .padding_edge(flex::Edge::Right, pad_r)
+                .padding_edge(flex::Edge::Bottom, 12.0f64)
+                .min_width(0.0f64)
+        };
+    }
+
+    // ---- handlers ---------------------------------------------------------------
+
+    fn _answer(ref this, sender: *u8, allow: bool) {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return; };
+        guard let option::Option::Some(it) = this.needs.at_ptr(at) else { return; };
+        let opt: text::Text = if allow { (*it).allow_id.clone() } else { (*it).deny_id.clone() };
+        if opt.is_empty() { return; }
+        let sid: text::Text = (*it).session_id.clone();
+        let tcid: text::Text = (*it).tool_call_id.clone();
+        engine::respond_permission(sid.view(), (*it).rpc_id.clone(), tcid.view(), opt.view());
+    }
+
+    fn on_allow(ref this, sender: *u8) { this._answer(sender, true); }
+    fn on_deny(ref this, sender: *u8) { this._answer(sender, false); }
+
+    fn on_open(ref this, sender: *u8) {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return; };
+        guard let option::Option::Some(it) = this.needs.at_ptr(at) else { return; };
+        let sid: text::Text = (*it).session_id.clone();
+        let cwd: text::Text = (*it).cwd.clone();
+        let title: text::Text = (*it).title.clone();
+        engine::load_session(sid.view(), cwd.view(), title: title.view());
+    }
+
+    // A project tile opens its latest run, or starts one there when it has none.
+    fn on_project_selected(ref this, _sender: *u8) {
+        guard let option::Option::Some(c) = m_collection::find("home:projects") else { return; };
+        let idx: i64 = c.selected_index();
+        if idx < (0 as i64) { return; }
+        let _c: m_collection::Collection = c.set_selected_index(-1 as i64);
+        guard let option::Option::Some(it) = this.projects.at_ptr(idx as usize) else { return; };
+        let path: text::Text = (*it).path.clone();
+        if (*it).latest_sid.is_empty() {
+            sessions::set_selected_project(path.view());
+            engine::new_chat(cwd: path.view());
+            return;
+        }
+        let sid: text::Text = (*it).latest_sid.clone();
+        let title: text::Text = (*it).latest_title.clone();
+        engine::load_session(sid.view(), path.view(), title: title.view());
+    }
+
+    fn on_model_changed(ref this, _sender: *u8) {
+        let v: text::Text = pickers::picked("home:model", this.model_values);
+        if v.is_empty() { return; }
+        engine::set_config_option("model", v.view());
+        this.model_values = pickers::fill_config("home:model", "model");
+    }
+
+    fn on_effort_changed(ref this, _sender: *u8) {
+        let v: text::Text = pickers::picked("home:effort", this.effort_values);
+        if v.is_empty() { return; }
+        engine::set_config_option("reasoning_effort", v.view());
+        this.effort_values = pickers::fill_config("home:effort", "reasoning_effort");
+    }
+
+    fn on_mode_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(p) = m_popup::find("home:mode") else { return; };
+        engine::set_approval_mode(engine::ApprovalMode::from_index(p.selected_index()));
+    }
+
+    fn on_project_changed(ref this, _sender: *u8) {
+        let v: text::Text = pickers::picked("home:cwd", this.project_paths);
+        if v.equals(pickers::SEP) {
+            this.project_paths = pickers::fill_project("home:cwd");
+            return;
+        }
+        if v.equals(pickers::CHOOSE) {
+            pickers::choose_and_open_project();
+            this.project_paths = pickers::fill_project("home:cwd");
+            return;
+        }
+        sessions::set_selected_project(v.view());
+        engine::new_chat(cwd: v.view());
+    }
+
+    fn on_add_project(ref this, _sender: *u8) -> bool {
+        pickers::choose_and_open_project();
+        return true;
+    }
+
+    fn on_attach_file(ref this, _sender: *u8) -> bool {
+        this.files.choose();
+        return true;
+    }
+
+    fn on_remove_attachment(ref this, sender: *u8) -> bool {
+        this.files.remove_from_sender(sender);
+        return true;
+    }
+
+    fn on_drag_over(ref this, sender: *u8) -> bool {
+        return this.files.handle_drag_over(sender);
+    }
+
+    fn on_drag_leave(ref this, sender: *u8) -> bool {
+        return this.files.handle_drag_leave(sender);
+    }
+
+    fn on_drop(ref this, sender: *u8) -> bool {
+        return this.files.handle_drop(sender);
+    }
+
+    fn _sync_composer(ref this) {
+        guard let option::Option::Some(ta) = text_area::find("home:composer") else { return; };
+        let cur: text::Text = text::from_str(ta.text());
+        let has_txt: bool = !cur.is_empty();
+        // Workaround: facet_appkit's `did_change_imp` refreshes the editor
+        // placeholder on programmatic `set_text`, not on interactive typing.
+        if has_txt != this.composer_has_text {
+            this.composer_has_text = has_txt;
+            let ph: str = if has_txt { "" } else { style::COMPOSER_PLACEHOLDER };
+            let _ta: text_area::TextArea = ta.set_placeholder(ph);
+        }
+        let proj: text::Text = sessions::selected_project();
+        this.popup.update(cur.view(), proj.view());
+    }
+
+    fn on_composer_changed(ref this, _sender: *u8) {
+        this._sync_composer();
+    }
+
+    fn on_slash_event(ref this, _name: str) {
+        guard let option::Option::Some(ta) = text_area::find("home:composer") else { return; };
+        let cur: str = ta.text();
+        let needs_space: bool = !cur.is_empty() && !cur.has_suffix(" ") && !cur.has_suffix("\n") && !cur.has_suffix("/");
+        let next: text::Text = if cur.has_suffix("/") {
+            text::from_str(cur)
+        } else if needs_space {
+            "${cur} /"
+        } else {
+            "${cur}/"
+        };
+        let end_pos: i64 = next.count() as i64;
+        let _t: text_area::TextArea = ta.set_text(next.view()).set_cursor_position(end_pos);
+        if !ta.is_focused() {
+            let _f: text_area::TextArea = ta.focus();
+        }
+        this._sync_composer();
+    }
+
+    fn on_popup_pick(ref this, sender: *u8) -> bool {
+        return this.popup.pick_from_sender(sender);
+    }
+
+    fn _start(ref this) {
+        guard let option::Option::Some(ta) = text_area::find("home:composer") else { return; };
+        let raw: text::Text = text::from_str(ta.text());
+        let trimmed: str = raw.view().trim();
+        let has_files: bool = this.files.count() > (0 as usize);
+        if trimmed.is_empty() && !has_files { return; }
+        this.composer_has_text = false;
+        let _ta: text_area::TextArea = ta.set_text("").set_placeholder(style::COMPOSER_PLACEHOLDER);
+        this.popup.hide();
+        if has_files {
+            let prompt_txt: str = if trimmed.is_empty() { "Please inspect the attached files." } else { trimmed };
+            engine::send_prompt_with_attachments(prompt_txt, this.files.take_all());
+        } else {
+            engine::send_prompt(trimmed);
+        }
+    }
+
+    fn on_start(ref this, _sender: *u8) { this._start(); }
+
+    fn on_composer_key(ref this, event: *u8) -> bool {
+        if this.popup.handle_key(event) { return true; }
+        if gestures::key_named(event) == gestures::key_return() {
+            let mods: u64 = gestures::key_modifiers(event);
+            let want_cmd: bool = prefs::send_key() == prefs::SendKeyPref::CmdReturn;
+            let submit: bool = if want_cmd {
+                gestures::has_modifier(mods, gestures::mod_command()) || gestures::has_modifier(mods, gestures::mod_control())
+            } else {
+                !gestures::has_modifier(mods, gestures::mod_shift())
+            };
+            if submit {
+                this._start();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) {
+        this._sync_lists();
+        this.project_paths = pickers::fill_project("home:cwd");
+    }
+
+    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
+        this._sync_lists();
+        this._sync_pickers();
+        this._sync_engine();
+    }
+
+    fn on_account_changed(ref this, _ev: account::AccountChange) {
+        this._sync_usage();
+        this._sync_engine();
+    }
+
+    // ---- node helpers -------------------------------------------------------------
+
+    fn _kv(this, title: str, key: str, mono: bool = false) -> core::Node {
+        return @ui {
+            hstack {
+                label(title, font_size: 13.5f64, text_color: style::muted(), max_lines: 1 as i64)
+                    .shrink(0.0f64)
+                spacer().grow(1.0f64)
+                label("", key: key,
+                font_size: 13.5f64,
+                font_family: if mono { ftheme::MONOSPACE } else { "" },
+                text_color: style::ink(),
+                text_align: vocab::TextAlign::End,
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                    .shrink(1.0f64)
+            }
+            .align(flex::Align::Center)
+                .gap(10.0f64)
+        };
+    }
+
+    fn _composer(ref this) -> core::Node {
+        let body: core::Node = @ui {
+            column {
+                this.files.build_drop_hint()
+                this.files.build_strip(on_remove: this.on_remove_attachment)
+                text_area("", key: "home:composer",
+                font_size: 16.0f64,
+                font_scales: false,
+                placeholder: style::COMPOSER_PLACEHOLDER,
+                placeholder_color: style::faint(),
+                text_color: style::ink(),
+                bordered: false,
+                on_text_changed: this.on_composer_changed)
+                    .height(64.0f64)
+                    .gesture(on_key: this.on_composer_key,
+                    allow_file_drop: true,
+                    on_drag_over: this.on_drag_over,
+                    on_drag_leave: this.on_drag_leave,
+                    on_drop: this.on_drop)
+                hstack {
+                    style::circle_icon(icons::add, "home:attach",
+                    title: "Attach file or image",
+                    size: 30.0f64, icon_size: 18.0f64,
+                    color: style::ink(),
+                    on_click: this.on_attach_file)
+                    style::picker_chip("home:cwd", "Project", on_changed: this.on_project_changed)
+                    style::picker_chip("home:model", "Model", on_changed: this.on_model_changed)
+                    style::picker_chip("home:effort", "Effort", on_changed: this.on_effort_changed)
+                    style::picker_chip("home:mode", "Approvals", on_changed: this.on_mode_changed)
+                    spacer().grow(1.0f64)
+                    style::primary_button("Start run  →", "home:start", on_click: this.on_start,
+                    height: 32.0f64, font_size: 13.5f64)
+                        .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                        .shrink(0.0f64)
+                }
+                .align(flex::Align::Center)
+                    .gap(6.0f64)
+            }
+            .gap(10.0f64)
+                .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                .padding_edge(flex::Edge::Top, 16.0f64)
+                .padding_edge(flex::Edge::Bottom, 14.0f64)
+        };
+        return style::card_box("home:composer_card", body, radius: 16.0f64)
+            .gesture(allow_file_drop: true,
+            on_drag_over: this.on_drag_over,
+            on_drag_leave: this.on_drag_leave,
+            on_drop: this.on_drop);
+    }
+}
+
+impl HomeView: component::Component {
+    fn build(ref this) -> core::Node {
+        return @ui {
+            split(key: "home:split",
+            position: 718.0f64,
+            min_leading: panels::CENTRE_MIN,
+            min_trailing: panels::PANEL_MIN,
+            divider_color: style::hairline(),
+            divider_thickness: 1.0f64,
+            role_leading: m_split::PaneRole::Content,
+            role_trailing: m_split::PaneRole::Content) {
+                column(key: "home:center") {
+                    label("What should Grok work on?", key: "home:title",
+                    font_size: 38.0f64,
+                    font_weight: vocab::FontWeight::Bold,
+                    text_color: style::ink(),
+                    max_lines: 1 as i64)
+                        .margin_edge(flex::Edge::Bottom, 6.0f64)
+                    this._composer()
+                    this.popup.build(on_pick: this.on_popup_pick)
+
+                    column(key: "home:needs_section") {
+                        style::caption("NEEDS YOU", accent: true)
+                        list(key: "home:needs")
+                            .height(0.0f64)
+                            .shrink(0.0f64)
+                    }
+                    .gap(14.0f64)
+                        .margin_edge(flex::Edge::Top, 18.0f64)
+
+                    column(key: "home:projects_section") {
+                        hstack {
+                            style::caption("PROJECTS")
+                            spacer().grow(1.0f64)
+                            hstack(key: "home:add_project") {
+                                symbol(icons::add, size: 14.0f64, color: style::ink())
+                                    .shrink(0.0f64)
+                                    .set_input_transparent(true)
+                                label("Add project",
+                                font_size: 12.0f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                text_color: style::ink(),
+                                max_lines: 1 as i64)
+                                    .set_input_transparent(true)
+                            }
+                            .align(flex::Align::Center)
+                                .gap(4.0f64)
+                                .height(26.0f64)
+                                .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                .set_background_color(style::chip())
+                                .set_corner_radius(vocab::Corners::all(7.0f64))
+                                .set_tooltip("Add project folder (⌘O)")
+                                .gesture(on_click: this.on_add_project)
+                        }
+                        .align(flex::Align::Center)
+                        collection(key: "home:projects",
+                        columns: 2 as usize,
+                        selection_mode: vocab::SelectionMode::Single,
+                        selection_highlight: vocab::SelectionHighlight::None,
+                        on_selection_changed: this.on_project_selected,
+                        row: this.build_project_tile)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .gap(14.0f64)
+                        .margin_edge(flex::Edge::Top, 18.0f64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .gap(14.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 30.0f64)
+                    .padding_edge(flex::Edge::Top, 52.0f64)
+                    .padding_edge(flex::Edge::Bottom, 16.0f64)
+                    .set_background_color(style::content())
+
+                column(key: "home:panel") {
+                    label("Engine", font_size: 17.0f64, font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::ink())
+                    hstack {
+                        style::dot(9.0f64, style::faint(), key: "home:engine_dot")
+                        label("Starting…", key: "home:engine_status", font_size: 14.5f64,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::TailTruncation, max_lines: 1 as i64)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .align(flex::Align::Center)
+                        .gap(10.0f64)
+                    this._kv("Version", "home:version", mono: true)
+                    this._kv("Connection", "home:connection")
+                    this._kv("Approvals", "home:approvals")
+
+                    label("Usage", font_size: 17.0f64, font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::ink())
+                        .margin_edge(flex::Edge::Top, 26.0f64)
+                    hstack {
+                        label("", key: "home:usage_pct", font_size: 44.0f64,
+                        font_weight: vocab::FontWeight::Bold, text_color: style::ink())
+                        label("", key: "home:usage_period", font_size: 15.0f64, text_color: style::muted())
+                            .margin_edge(flex::Edge::Bottom, 7.0f64)
+                    }
+                    .align(flex::Align::End)
+                        .gap(8.0f64)
+                    style::usage_bar("home:usage_bar")
+                    hstack {
+                        label("", key: "home:usage_reset", font_size: 14.0f64, text_color: style::muted(),
+                        max_lines: 1 as i64)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                        label("", key: "home:usage_prepaid", font_size: 14.0f64, text_color: style::muted(),
+                        max_lines: 1 as i64)
+                    }
+                    .align(flex::Align::Center)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .gap(14.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 28.0f64)
+                    .padding_edge(flex::Edge::Top, 32.0f64)
+                    .set_background_color(style::panel())
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+        };
+    }
+}
+
+impl HomeView: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.sessions_sub = sessions::watch(this.on_sessions_changed);
+        this.status_sub = engine::watch_status(this.on_status_changed);
+        this.account_sub = account::watch(this.on_account_changed);
+        this.slash_sub = events::on(EV_HOME_SLASH, this.on_slash_event);
+        if let option::Option::Some(l) = m_list::find("home:needs") {
+            let _l: m_list::List = l
+                .set_selection_mode(vocab::SelectionMode::None)
+                .set_separator(vocab::Separator::None)
+                .set_row(this.build_needs_row)
+                .set_row_height_of(this.needs_height)
+                .set_count(0 as usize);
+        }
+        this.files.sync();
+        this.popup.hide();
+        this.panel.arm();
+        panels::sync_panel("home:split", "home:panel");
+        if let option::Option::Some(ta) = text_area::find("home:composer") {
+            let _ta: text_area::TextArea = ta.focus();
+        }
+        this._sync_lists();
+        this._sync_pickers();
+        this._sync_engine();
+        this._sync_usage();
+    }
+}
+
+fn open_slash_commands() {
+    events::emit(EV_HOME_SLASH);
+}

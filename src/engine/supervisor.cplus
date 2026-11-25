@@ -1,0 +1,366 @@
+// src/engine/supervisor.cplus — manages the single ACP child process lifecycle.
+//
+// Spawns the agent (`grok agent stdio` or a test fake), runs `initialize` with
+// a 5 s timeout, detects crashes (`ClientEvent::Disconnected`), restarts with
+// exponential backoff, and tears down cleanly on exit.
+
+import "json/json" as json;
+import "stdlib/channel" as channel;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/process" as process;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+import "../acp/client" as client;
+import "../acp/types" as types;
+import "../acp/wire" as wire;
+import "../store/conversation" as conversation;
+import "../store/prefs" as prefs;
+
+enum SupervisorState {
+    Stopped,
+    Running,
+    Failed(text::Text),
+}
+
+impl SupervisorState {
+    fn is_running(this) -> bool {
+        return match this {
+            SupervisorState::Running => true,
+            _ => false,
+        };
+    }
+}
+
+struct Supervisor {
+    _argv: vec::Vec[text::Text],
+    _cwd: text::Text,
+    _max_restarts: i32,
+    _base_backoff_ms: i64,
+    _init_timeout_ms: i64,
+    _restart_count: i32,
+    state: SupervisorState,
+    // 0 or 1 active client. Using Vec[AcpClient] gives in-place `*AcpClient`
+    // via `at_ptr(0)` without moving out of `this`, and `remove_all()` runs
+    // `AcpClient::drop` (which shuts down and reaps the child).
+    _clients: vec::Vec[client::AcpClient],
+}
+
+fn _clone_text_vec(src: vec::Vec[text::Text]) -> vec::Vec[text::Text] {
+    var out: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var i: usize = 0 as usize;
+    while i < src.count() {
+        if let option::Option::Some(tp) = src.at_ptr(i) {
+            let _ = out.append((*tp).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+impl Supervisor {
+    fn new(take argv: vec::Vec[text::Text], cwd: str = "",
+    max_restarts: i32 = 3 as i32,
+    base_backoff_ms: i64 = 50 as i64,
+    init_timeout_ms: i64 = 5000 as i64) -> Supervisor {
+        return Supervisor {
+            _argv: argv,
+            _cwd: text::from_str(cwd),
+            _max_restarts: max_restarts,
+            _base_backoff_ms: base_backoff_ms,
+            _init_timeout_ms: init_timeout_ms,
+            _restart_count: 0 as i32,
+            state: SupervisorState::Stopped,
+            _clients: vec::new::[client::AcpClient](),
+        };
+    }
+
+    fn for_grok(binary_path: str, cwd: str = "") -> Supervisor {
+        let launcher: text::Text = prefs::browser_launcher_path();
+        var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+        let _ = argv.append(text::from_str("/usr/bin/env"));
+        let _ = argv.append("BROWSER=${launcher.view()}");
+        let _ = argv.append(text::from_str(binary_path));
+        let _ = argv.append(text::from_str("agent"));
+        let _ = argv.append(text::from_str("stdio"));
+        return Supervisor::new(argv, cwd: cwd);
+    }
+
+    fn pid(this) -> i32 {
+        if let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) {
+            return (*cp).pid();
+        }
+        return -1 as i32;
+    }
+
+    fn _spawn_and_init(ref this) -> bool {
+        let argv_copy: vec::Vec[text::Text] = _clone_text_vec(this._argv);
+        guard let option::Option::Some(ch) = client::AcpClient::spawn(argv_copy, cwd: this._cwd.view()) else {
+            this.state = SupervisorState::Failed(text::from_str("failed to spawn agent process"));
+            return false;
+        };
+        var cli: client::AcpClient = ch;
+
+        guard let option::Option::Some(p_init) = cli.send_request("initialize", types::params_initialize()) else {
+            let _ = cli.shutdown();
+            this.state = SupervisorState::Failed(text::from_str("failed to send initialize"));
+            return false;
+        };
+
+        match p_init.wait_timeout(this._init_timeout_ms) {
+            client::WaitOutcome::Response(resp) => {
+                match resp.error {
+                    option::Option::Some(err) => {
+                        let _ = cli.shutdown();
+                        this.state = SupervisorState::Failed(err.message.clone());
+                        return false;
+                    }
+                    option::Option::None => {}
+                }
+                this._clients.remove_all();
+                let _ = this._clients.append(cli);
+                this.state = SupervisorState::Running;
+                return true;
+            }
+            client::WaitOutcome::TimedOut => {
+                let _ = cli.shutdown();
+                this.state = SupervisorState::Failed(text::from_str("initialize timed out"));
+                return false;
+            }
+            client::WaitOutcome::Disconnected => {
+                let _ = cli.shutdown();
+                this.state = SupervisorState::Failed(text::from_str("agent exited during initialize"));
+                return false;
+            }
+        }
+    }
+
+    fn start(ref this) -> bool {
+        this.shutdown();
+        this._restart_count = 0 as i32;
+        return this._spawn_and_init();
+    }
+
+    fn restart(ref this) -> bool {
+        if this._restart_count >= this._max_restarts {
+            this.state = SupervisorState::Failed(text::from_str("max restarts exceeded"));
+            return false;
+        }
+        this._clients.remove_all();
+
+        // Exponential backoff: base * 2^attempt, capped at 5000 ms.
+        var shift: i32 = this._restart_count;
+        if shift > (6 as i32) { shift = 6 as i32; }
+        var delay_ms: i64 = this._base_backoff_ms << (shift as i64);
+        if delay_ms > (5000 as i64) { delay_ms = 5000 as i64; }
+        if delay_ms > (0 as i64) {
+            time::sleep(delay_ms as u64).wait();
+        }
+
+        this._restart_count = this._restart_count +% (1 as i32);
+        return this._spawn_and_init();
+    }
+
+    fn shutdown(ref this) {
+        if let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) {
+            let _ = (*cp).shutdown();
+        }
+        this._clients.remove_all();
+        this.state = SupervisorState::Stopped;
+    }
+
+    fn send_request(ref this, method: str, take params: json::Value) -> option::Option[client::PendingResponse] {
+        guard let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) else {
+            return option::Option[client::PendingResponse]::None;
+        };
+        return (*cp).send_request(method, params);
+    }
+
+    fn send_notification(ref this, method: str, take params: json::Value) -> bool {
+        guard let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) else {
+            return false;
+        };
+        return (*cp).send_notification(method, params);
+    }
+
+    fn send_response(ref this, id: wire::JsonRpcId, take result_val: json::Value) -> bool {
+        guard let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) else {
+            return false;
+        };
+        return (*cp).send_response(id, result_val);
+    }
+
+    fn try_poll_event(this) -> channel::TryReceiveResult[client::ClientEvent] {
+        guard let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) else {
+            return channel::TryReceiveResult[client::ClientEvent]::Closed;
+        };
+        return (*cp).try_poll_event();
+    }
+
+    fn send_error(ref this, id: wire::JsonRpcId, code: i64, message: str) -> bool {
+        guard let option::Option::Some(cp) = this._clients.at_ptr(0 as usize) else {
+            return false;
+        };
+        return (*cp).send_error(id, code, message);
+    }
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+fn _test_poll_and_drain(ref sup: Supervisor, ref store: conversation::ConversationStore) -> bool {
+    var disconnected: bool = false;
+    loop {
+        match sup.try_poll_event() {
+            channel::TryReceiveResult::Value(ev) => {
+                match ev {
+                    client::ClientEvent::SessionUpdate(env) => { store.apply_update(env); }
+                    client::ClientEvent::PermissionRequest(pr) => { store.apply_permission_request(pr); }
+                    client::ClientEvent::UnknownAgentRequest(req) => {
+                        let _ = sup.send_error(req.id, -32601 as i64, "Method not found");
+                    }
+                    client::ClientEvent::QueueChanged(_qs) => {}
+                    client::ClientEvent::McpServersUpdated(_ms) => {}
+                    client::ClientEvent::ExtensionNotification(_m) => {}
+                    client::ClientEvent::Disconnected => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            channel::TryReceiveResult::Empty => { break; }
+            channel::TryReceiveResult::Closed => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    if disconnected {
+        return sup.restart();
+    }
+    return true;
+}
+
+#[test]
+fn supervisor_restarts_after_child_crash() {
+    let my_pid: i32 = process::current_id();
+    let marker: text::Text = "/tmp/desk420-crash-marker-${my_pid}";
+    let _ = fs::remove_file(marker.view());
+
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("python3"));
+    let _ = argv.append(text::from_str("fixtures/acp/fake_agent.py"));
+    let _ = argv.append(text::from_str("--mode=crash-once"));
+    let _ = argv.append(text::from_str("--marker"));
+    let _ = argv.append(marker.clone());
+
+    var sup: Supervisor = Supervisor::new(argv, max_restarts: 3 as i32, base_backoff_ms: 20 as i64);
+    assert sup.start();
+    let first_pid: i32 = sup.pid();
+    assert first_pid > (0 as i32);
+
+    // Wait up to 2s for the crash to be detected and restarted by _test_poll_and_drain.
+    var store: conversation::ConversationStore = conversation::ConversationStore::new();
+    var attempts: i32 = 0 as i32;
+    while sup._restart_count == (0 as i32) && attempts < (200 as i32) {
+        let _ = _test_poll_and_drain(sup, store);
+        time::sleep(10 as u64).wait();
+        attempts = attempts +% (1 as i32);
+    }
+
+    assert sup._restart_count == (1 as i32);
+    assert sup.state.is_running();
+    let second_pid: i32 = sup.pid();
+    assert second_pid > (0 as i32);
+    assert second_pid != first_pid;
+
+    // Verify the restarted child handles a full session/new + session/prompt turn.
+    guard let option::Option::Some(pn) = sup.send_request("session/new", types::params_session_new("/tmp")) else {
+        assert false;
+        return;
+    };
+    guard let option::Option::Some(rn) = pn.wait() else { assert false; return; };
+    var sid: text::Text = text::from_str("");
+    if let option::Option::Some(rvn) = rn.result {
+        if let option::Option::Some(sn) = types::decode_session_new(rvn) {
+            sid = sn.session_id.clone();
+        }
+    }
+    assert !sid.is_empty();
+
+    guard let option::Option::Some(pp) = sup.send_request("session/prompt", types::params_session_prompt_text(sid.view(), "hi")) else {
+        assert false;
+        return;
+    };
+    guard let option::Option::Some(rp) = pp.wait() else { assert false; return; };
+    var ended: bool = false;
+    if let option::Option::Some(rvp) = rp.result {
+        let pr: types::PromptResult = types::decode_prompt_result(rvp);
+        ended = pr.stop_reason.is_end_turn();
+    }
+    assert ended;
+
+    let _ = _test_poll_and_drain(sup, store);
+    guard let option::Option::Some(idx) = store.find_session_index(sid.view()) else { assert false; return; };
+    guard let option::Option::Some(sp) = store.session_ptr(idx) else { assert false; return; };
+    assert (*sp).all_agent_text().contains("recovered-ok");
+
+    sup.shutdown();
+    var kargv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = kargv.append(text::from_str("/bin/kill"));
+    let _ = kargv.append(text::from_str("-0"));
+    let _ = kargv.append("${second_pid}");
+    assert process::capture(kargv).code != (0 as i32);
+    let _ = fs::remove_file(marker.view());
+}
+
+#[test]
+fn supervisor_replays_recorded_fixture_end_to_end() {
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("python3"));
+    let _ = argv.append(text::from_str("fixtures/acp/fake_agent.py"));
+    let _ = argv.append(text::from_str("--fixture"));
+    let _ = argv.append(text::from_str("fixtures/acp/grok-1.0.92-mcp-tool-turn.jsonl"));
+
+    var sup: Supervisor = Supervisor::new(argv);
+    assert sup.start();
+
+    guard let option::Option::Some(pn) = sup.send_request("session/new", types::params_session_new("/tmp")) else {
+        assert false;
+        return;
+    };
+    guard let option::Option::Some(rn) = pn.wait() else { assert false; return; };
+    var sid: text::Text = text::from_str("");
+    if let option::Option::Some(rvn) = rn.result {
+        if let option::Option::Some(sn) = types::decode_session_new(rvn) {
+            sid = sn.session_id.clone();
+        }
+    }
+    assert !sid.is_empty();
+
+    var store: conversation::ConversationStore = conversation::ConversationStore::new();
+    store.begin_turn(sid.view(), "test mcp turn");
+
+    guard let option::Option::Some(pp) = sup.send_request("session/prompt", types::params_session_prompt_text(sid.view(), "test mcp turn")) else {
+        assert false;
+        return;
+    };
+    guard let option::Option::Some(rp) = pp.wait() else { assert false; return; };
+    var ended: bool = false;
+    let _ = _test_poll_and_drain(sup, store);
+    if let option::Option::Some(rvp) = rp.result {
+        let pr: types::PromptResult = types::decode_prompt_result(rvp);
+        ended = pr.stop_reason.is_end_turn();
+        store.apply_prompt_result(sid.view(), pr);
+    }
+    assert ended;
+
+    guard let option::Option::Some(idx) = store.find_session_index(sid.view()) else { assert false; return; };
+    guard let option::Option::Some(sp) = store.session_ptr(idx) else { assert false; return; };
+    assert (*sp).turn_state.is_idle();
+    assert (*sp).tool_call_count() == (2 as usize);
+    assert !(*sp).all_agent_text().is_empty();
+
+    sup.shutdown();
+}

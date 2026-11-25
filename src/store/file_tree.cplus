@@ -1,0 +1,210 @@
+// src/store/file_tree.cplus — lazy project file tree for the Conversation right panel.
+//
+// Reads only the project root plus directories the user has explicitly expanded,
+// skipping noisy build/VCS directories and sorting folders before files so even
+// large repositories stay instant.
+
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/string_set" as string_set;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+struct TreeEntry {
+    name: text::Text,
+    rel_path: text::Text,
+    full_path: text::Text,
+    is_dir: bool,
+    expanded: bool,
+    depth: usize,
+}
+
+fn should_skip(name: str) -> bool {
+    if name == "" || name == "." || name == ".." { return true; }
+    if name == ".git" || name == ".DS_Store" || name == "node_modules" { return true; }
+    if name == "target" || name == ".next" || name == "dist" || name == "__pycache__" { return true; }
+    if name == ".venv" || name == "venv" || name == ".cache" || name == ".turbo" { return true; }
+    return false;
+}
+
+fn clone_string_set(src: string_set::StringSet) -> string_set::StringSet {
+    var out: string_set::StringSet = string_set::with_capacity(src.count());
+    let cap: usize = src.slot_capacity();
+    var i: usize = 0 as usize;
+    while i < cap {
+        if let option::Option::Some(ep) = src.element_ptr_at_slot(i) {
+            let _ = out.insert((*ep).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _ascii_lower_byte(b: u8) -> u8 {
+    if b >= (65 as u8) && b <= (90 as u8) {
+        return b +% (32 as u8);
+    }
+    return b;
+}
+
+// Case-insensitive ASCII compare: true if `a` comes strictly before `b`.
+fn _name_before(a: str, b: str) -> bool {
+    let na: usize = a.count();
+    let nb: usize = b.count();
+    let lim: usize = if na < nb { na } else { nb };
+    var i: usize = 0 as usize;
+    while i < lim {
+        let ca: u8 = match a.byte_at(i) {
+            option::Option::Some(v) => _ascii_lower_byte(v),
+            option::Option::None => 0 as u8,
+        };
+        let cb: u8 = match b.byte_at(i) {
+            option::Option::Some(v) => _ascii_lower_byte(v),
+            option::Option::None => 0 as u8,
+        };
+        if ca != cb { return ca < cb; }
+        i = i +% (1 as usize);
+    }
+    return na < nb;
+}
+
+fn _sort_entries(take src: vec::Vec[TreeEntry]) -> vec::Vec[TreeEntry] {
+    var rem: vec::Vec[TreeEntry] = src;
+    var out: vec::Vec[TreeEntry] = vec::new::[TreeEntry]();
+    while rem.count() > (0 as usize) {
+        var best_i: usize = 0 as usize;
+        var i: usize = 1 as usize;
+        while i < rem.count() {
+            if let option::Option::Some(bp) = rem.at_ptr(best_i) {
+                if let option::Option::Some(cp) = rem.at_ptr(i) {
+                    let better: bool = if (*cp).is_dir != (*bp).is_dir {
+                        (*cp).is_dir
+                    } else {
+                        _name_before((*cp).name.view(), (*bp).name.view())
+                    };
+                    if better { best_i = i; }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        if let option::Option::Some(item) = rem.remove(at: best_i) {
+            let _ = out.append(item);
+        }
+    }
+    return out;
+}
+
+fn _walk_dir(dir_full: str, dir_rel: str, depth: usize,
+expanded: string_set::StringSet, ref out: vec::Vec[TreeEntry], max_entries: usize) {
+    if out.count() >= max_entries || depth > (8 as usize) { return; }
+    guard let option::Option::Some(names) = fs::read_dir(dir_full) else { return; };
+
+    var level: vec::Vec[TreeEntry] = vec::new::[TreeEntry]();
+    var i: usize = 0 as usize;
+    while i < names.count() {
+        if let option::Option::Some(np) = names.at_ptr(i) {
+            let nm: str = (*np).view();
+            if !should_skip(nm) {
+                let full: text::Text = path::join(base: dir_full, child: nm);
+                let rel: text::Text = if dir_rel == "" {
+                    text::from_str(nm)
+                } else {
+                    "${dir_rel}/${nm}"
+                };
+                let dir_flag: bool = fs::is_dir(full.view());
+                let exp: bool = dir_flag && expanded.contains(rel.view());
+                let _ = level.append(TreeEntry {
+                    name: text::from_str(nm),
+                    rel_path: rel,
+                    full_path: full,
+                    is_dir: dir_flag,
+                    expanded: exp,
+                    depth: depth,
+                });
+            }
+        }
+        i = i +% (1 as usize);
+    }
+
+    var sorted: vec::Vec[TreeEntry] = _sort_entries(level);
+    for entry in sorted.drain() {
+        if out.count() >= max_entries { break; }
+        let recurse: bool = entry.is_dir && entry.expanded;
+        let sub_full: text::Text = if recurse { entry.full_path.clone() } else { text::from_str("") };
+        let sub_rel: text::Text = if recurse { entry.rel_path.clone() } else { text::from_str("") };
+        let _ = out.append(entry);
+        if recurse {
+            _walk_dir(sub_full.view(), sub_rel.view(), depth +% (1 as usize), expanded, out, max_entries);
+        }
+    }
+}
+
+fn build_visible(root: str, expanded: string_set::StringSet, max_entries: usize = 500 as usize) -> vec::Vec[TreeEntry] {
+    var out: vec::Vec[TreeEntry] = vec::new::[TreeEntry]();
+    if root == "" || root.contains(".desk420/") || !fs::is_dir(root) {
+        return out;
+    }
+    _walk_dir(root, "", 0 as usize, expanded, out, max_entries);
+    return out;
+}
+
+fn format_prompt_ref(rel_path: str, is_dir: bool) -> text::Text {
+    let body: text::Text = if is_dir { "${rel_path}/" } else { text::from_str(rel_path) };
+    if body.contains(" ") {
+        return "@\"${body.view()}\"";
+    }
+    return "@${body.view()}";
+}
+
+fn append_prompt_ref(existing: str, rel_path: str, is_dir: bool) -> text::Text {
+    let token: text::Text = format_prompt_ref(rel_path, is_dir);
+    if existing == "" {
+        return "${token.view()} ";
+    }
+    let last_b: u8 = match existing.byte_at(existing.count() -% (1 as usize)) {
+        option::Option::Some(b) => b,
+        option::Option::None => 32 as u8,
+    };
+    let needs_space: bool = last_b != (32 as u8) && last_b != (10 as u8) && last_b != (9 as u8);
+    if needs_space {
+        return "${existing} ${token.view()} ";
+    }
+    return "${existing}${token.view()} ";
+}
+
+#[test]
+fn file_tree_sorts_dirs_first_expands_lazily_and_formats_refs() {
+    let root: str = "/tmp/desk420-filetree-test";
+    let _ = fs::create_dir_all("${root}/src");
+    let _ = fs::create_dir_all("${root}/.git");
+    let _ = fs::write_string("${root}/README.md", "hi");
+    let _ = fs::write_string("${root}/app.cplus", "fn main() {}");
+    let _ = fs::write_string("${root}/src/main.cplus", "fn main() {}");
+
+    // Collapsed root: dirs first (src), then files alphabetically (app.cplus, README.md); .git skipped.
+    var exp: string_set::StringSet = string_set::new();
+    let collapsed: vec::Vec[TreeEntry] = build_visible(root, exp);
+    assert collapsed.count() == (3 as usize);
+    guard let option::Option::Some(e0) = collapsed.at_ptr(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(e1) = collapsed.at_ptr(1 as usize) else { assert false; return; };
+    guard let option::Option::Some(e2) = collapsed.at_ptr(2 as usize) else { assert false; return; };
+    assert (*e0).name.equals("src") && (*e0).is_dir && !(*e0).expanded;
+    assert (*e1).name.equals("app.cplus") && !(*e1).is_dir;
+    assert (*e2).name.equals("README.md") && !(*e2).is_dir;
+
+    // Expand "src": src/main.cplus appears right beneath src at depth 1.
+    let _ = exp.insert(text::from_str("src"));
+    let expanded: vec::Vec[TreeEntry] = build_visible(root, exp);
+    assert expanded.count() == (4 as usize);
+    guard let option::Option::Some(x1) = expanded.at_ptr(1 as usize) else { assert false; return; };
+    assert (*x1).rel_path.equals("src/main.cplus") && (*x1).depth == (1 as usize);
+
+    // Prompt reference formatting.
+    assert format_prompt_ref("src/main.cplus", false).equals("@src/main.cplus");
+    assert format_prompt_ref("src", true).equals("@src/");
+    assert format_prompt_ref("my docs/plan.md", false).equals("@\"my docs/plan.md\"");
+    assert append_prompt_ref("", "src/main.cplus", false).equals("@src/main.cplus ");
+    assert append_prompt_ref("explain", "src", true).equals("explain @src/ ");
+    assert append_prompt_ref("explain ", "src", true).equals("explain @src/ ");
+}

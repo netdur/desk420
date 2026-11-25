@@ -1,0 +1,3003 @@
+// src/ui/chat_screen.cplus — an open run view.
+//
+// Centre: the run's title, the transcript (markdown answers, the person's
+// messages as bubbles on the right, approvals as lime cards with the
+// command and its choices) and the composer with Model / Effort / Approvals
+// chips. Right: a tabbed panel — Run (a timeline of thoughts, tool calls
+// and the approval being waited on), Browser, Terminal (command output)
+// and Preview (file changes).
+//
+// Retained facet component: `build` runs once; everything after that is a
+// write onto the live tree driven by the conversation, sessions and engine
+// signals.
+
+import "events/events" as events;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/label" as label;
+import "facet/mount" as mount;
+import "facet/obs_vec" as obs_vec;
+import "facet/popup" as m_popup;
+import "facet/relist" as m_relist;
+import "facet/services" as services;
+import "facet/spinner" as m_spinner;
+import "facet/split" as m_split;
+import "facet/text_area" as text_area;
+import "facet/text_field" as text_field;
+import "facet/text_metrics" as text_metrics;
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "json/json" as json;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/result" as result;
+import "stdlib/string_set" as string_set;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "../acp/wire" as wire;
+import "../engine/runtime" as engine;
+import "../markdown/parser" as md;
+import "../store/account" as account;
+import "../store/conversation" as conversation;
+import "../store/file_tree" as file_tree;
+import "../store/prefs" as prefs;
+import "../store/sessions" as sessions;
+import "./attachments" as attachments;
+import "./browser_pane" as browser_pane;
+import "./composer_popup" as composer_popup;
+import "./panels" as panels;
+import "./pickers" as pickers;
+import "./plan_bar" as plan_bar;
+import "./style" as style;
+
+// ───────────────────────────── transcript row model ─────────────────────────────
+
+enum RowKind {
+    LoadEarlier,
+    UserMessage,
+    AgentProse,
+    AgentCode,
+    ApprovalCard,
+    BrowserCard,
+    OpenUrlChip,
+    ThoughtNote,
+    QuotaNotice,
+    StatusNote,
+    TopSpacer,
+    BottomSpacer,
+}
+
+enum BrowserCardState {
+    Running,
+    Done,
+    Failed,
+}
+
+impl BrowserCardState {
+    fn label(this) -> str {
+        return match this {
+            BrowserCardState::Running => "Running…",
+            BrowserCardState::Done => "Done",
+            BrowserCardState::Failed => "Failed",
+        };
+    }
+}
+
+enum InspectorTab {
+    Run,
+    Files,
+    Browser,
+    Terminal,
+    Preview,
+}
+
+impl InspectorTab {
+    fn slug(this) -> str {
+        return match this {
+            InspectorTab::Run => "run",
+            InspectorTab::Files => "files",
+            InspectorTab::Browser => "browser",
+            InspectorTab::Terminal => "terminal",
+            InspectorTab::Preview => "preview",
+        };
+    }
+}
+
+struct DisplayRow {
+    kind: RowKind,
+    body: text::Text,
+    plain_prose: text::Text,
+    cached_w: f64,
+    cached_h: f64,
+    // Code block language
+    lang: text::Text,
+    // Browser card & OpenUrlChip target URL
+    url: text::Text,
+    browser_state: BrowserCardState,
+    // User message rewind metadata
+    user_ordinal: i32,
+    rewind_picking: bool,
+    // Quota notice reset label
+    reset_label: text::Text,
+    // Approval metadata
+    item_id: text::Text,
+    title: text::Text,
+    rpc_id: wire::JsonRpcId,
+    perm_options: vec::Vec[types::PermissionOption],
+    resolved_label: text::Text,
+}
+
+fn _empty_row(kind: RowKind, take body: text::Text) -> DisplayRow {
+    return DisplayRow {
+        kind: kind,
+        body: body,
+        plain_prose: text::from_str(""),
+        cached_w: 0.0f64,
+        cached_h: 0.0f64,
+        lang: text::from_str(""),
+        url: text::from_str(""),
+        browser_state: BrowserCardState::Done,
+        user_ordinal: 0 as i32,
+        rewind_picking: false,
+        reset_label: text::from_str(""),
+        item_id: text::from_str(""),
+        title: text::from_str(""),
+        rpc_id: wire::JsonRpcId::Num(0 as i64),
+        perm_options: vec::new::[types::PermissionOption](),
+        resolved_label: text::from_str(""),
+    };
+}
+
+// ───────────────────────────── run timeline model ─────────────────────────────
+
+enum StepState {
+    Done,
+    Working,
+    Waiting,
+    Failed,
+}
+
+struct Step {
+    title: text::Text,
+    detail: text::Text,
+    mono: bool,
+    state: StepState,
+}
+
+// ───────────────────────────── text helpers ─────────────────────────────
+
+const BODY_SIZE: f64 = 15.5f64;
+const BODY_LINE: f64 = 23.0f64;
+const HEADING_SIZE: f64 = 18.0f64;
+const CODE_SIZE: f64 = 13.0f64;
+const CODE_LINE: f64 = 19.0f64;
+const COMPOSER_MIN_H: f64 = 44.0f64;
+const COMPOSER_MAX_H: f64 = 160.0f64;
+const SIDE_TEXT_CAP: usize = 24000 as usize;
+const INITIAL_TAIL_BLOCKS: usize = 40 as usize;
+const LOAD_MORE_STEP: usize = 80 as usize;
+
+fn _build_diff_spans(raw: str) -> vocab::Spans {
+    var spans: vocab::Spans = vocab::Spans::new();
+    let lines: vec::Vec[str] = raw.split(separator: "\n");
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if let option::Option::Some(line) = lines.at(i) {
+            if i > (0 as usize) {
+                let _ = spans.add(vocab::TextSpan::of("\n", font_family: ftheme::MONOSPACE, font_size: 12.0f64, color: style::ink()));
+            }
+            var col: vocab::Color = style::ink();
+            var wt: vocab::FontWeight = vocab::FontWeight::Regular;
+            if line.has_prefix("diff --git") || line.has_prefix("@@") || line.has_prefix("# ") || line.has_prefix("## ") {
+                col = style::lime_text();
+                wt = vocab::FontWeight::Semibold;
+            } else if line.has_prefix("+++") || line.has_prefix("---") {
+                col = style::muted();
+                wt = vocab::FontWeight::Medium;
+            } else if line.has_prefix("+") {
+                col = style::ok_green();
+            } else if line.has_prefix("-") {
+                col = style::danger();
+            }
+            let _ = spans.add(vocab::TextSpan::of(line, font_family: ftheme::MONOSPACE, font_size: 12.0f64, font_weight: wt, color: col));
+        }
+        i = i +% (1 as usize);
+    }
+    return spans;
+}
+
+fn _same_row(a: *DisplayRow, b: *DisplayRow) -> bool {
+    if (*a).kind != (*b).kind { return false; }
+    if (*a).user_ordinal != (*b).user_ordinal { return false; }
+    if (*a).rewind_picking != (*b).rewind_picking { return false; }
+    if (*a).browser_state != (*b).browser_state { return false; }
+    if !(*a).body.equals((*b).body.view()) { return false; }
+    if !(*a).lang.equals((*b).lang.view()) { return false; }
+    if !(*a).url.equals((*b).url.view()) { return false; }
+    if !(*a).reset_label.equals((*b).reset_label.view()) { return false; }
+    if !(*a).title.equals((*b).title.view()) { return false; }
+    if !(*a).item_id.equals((*b).item_id.view()) { return false; }
+    if !(*a).resolved_label.equals((*b).resolved_label.view()) { return false; }
+    return true;
+}
+
+fn _is_url_char(b: u8) -> bool {
+    if b <= (32 as u8) { return false; }
+    if b == ('"' as u8) || b == ('\'' as u8) || b == ('`' as u8)
+        || b == (')' as u8) || b == (']' as u8) || b == ('>' as u8)
+        || b == (',' as u8) || b == (';' as u8) {
+        return false;
+    }
+    return true;
+}
+
+fn _extract_url_from_prefix(s: str, prefix: str) -> text::Text {
+    guard let option::Option::Some(start) = s.find(prefix) else { return text::from_str(""); };
+    let n: usize = s.count();
+    let prefix_end: usize = start +% prefix.count();
+    var end: usize = prefix_end;
+    // Ensure host boundary (port, path, query, fragment, or end) so localhost.evil.com is ignored.
+    if let option::Option::Some(nb) = s.byte_at(end) {
+        if nb != (':' as u8) && nb != ('/' as u8) && nb != ('?' as u8) && nb != ('#' as u8) && _is_url_char(nb) {
+            return text::from_str("");
+        }
+    }
+    while end < n {
+        guard let option::Option::Some(b) = s.byte_at(end) else { break; };
+        if !_is_url_char(b) { break; }
+        end = end +% (1 as usize);
+    }
+    while end > prefix_end {
+        guard let option::Option::Some(b) = s.byte_at(end -% (1 as usize)) else { break; };
+        if b != ('.' as u8) { break; }
+        end = end -% (1 as usize);
+    }
+    if let option::Option::Some(sl) = s.slice(from: start, to: end) {
+        return text::from_str(sl);
+    }
+    return text::from_str("");
+}
+
+fn extract_localhost_url(s: str) -> text::Text {
+    let a: text::Text = _extract_url_from_prefix(s, "http://localhost");
+    if !a.is_empty() { return a; }
+    let b: text::Text = _extract_url_from_prefix(s, "https://localhost");
+    if !b.is_empty() { return b; }
+    let c: text::Text = _extract_url_from_prefix(s, "http://127.0.0.1");
+    if !c.is_empty() { return c; }
+    return _extract_url_from_prefix(s, "https://127.0.0.1");
+}
+
+fn is_quota_error(msg: str) -> bool {
+    let low: text::Text = text::from_str(msg).lowercased();
+    let v: str = low.view();
+    return v.contains("quota")
+        || v.contains("rate limit")
+        || v.contains("usage limit")
+        || v.contains("limit reached")
+        || v.contains("out of credits")
+        || v.contains("429");
+}
+
+fn _is_browser_tool_name(name: str) -> bool {
+    return name.contains("desk420-browser")
+        || name.contains("browser_open")
+        || name.contains("browser_snapshot")
+        || name.contains("browser_click")
+        || name.contains("browser_type")
+        || name.contains("browser_press")
+        || name.contains("browser_wait")
+        || name.contains("browser_console")
+        || name.contains("browser_network")
+        || name.contains("browser_eval")
+        || name.contains("browser_resize")
+        || name.contains("browser_screenshot");
+}
+
+fn _json_arg_str(raw_json: str, key: str) -> text::Text {
+    if raw_json == "" { return text::from_str(""); }
+    guard let result::Result::Ok(v) = json::Value::parse(source: raw_json) else { return text::from_str(""); };
+    let target: json::Value = match v.value(for_key: "arguments") {
+        option::Option::Some(a) => a,
+        option::Option::None => v,
+    };
+    return match target.value(for_key: key) {
+        option::Option::Some(fv) => match fv.as_text() {
+            option::Option::Some(t) => t,
+            option::Option::None => text::from_str(""),
+        },
+        option::Option::None => text::from_str(""),
+    };
+}
+
+fn browser_card_summary(title: str, raw_input: str) -> text::Text {
+    let combined: text::Text = "${title} ${raw_input}";
+    let cv: str = combined.view();
+    if cv.contains("browser_open") {
+        let u: text::Text = _json_arg_str(raw_input, "url");
+        if !u.is_empty() { return "Opened ${u.view()}"; }
+        return text::from_str("Opened page in Browser");
+    }
+    if cv.contains("browser_click") {
+        let r: text::Text = _json_arg_str(raw_input, "ref");
+        if !r.is_empty() { return "Clicked [${r.view()}]"; }
+        return text::from_str("Clicked element in Browser");
+    }
+    if cv.contains("browser_type") {
+        let r: text::Text = _json_arg_str(raw_input, "ref");
+        if !r.is_empty() { return "Typed into [${r.view()}]"; }
+        return text::from_str("Typed in Browser");
+    }
+    if cv.contains("browser_press") {
+        let k: text::Text = _json_arg_str(raw_input, "key");
+        if !k.is_empty() { return "Pressed ${k.view()}"; }
+        return text::from_str("Pressed key in Browser");
+    }
+    if cv.contains("browser_wait") {
+        let t: text::Text = _json_arg_str(raw_input, "text");
+        if !t.is_empty() { return "Waited for \"${t.view()}\""; }
+        return text::from_str("Waited in Browser");
+    }
+    if cv.contains("browser_console") { return text::from_str("Read browser console"); }
+    if cv.contains("browser_network") { return text::from_str("Checked browser network"); }
+    if cv.contains("browser_screenshot") { return text::from_str("Captured browser screenshot"); }
+    if cv.contains("browser_snapshot") { return text::from_str("Inspected page snapshot"); }
+    if cv.contains("browser_resize") { return text::from_str("Resized browser viewport"); }
+    if cv.contains("browser_eval") { return text::from_str("Evaluated script in Browser"); }
+    if title != "" { return text::from_str(title); }
+    return text::from_str("Browser action");
+}
+
+fn _append_inline_spans(ref spans: vocab::Spans, src: str, base_size: f64, base_bold: bool) {
+    let parsed: vec::Vec[md::InlineSpan] = md::parse_inline(src);
+    let base_weight: vocab::FontWeight = if base_bold { vocab::FontWeight::Bold } else { vocab::FontWeight::Regular };
+    var i: usize = 0 as usize;
+    while i < parsed.count() {
+        if let option::Option::Some(sp) = parsed.at_ptr(i) {
+            let txt: str = (*sp).text.view();
+            match (*sp).kind {
+                md::InlineKind::Plain => {
+                    let _ = spans.add(vocab::TextSpan::of(
+                        txt,
+                        font_size: base_size,
+                        font_weight: base_weight,
+                        color: style::ink(),
+                    ));
+                }
+                md::InlineKind::Bold => {
+                    let _ = spans.add(vocab::TextSpan::of(
+                        txt,
+                        font_size: base_size,
+                        font_weight: vocab::FontWeight::Bold,
+                        color: style::ink(),
+                    ));
+                }
+                md::InlineKind::Italic => {
+                    let _ = spans.add(vocab::TextSpan::of(
+                        txt,
+                        font_size: base_size,
+                        font_weight: base_weight,
+                        italic: true,
+                        color: style::ink(),
+                    ));
+                }
+                md::InlineKind::Code => {
+                    let code_sz: f64 = if base_size > 15.5f64 { 15.0f64 } else { 13.5f64 };
+                    let _ = spans.add(vocab::TextSpan::of(
+                        txt,
+                        font_size: code_sz,
+                        font_family: ftheme::MONOSPACE,
+                        color: style::ink(),
+                        background_color: style::chip(),
+                    ));
+                }
+                md::InlineKind::Link => {
+                    let _ = spans.add(vocab::TextSpan::of(
+                        txt,
+                        font_size: base_size,
+                        font_weight: base_weight,
+                        decoration: vocab::TextDecoration::Underline,
+                        link: (*sp).url.view(),
+                    ));
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+}
+
+fn _plain_inline_text(src: str) -> text::Text {
+    var out: text::Text = text::new();
+    let parsed: vec::Vec[md::InlineSpan] = md::parse_inline(src);
+    var i: usize = 0 as usize;
+    while i < parsed.count() {
+        if let option::Option::Some(sp) = parsed.at_ptr(i) {
+            let _ = out.append((*sp).text.view());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+// Render all consecutive non-code markdown blocks (headings, paragraphs, lists)
+// into one attributed span list so the user can drag-select across an entire
+// multi-paragraph answer in a single gesture.
+fn _build_prose_spans(src: str) -> vocab::Spans {
+    var spans: vocab::Spans = vocab::Spans::new();
+    let blocks: vec::Vec[md::MdBlock] = md::parse_blocks(src);
+    var prev_list: bool = false;
+    var i: usize = 0 as usize;
+    while i < blocks.count() {
+        if let option::Option::Some(mb) = blocks.at_ptr(i) {
+            let is_list: bool = (*mb).kind == md::BlockKind::ListItem;
+            if i > (0 as usize) {
+                let sep: str = if prev_list && is_list { "\n" } else { "\n\n" };
+                let _ = spans.add(vocab::TextSpan::of(sep, font_size: BODY_SIZE, color: style::ink()));
+            }
+            if (*mb).kind == md::BlockKind::Heading {
+                _append_inline_spans(spans, (*mb).body.view(), HEADING_SIZE, true);
+            } else if is_list {
+                if (*mb).level == (1 as i32) {
+                    let _ = spans.add(vocab::TextSpan::of("  ", font_size: BODY_SIZE, color: style::ink()));
+                } else {
+                    let _ = spans.add(vocab::TextSpan::of("  •  ", font_size: BODY_SIZE, color: style::ink()));
+                }
+                _append_inline_spans(spans, (*mb).body.view(), BODY_SIZE, false);
+            } else {
+                _append_inline_spans(spans, (*mb).body.view(), BODY_SIZE, false);
+            }
+            prev_list = is_list;
+        }
+        i = i +% (1 as usize);
+    }
+    return spans;
+}
+
+fn _append_md_prose(ref buf: text::Text, ref prev_list: bool, mb: *md::MdBlock) {
+    let is_list: bool = (*mb).kind == md::BlockKind::ListItem;
+    if !buf.is_empty() {
+        let _ = buf.append(if prev_list && is_list { "\n" } else { "\n\n" });
+    }
+    if (*mb).kind == md::BlockKind::Heading {
+        let _ = buf.append("## ");
+        let _ = buf.append((*mb).body.view());
+    } else if is_list {
+        if (*mb).level != (1 as i32) {
+            let _ = buf.append("- ");
+        }
+        let _ = buf.append((*mb).body.view());
+    } else {
+        let _ = buf.append((*mb).body.view());
+    }
+    prev_list = is_list;
+}
+
+fn _flatten_prose_plain(src: str) -> text::Text {
+    let blocks: vec::Vec[md::MdBlock] = md::parse_blocks(src);
+    var out: text::Text = text::new();
+    var prev_list: bool = false;
+    var i: usize = 0 as usize;
+    while i < blocks.count() {
+        if let option::Option::Some(mb) = blocks.at_ptr(i) {
+            let is_list: bool = (*mb).kind == md::BlockKind::ListItem;
+            if i > (0 as usize) {
+                let _ = out.append(if prev_list && is_list { "\n" } else { "\n\n" });
+            }
+            let plain: text::Text = _plain_inline_text((*mb).body.view());
+            if is_list {
+                let _ = out.append(if (*mb).level == (1 as i32) { "  " } else { "  •  " });
+            }
+            let _ = out.append(plain.view());
+            prev_list = is_list;
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _flush_prose(ref out_rows: vec::Vec[DisplayRow], ref buf: text::Text, ref prev_list: bool) {
+    if buf.is_empty() { return; }
+    let local_u: text::Text = extract_localhost_url(buf.view());
+    var prow: DisplayRow = _empty_row(RowKind::AgentProse, buf.clone());
+    prow.plain_prose = _flatten_prose_plain(buf.view());
+    let _ = out_rows.append(prow);
+    if !local_u.is_empty() {
+        var chip: DisplayRow = _empty_row(RowKind::OpenUrlChip, "Open ${local_u.view()} in Browser");
+        chip.url = local_u;
+        let _ = out_rows.append(chip);
+    }
+    buf = text::new();
+    prev_list = false;
+}
+
+struct TextChunk {
+    body: text::Text,
+    cached_w: f64,
+    cached_h: f64,
+}
+
+fn _chunk_mono_lines(raw: str, max_lines: usize, max_bytes: usize) -> vec::Vec[text::Text] {
+    var out: vec::Vec[text::Text] = vec::new::[text::Text]();
+    if raw == "" { return out; }
+    let lines: vec::Vec[str] = raw.split(separator: "\n");
+    var buf: text::Text = text::new();
+    var line_count: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if let option::Option::Some(line) = lines.at(i) {
+            if line_count > (0 as usize) && (line_count >= max_lines || (buf.count() +% line.count()) > max_bytes) {
+                let _ = out.append(buf);
+                buf = text::new();
+                line_count = 0 as usize;
+            }
+            if line_count > (0 as usize) {
+                let _ = buf.append("\n");
+            }
+            let _ = buf.append(line);
+            line_count = line_count +% (1 as usize);
+        }
+        i = i +% (1 as usize);
+    }
+    if line_count > (0 as usize) {
+        let _ = out.append(buf);
+    }
+    return out;
+}
+
+fn _cap_output(s: str, max_bytes: usize) -> text::Text {
+    if s.count() <= max_bytes { return text::from_str(s); }
+    if let option::Option::Some(sl) = s.slice(from: 0 as usize, to: max_bytes) {
+        return "${sl}\n… (truncated)";
+    }
+    return text::from_str(s);
+}
+
+fn _first_line(s: str) -> text::Text {
+    let t: str = s.trim();
+    if let option::Option::Some(nl) = t.find("\n") {
+        if let option::Option::Some(head) = t.slice(from: 0 as usize, to: nl) {
+            return text::from_str(head);
+        }
+    }
+    return text::from_str(t);
+}
+
+// "Execute `rm temp.txt`" → "rm temp.txt"; anything without backticks as is.
+fn _backticked(s: str) -> text::Text {
+    guard let option::Option::Some(a) = s.find("`") else { return text::from_str(s); };
+    guard let option::Option::Some(rest) = s.slice(from: a +% (1 as usize), to: s.count()) else {
+        return text::from_str(s);
+    };
+    guard let option::Option::Some(b) = rest.find("`") else { return text::from_str(s); };
+    guard let option::Option::Some(inner) = rest.slice(from: 0 as usize, to: b) else { return text::from_str(s); };
+    return text::from_str(inner);
+}
+
+fn _format_diff(diff_path: str, old_s: str, new_s: str) -> text::Text {
+    var out: text::Text = text::new();
+    let _ = out.append("${diff_path}\n");
+    if old_s != "" {
+        let old_lines: vec::Vec[str] = old_s.split(separator: "\n");
+        var i: usize = 0 as usize;
+        while i < old_lines.count() {
+            if let option::Option::Some(l) = old_lines.at(i) {
+                let _ = out.append("- ${l}\n");
+            }
+            i = i +% (1 as usize);
+        }
+    }
+    if new_s != "" {
+        let new_lines: vec::Vec[str] = new_s.split(separator: "\n");
+        var i: usize = 0 as usize;
+        while i < new_lines.count() {
+            if let option::Option::Some(l) = new_lines.at(i) {
+                let _ = out.append("+ ${l}\n");
+            }
+            i = i +% (1 as usize);
+        }
+    }
+    return out;
+}
+
+// The run's title: the store's, else the session list's, else "New run".
+fn _run_title(session_id: str, stored: str) -> text::Text {
+    if stored != "" { return text::from_str(stored); }
+    let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+    var i: usize = 0 as usize;
+    while i < rows.count() {
+        if let option::Option::Some(rp) = rows.at_ptr(i) {
+            if (*rp).session_id.equals(session_id) && !(*rp).title.is_empty() {
+                return (*rp).title.clone();
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return text::from_str("New run");
+}
+
+// The project an approval is asked in: the folder of the active run, or
+// nothing for a general chat.
+fn _project_name() -> text::Text {
+    let cwd: text::Text = engine::active_cwd();
+    if cwd.is_empty() || cwd.contains(".desk420/") { return text::from_str(""); }
+    return text::from_str(path::file_name(cwd.view()));
+}
+
+// ───────────────────────────── ChatScreen ─────────────────────────────
+
+struct _FileTreeJob {
+    cwd: text::Text,
+    expanded: string_set::StringSet,
+    entries: vec::Vec[file_tree::TreeEntry],
+}
+
+impl _FileTreeJob: services::Job {
+    fn run(ref this) {
+        this.entries = file_tree::build_visible(this.cwd.view(), this.expanded);
+    }
+
+    fn apply(ref this) {}
+}
+
+struct ChatScreen {
+    rows: obs_vec::ObsVec[DisplayRow],
+    steps: obs_vec::ObsVec[Step],
+    file_entries: obs_vec::ObsVec[file_tree::TreeEntry],
+    expanded_dirs: string_set::StringSet,
+    file_tree_cwd: text::Text,
+    file_tree_epoch: u64,
+    tree_job: _FileTreeJob,
+    tree_dirty: bool,
+    epoch: u64,
+    visible_blocks: usize,
+    suppress_auto_scroll: bool,
+    model_values: vec::Vec[text::Text],
+    effort_values: vec::Vec[text::Text],
+    rendered_sid: text::Text,
+    composer_h: f64,
+    composer_has_text: bool,
+    action_is_stop: bool,
+    pending_ref_path: text::Text,
+    pending_ref_is_dir: bool,
+    popup: composer_popup::ComposerPopup,
+    files: attachments::Attachments,
+    browser: browser_pane::BrowserPane,
+    plan: plan_bar::PlanBar,
+    panel: panels::TrailingPanel,
+    copied_code_key: text::Text,
+    copied_timer: services::Cancellable,
+    rewind_pick_prompt: i64,
+    terminal_text: text::Text,
+    preview_text: text::Text,
+    term_chunks: obs_vec::ObsVec[TextChunk],
+    preview_chunks: obs_vec::ObsVec[TextChunk],
+    term_epoch: u64,
+    preview_epoch: u64,
+    tab: InspectorTab,
+    store_sub: events::SignalSubscription[conversation::StoreChange],
+    status_sub: events::SignalSubscription[engine::EngineStateEvent],
+    browser_tab_sub: events::Subscription,
+    slash_sub: events::Subscription,
+}
+
+impl ChatScreen {
+    fn new() -> ChatScreen {
+        return ChatScreen {
+            rows: obs_vec::ObsVec[DisplayRow]::new(),
+            steps: obs_vec::ObsVec[Step]::new(),
+            file_entries: obs_vec::ObsVec[file_tree::TreeEntry]::new(),
+            expanded_dirs: string_set::new(),
+            file_tree_cwd: text::from_str(""),
+            file_tree_epoch: 0 as u64,
+            tree_job: _FileTreeJob {
+                cwd: text::from_str(""),
+                expanded: string_set::new(),
+                entries: vec::new::[file_tree::TreeEntry](),
+            },
+            tree_dirty: false,
+            epoch: 0 as u64,
+            visible_blocks: INITIAL_TAIL_BLOCKS,
+            suppress_auto_scroll: false,
+            model_values: vec::new::[text::Text](),
+            effort_values: vec::new::[text::Text](),
+            rendered_sid: text::from_str(""),
+            composer_h: COMPOSER_MIN_H,
+            composer_has_text: false,
+            action_is_stop: false,
+            pending_ref_path: text::from_str(""),
+            pending_ref_is_dir: false,
+            popup: composer_popup::ComposerPopup::new("chat", "chat:composer", stage_key: "conv:stage"),
+            files: attachments::Attachments::new("chat", stage_key: "conv:stage", floating: true),
+            browser: browser_pane::BrowserPane::new(),
+            plan: plan_bar::PlanBar::new(stage_key: "conv:stage"),
+            panel: panels::TrailingPanel::new("conv:split", 360.0f64),
+            copied_code_key: text::from_str(""),
+            copied_timer: services::Cancellable::none(),
+            rewind_pick_prompt: -1 as i64,
+            terminal_text: text::from_str(""),
+            preview_text: text::from_str(""),
+            term_chunks: obs_vec::ObsVec[TextChunk]::new(),
+            preview_chunks: obs_vec::ObsVec[TextChunk]::new(),
+            term_epoch: 0 as u64,
+            preview_epoch: 0 as u64,
+            tab: InspectorTab::Run,
+            store_sub: events::SignalSubscription[conversation::StoreChange]::none(),
+            status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+            browser_tab_sub: events::Subscription::none(),
+            slash_sub: events::Subscription::none(),
+        };
+    }
+
+    // ---- projection from the store ------------------------------------------
+
+    fn _push_step(ref out: vec::Vec[Step], title: str, take detail: text::Text, mono: bool, state: StepState) {
+        let _ = out.append(Step {
+            title: text::from_str(title),
+            detail: detail,
+            mono: mono,
+            state: state,
+        });
+    }
+
+    fn _project(this, ref out_rows: vec::Vec[DisplayRow], ref out_steps: vec::Vec[Step],
+    ref term: text::Text, ref prev: text::Text, ref out_title: text::Text) {
+        let sid: text::Text = engine::active_session_id();
+        if sid.is_empty() { return; }
+
+        guard let option::Option::Some(sidx) = conversation::session_index(sid.view()) else {
+            out_title = _run_title(sid.view(), "");
+            return;
+        };
+
+        let total_blocks: usize = conversation::session_block_count(sidx);
+        if total_blocks > (0 as usize) {
+            let _ = out_rows.append(_empty_row(RowKind::TopSpacer, text::from_str("")));
+        }
+        let start_bi: usize = if total_blocks > this.visible_blocks {
+            total_blocks -% this.visible_blocks
+        } else {
+            0 as usize
+        };
+        if start_bi > (0 as usize) {
+            let hidden_n: usize = start_bi;
+            let _ = out_rows.append(_empty_row(RowKind::LoadEarlier, "Load earlier messages (${hidden_n} older)"));
+        }
+
+        var user_ord: i64 = 0 as i64;
+        var pre_i: usize = 0 as usize;
+        while pre_i < start_bi {
+            if conversation::session_block_kind(sidx, pre_i) == conversation::BlockKind::UserText {
+                user_ord = user_ord +% (1 as i64);
+            }
+            pre_i = pre_i +% (1 as usize);
+        }
+
+        var prose_buf: text::Text = text::new();
+        var prose_prev_list: bool = false;
+        var bi: usize = start_bi;
+        while bi < total_blocks {
+            match conversation::session_block_kind(sidx, bi) {
+                conversation::BlockKind::UserText => {
+                    _flush_prose(out_rows, prose_buf, prose_prev_list);
+                    var urow: DisplayRow = _empty_row(RowKind::UserMessage, conversation::session_block_text_body(sidx, bi));
+                    urow.user_ordinal = user_ord as i32;
+                    urow.rewind_picking = this.rewind_pick_prompt == user_ord;
+                    let _ = out_rows.append(urow);
+                    user_ord = user_ord +% (1 as i64);
+                }
+                conversation::BlockKind::AgentText => {
+                    let body: text::Text = conversation::session_block_text_body(sidx, bi);
+                    let md_blocks: vec::Vec[md::MdBlock] = md::parse_blocks(body.view());
+                    var mi: usize = 0 as usize;
+                    while mi < md_blocks.count() {
+                        if let option::Option::Some(mb) = md_blocks.at_ptr(mi) {
+                            if (*mb).kind == md::BlockKind::CodeBlock {
+                                _flush_prose(out_rows, prose_buf, prose_prev_list);
+                                var row: DisplayRow = _empty_row(RowKind::AgentCode, (*mb).body.clone());
+                                row.lang = (*mb).lang.clone();
+                                let _ = out_rows.append(row);
+                            } else {
+                                // Emit each paragraph/heading as its own row so NSTableView
+                                // virtualizes long replies instead of putting 4KB+ in one
+                                // giant NSTextField backing store. Keep short consecutive
+                                // list runs grouped together so bullets stay tight.
+                                let is_list: bool = (*mb).kind == md::BlockKind::ListItem;
+                                if !prose_buf.is_empty() && (!prose_prev_list || !is_list || prose_buf.count() > (600 as usize)) {
+                                    _flush_prose(out_rows, prose_buf, prose_prev_list);
+                                }
+                                _append_md_prose(prose_buf, prose_prev_list, mb);
+                            }
+                        }
+                        mi = mi +% (1 as usize);
+                    }
+                }
+                conversation::BlockKind::AgentThought => {
+                    ChatScreen::_push_step(out_steps, "Thought", text::from_str(""), false, StepState::Done);
+                    if prefs::expand_thinking() {
+                        let tb_txt: text::Text = conversation::session_block_text_body(sidx, bi);
+                        if !tb_txt.view().trim().is_empty() {
+                            _flush_prose(out_rows, prose_buf, prose_prev_list);
+                            let _ = out_rows.append(_empty_row(RowKind::ThoughtNote, _cap_output(tb_txt.view().trim(), 600 as usize)));
+                        }
+                    }
+                }
+                conversation::BlockKind::ToolCall => {
+                    if let option::Option::Some(tb) = conversation::session_clone_tool_block(sidx, bi) {
+                        if !tb.family.equals("SearchTool") {
+                            let is_exec: bool = match tb.kind { types::ToolKind::Execute => true, _ => false };
+                            let is_browser: bool = _is_browser_tool_name(tb.title.view())
+                                || _is_browser_tool_name(tb.family.view())
+                                || _is_browser_tool_name(tb.raw_input_json.view());
+                            let state: StepState = if tb.status.is_failed() {
+                                StepState::Failed
+                            } else if tb.status.is_completed() {
+                                StepState::Done
+                            } else {
+                                StepState::Working
+                            };
+                            let failed: bool = tb.status.is_failed();
+                            let done: bool = tb.status.is_completed();
+                            if is_browser {
+                                _flush_prose(out_rows, prose_buf, prose_prev_list);
+                                let summary: text::Text = browser_card_summary(tb.title.view(), tb.raw_input_json.view());
+                                let b_url: text::Text = _json_arg_str(tb.raw_input_json.view(), "url");
+                                let detail: text::Text = if failed && !tb.output_text.is_empty() {
+                                    _first_line(tb.output_text.view())
+                                } else if !b_url.is_empty() {
+                                    b_url.clone()
+                                } else {
+                                    _first_line(tb.output_text.view())
+                                };
+                                var brow: DisplayRow = _empty_row(RowKind::BrowserCard, detail.clone());
+                                brow.title = summary.clone();
+                                brow.url = b_url;
+                                brow.browser_state = if failed {
+                                    BrowserCardState::Failed
+                                } else if done {
+                                    BrowserCardState::Done
+                                } else {
+                                    BrowserCardState::Running
+                                };
+                                let _ = out_rows.append(brow);
+                                let _ = out_steps.append(Step {
+                                    title: summary,
+                                    detail: detail,
+                                    mono: false,
+                                    state: state,
+                                });
+                            } else if is_exec {
+                                let cmd: text::Text = _backticked(tb.title.view());
+                                let title: str = if failed {
+                                    "Command failed"
+                                } else if done {
+                                    "Ran command"
+                                } else {
+                                    "Running command"
+                                };
+                                ChatScreen::_push_step(out_steps, title, cmd.clone(), true, state);
+                                let local_u: text::Text = extract_localhost_url(tb.output_text.view());
+                                if !local_u.is_empty() {
+                                    _flush_prose(out_rows, prose_buf, prose_prev_list);
+                                    var chip: DisplayRow = _empty_row(RowKind::OpenUrlChip, "Open ${local_u.view()} in Browser");
+                                    chip.url = local_u;
+                                    let _ = out_rows.append(chip);
+                                }
+                                if term.count() < SIDE_TEXT_CAP {
+                                    let _ = term.append("$ ${cmd.view()}\n");
+                                    if !tb.output_text.is_empty() {
+                                        let out: text::Text = _cap_output(tb.output_text.view(), 2000 as usize);
+                                        let _ = term.append(out.view());
+                                        if !out.view().has_suffix("\n") { let _ = term.append("\n"); }
+                                    } else if !tb.tool_not_run.is_empty() {
+                                        let _ = term.append("(not run: ${tb.tool_not_run.view()})\n");
+                                    }
+                                    let _ = term.append("\n");
+                                }
+                            } else {
+                                let title: text::Text = if tb.title.is_empty() {
+                                    text::from_str("Tool call")
+                                } else {
+                                    tb.title.clone()
+                                };
+                                let detail: text::Text = if !tb.diff_path.is_empty() {
+                                    text::from_str(path::file_name(tb.diff_path.view()))
+                                } else if failed && !tb.tool_not_run.is_empty() {
+                                    "Not run: ${tb.tool_not_run.view()}"
+                                } else if !tb.output_text.is_empty() {
+                                    _first_line(tb.output_text.view())
+                                } else {
+                                    text::from_str("")
+                                };
+                                let _ = out_steps.append(Step {
+                                    title: title,
+                                    detail: detail,
+                                    mono: false,
+                                    state: state,
+                                });
+                            }
+                            if !tb.diff_path.is_empty() && prev.count() < SIDE_TEXT_CAP {
+                                let d: text::Text = _format_diff(tb.diff_path.view(), tb.diff_old.view(), tb.diff_new.view());
+                                let _ = prev.append(_cap_output(d.view(), 4000 as usize).view());
+                                let _ = prev.append("\n");
+                            }
+                        }
+                    }
+                }
+                conversation::BlockKind::Permission => {
+                    _flush_prose(out_rows, prose_buf, prose_prev_list);
+                    if let option::Option::Some(pb) = conversation::session_clone_permission_block(sidx, bi) {
+                        let detail: text::Text = if !pb.command.is_empty() {
+                            pb.command.clone()
+                        } else {
+                            pb.description.clone()
+                        };
+                        var res_lbl: text::Text = text::from_str("");
+                        if let option::Option::Some(ro) = pb.resolved_option {
+                            res_lbl = if ro.contains("allow") {
+                                text::from_str("Allowed")
+                            } else {
+                                text::from_str("Denied")
+                            };
+                        }
+                        if res_lbl.is_empty() {
+                            ChatScreen::_push_step(out_steps, "Waiting for your approval", detail.clone(), true, StepState::Waiting);
+                        }
+                        var opts_copy: vec::Vec[types::PermissionOption] = vec::new::[types::PermissionOption]();
+                        var oi: usize = 0 as usize;
+                        while oi < pb.options.count() {
+                            if let option::Option::Some(op) = pb.options.at_ptr(oi) {
+                                let _ = opts_copy.append((*op).clone());
+                            }
+                            oi = oi +% (1 as usize);
+                        }
+                        var row: DisplayRow = _empty_row(RowKind::ApprovalCard, detail);
+                        row.item_id = pb.tool_call_id.clone();
+                        row.title = if pb.title.is_empty() { text::from_str("Approval required") } else { pb.title.clone() };
+                        row.rpc_id = pb.rpc_id.clone();
+                        row.perm_options = opts_copy;
+                        row.resolved_label = res_lbl;
+                        let _ = out_rows.append(row);
+                    }
+                }
+                conversation::BlockKind::Unknown => {
+                    // Ignore internal ACP update kinds ("plan", "usage", etc.) so they don't clutter the transcript.
+                    let note: text::Text = conversation::session_block_text_body(sidx, bi);
+                    let nv: str = note.view().trim();
+                    if !nv.is_empty() && nv != "plan" && nv != "usage" && nv != "usage_update" {
+                        _flush_prose(out_rows, prose_buf, prose_prev_list);
+                        let _ = out_rows.append(_empty_row(RowKind::StatusNote, note));
+                    }
+                }
+            }
+            bi = bi +% (1 as usize);
+        }
+        _flush_prose(out_rows, prose_buf, prose_prev_list);
+
+        if conversation::session_turn_is_idle_cancelled(sidx) {
+            let _ = out_rows.append(_empty_row(RowKind::StatusNote, text::from_str("Stopped")));
+        } else {
+            let err_msg: text::Text = conversation::session_turn_error_message(sidx);
+            if !err_msg.is_empty() {
+                if is_quota_error(err_msg.view()) {
+                    var qrow: DisplayRow = _empty_row(RowKind::QuotaNotice, err_msg);
+                    qrow.title = text::from_str("Usage quota reached");
+                    qrow.reset_label = account::usage_reset_pretty();
+                    let _ = out_rows.append(qrow);
+                } else {
+                    let _ = out_rows.append(_empty_row(RowKind::StatusNote, err_msg));
+                }
+            }
+        }
+        if conversation::session_turn_is_running(sidx) && out_steps.count() == (0 as usize) {
+            ChatScreen::_push_step(out_steps, "Working…", text::from_str(""), false, StepState::Working);
+        }
+        if out_rows.count() > (0 as usize) {
+            let _ = out_rows.append(_empty_row(RowKind::BottomSpacer, text::from_str("")));
+        }
+        let live_title: text::Text = conversation::session_title(sid.view());
+        out_title = _run_title(sid.view(), live_title.view());
+        let git_diff: text::Text = engine::git_diff_text();
+        if !git_diff.is_empty() {
+            let _ = prev.append(git_diff.view());
+        } else {
+            let git_s: text::Text = engine::git_status_summary();
+            if !git_s.is_empty() {
+                let _ = prev.append(git_s.view());
+            }
+        }
+    }
+
+    // ---- transcript data source (height beside builder) ---------------------
+
+    fn row_height_at(ref this, index: usize, width: f64) -> f64 {
+        guard let option::Option::Some(rp) = this.rows.at_ptr(index) else { return 32.0f64; };
+        let avail: f64 = if width > 160.0f64 { width - 92.0f64 } else { 520.0f64 };
+        // Fast O(1) cache hit during live window resize: avoid re-running
+        // CoreText on every single pixel of drag (re-measure every ~16pt step).
+        let dw: f64 = avail - (*rp).cached_w;
+        if (*rp).cached_h > 0.0f64 && dw < 16.0f64 && dw > -16.0f64 {
+            return (*rp).cached_h;
+        }
+        let measured: f64 = match (*rp).kind {
+            RowKind::LoadEarlier => 52.0f64,
+            RowKind::UserMessage => {
+                let bubble_w: f64 = (avail * 0.72f64) - 44.0f64;
+                let mw: f64 = if bubble_w > 120.0f64 { bubble_w } else { 120.0f64 };
+                let h: f64 = text_metrics::measure_height(
+                    (*rp).body.view(), mw,
+                    font_size: BODY_SIZE, font_scales: false, line_height: BODY_LINE,
+                );
+                let extra: f64 = if (*rp).rewind_picking { 38.0f64 } else { 0.0f64 };
+                h + 56.0f64 + extra
+            }
+            RowKind::AgentProse => {
+                let prose_txt: str = if (*rp).plain_prose.is_empty() {
+                    (*rp).body.view()
+                } else {
+                    (*rp).plain_prose.view()
+                };
+                let h: f64 = text_metrics::measure_height(
+                    prose_txt, avail - 12.0f64,
+                    font_size: BODY_SIZE, font_scales: false, line_height: BODY_LINE,
+                );
+                h + 18.0f64
+            }
+            RowKind::AgentCode => {
+                let cw: f64 = if avail > 48.0f64 { avail - 36.0f64 } else { avail };
+                let h: f64 = text_metrics::measure_height(
+                    (*rp).body.view(), cw,
+                    font_family: ftheme::MONOSPACE,
+                    font_size: CODE_SIZE, font_scales: false, line_height: CODE_LINE,
+                );
+                h + 78.0f64
+            }
+            RowKind::ApprovalCard => {
+                if !(*rp).resolved_label.is_empty() {
+                    40.0f64
+                } else {
+                    let has_cmd: bool = !(*rp).body.is_empty();
+                    if has_cmd { 236.0f64 } else { 168.0f64 }
+                }
+            }
+            RowKind::BrowserCard => 58.0f64,
+            RowKind::OpenUrlChip => 44.0f64,
+            RowKind::ThoughtNote => {
+                let h: f64 = text_metrics::measure_height(
+                    (*rp).body.view(), avail - 28.0f64,
+                    font_size: 13.0f64, font_scales: false, line_height: 19.0f64,
+                );
+                h + 26.0f64
+            }
+            RowKind::QuotaNotice => 92.0f64,
+            RowKind::StatusNote => 30.0f64,
+            RowKind::TopSpacer => 18.0f64,
+            RowKind::BottomSpacer => 164.0f64,
+        };
+        (*rp).cached_w = avail;
+        (*rp).cached_h = measured;
+        return measured;
+    }
+
+    fn build_row(ref this, index: usize) -> core::Node {
+        let g: u64 = this.epoch;
+        let outer_key: text::Text = "chat:row:${g}:${index}";
+        guard let option::Option::Some(rp) = this.rows.at_ptr(index) else {
+            return @ui { column(key: outer_key.view()) {} };
+        };
+        let body_txt: text::Text = (*rp).body.clone();
+        let lang_txt: text::Text = (*rp).lang.clone();
+        let lbl_key: text::Text = "chat:msg:${index}";
+
+        return match (*rp).kind {
+            RowKind::LoadEarlier => @ui {
+                hstack(key: outer_key.view()) {
+                    spacer().grow(1.0f64)
+                    style::outline_button(body_txt.view(), "chat:load_earlier", on_click: this.on_load_earlier)
+                    spacer().grow(1.0f64)
+                }
+                .align(flex::Align::Center)
+                    .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                    .padding_edge(flex::Edge::Vertical, 10.0f64)
+            },
+            RowKind::UserMessage => {
+                let p_ord: i32 = (*rp).user_ordinal;
+                let picking: bool = (*rp).rewind_picking;
+                let rw_btn_key: text::Text = "chat:rewind:${p_ord}";
+                let rw_all_key: text::Text = "chat:rw_all:${p_ord}";
+                let rw_conv_key: text::Text = "chat:rw_conv:${p_ord}";
+                let rw_files_key: text::Text = "chat:rw_files:${p_ord}";
+                @ui {
+                    column(key: outer_key.view()) {
+                        hstack {
+                            style::circle_icon(icons::undo, rw_btn_key.view(),
+                            title: "Rewind to this message",
+                            size: 24.0f64, icon_size: 14.5f64,
+                            color: if picking { style::lime_text() } else { style::faint() },
+                            on_click: this.on_rewind_pick)
+                            column {
+                                label(body_txt.view(), key: lbl_key.view(),
+                                font_size: BODY_SIZE,
+                                font_scales: false,
+                                line_height: BODY_LINE,
+                                text_color: style::ink(),
+                                line_break: vocab::LineBreak::WordWrap,
+                                selectable: true)
+                                    .shrink(1.0f64)
+                            }
+                            .set_max_width_percent(72.0f64)
+                                .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                                .padding_edge(flex::Edge::Vertical, 12.0f64)
+                                .set_background_color(style::chip())
+                                .set_corner_radius(vocab::Corners::all(16.0f64))
+                        }
+                        .width_percent(100.0f64)
+                            .justify(flex::Justify::End)
+                            .align(flex::Align::Center)
+                            .gap(6.0f64)
+                        if picking {
+                            hstack(key: "chat:rw_picker") {
+                                label("Rewind:",
+                                font_size: 11.5f64,
+                                font_scales: false,
+                                text_color: style::muted())
+                                text_button("Chat & files", key: rw_all_key.view(),
+                                font_size: 11.5f64,
+                                font_weight: vocab::FontWeight::Semibold,
+                                text_color: style::on_lime(),
+                                bordered: false,
+                                corner_radius: vocab::Corners::all(6.0f64),
+                                on_click: this.on_rewind_exec)
+                                    .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                                    .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                    .set_background_color(style::lime())
+                                text_button("Chat only", key: rw_conv_key.view(),
+                                font_size: 11.5f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                text_color: style::ink(),
+                                bordered: false,
+                                corner_radius: vocab::Corners::all(6.0f64),
+                                on_click: this.on_rewind_exec)
+                                    .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                                    .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                    .set_background_color(style::chip())
+                                text_button("Files only", key: rw_files_key.view(),
+                                font_size: 11.5f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                text_color: style::ink(),
+                                bordered: false,
+                                corner_radius: vocab::Corners::all(6.0f64),
+                                on_click: this.on_rewind_exec)
+                                    .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                                    .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                    .set_background_color(style::chip())
+                                text_button("Cancel", key: "chat:rw_cancel",
+                                font_size: 11.5f64,
+                                text_color: style::muted(),
+                                bordered: false,
+                                on_click: this.on_rewind_cancel)
+                            }
+                            .align(flex::Align::Center)
+                                .gap(6.0f64)
+                                .padding_edge(flex::Edge::Top, 6.0f64)
+                        }
+                    }
+                    .align(flex::Align::End)
+                        .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                        .padding_edge(flex::Edge::Vertical, 10.0f64)
+                }
+            }
+            RowKind::AgentProse => {
+                let spans: vocab::Spans = _build_prose_spans(body_txt.view());
+                @ui {
+                    column(key: outer_key.view()) {
+                        label(body_txt.view(), key: lbl_key.view(),
+                        font_size: BODY_SIZE,
+                        font_scales: false,
+                        line_height: BODY_LINE,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::WordWrap,
+                        vertical_align: vocab::TextAlign::Start,
+                        selectable: true,
+                        formatted_text: spans)
+                            .width_percent(100.0f64)
+                            .height_percent(100.0f64)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .width_percent(100.0f64)
+                        .height_percent(100.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                        .padding_edge(flex::Edge::Vertical, 6.0f64)
+                }
+            }
+            RowKind::AgentCode => {
+                let copy_key: text::Text = "chat:code_copy:${index}";
+                let header_txt: str = if lang_txt.is_empty() { "code" } else { lang_txt.view() };
+                @ui {
+                    column(key: outer_key.view()) {
+                        column {
+                            hstack {
+                                label(header_txt,
+                                font_size: 11.5f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                font_scales: false,
+                                text_color: style::muted())
+                                spacer().grow(1.0f64)
+                                style::circle_icon(icons::content_copy, copy_key.view(),
+                                title: "Copy code",
+                                size: 24.0f64, icon_size: 14.5f64,
+                                color: style::muted(),
+                                on_click: this.on_copy_code)
+                            }
+                            .align(flex::Align::Center)
+                                .height(24.0f64)
+                            label(body_txt.view(), key: lbl_key.view(),
+                            font_family: ftheme::MONOSPACE,
+                            font_size: CODE_SIZE,
+                            font_scales: false,
+                            line_height: CODE_LINE,
+                            text_color: style::ink(),
+                            line_break: vocab::LineBreak::WordWrap,
+                            vertical_align: vocab::TextAlign::Start,
+                            selectable: true)
+                                .width_percent(100.0f64)
+                                .height(0.0f64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                        }
+                        .width_percent(100.0f64)
+                            .height_percent(100.0f64)
+                            .padding(14.0f64)
+                            .gap(6.0f64)
+                            .set_background_color(style::well())
+                            .set_corner_radius(vocab::Corners::all(10.0f64))
+                    }
+                    .width_percent(100.0f64)
+                        .height_percent(100.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                        .padding_edge(flex::Edge::Vertical, 8.0f64)
+                }
+            }
+            RowKind::ApprovalCard => this._approval_row(index, outer_key.view()),
+            RowKind::BrowserCard => {
+                let card_title: text::Text = (*rp).title.clone();
+                let card_state: BrowserCardState = (*rp).browser_state;
+                let has_url: bool = !(*rp).url.is_empty();
+                let open_key: text::Text = "chat:open_url:${index}";
+                let st_col: vocab::Color = if card_state == BrowserCardState::Failed { style::danger() } else { style::lime_text() };
+                @ui {
+                    column(key: outer_key.view()) {
+                        bordered(stroke: vocab::Brush::solid(style::hairline()),
+                        stroke_width: 1.0f64,
+                        stroke_shape: vocab::Shape::rounded(10.0f64)) {
+                            hstack {
+                                symbol(icons::language, size: 16.0f64, color: style::lime_text())
+                                    .shrink(0.0f64)
+                                column {
+                                    label(card_title.view(), key: lbl_key.view(),
+                                    font_size: 13.5f64,
+                                    font_weight: vocab::FontWeight::Medium,
+                                    font_scales: false,
+                                    text_color: style::ink(),
+                                    line_break: vocab::LineBreak::TailTruncation,
+                                    max_lines: 1 as i64)
+                                    if !body_txt.is_empty() {
+                                        label(body_txt.view(),
+                                        font_family: ftheme::MONOSPACE,
+                                        font_size: 11.5f64,
+                                        font_scales: false,
+                                        text_color: style::muted(),
+                                        line_break: vocab::LineBreak::TailTruncation,
+                                        max_lines: 1 as i64)
+                                    }
+                                }
+                                .grow(1.0f64)
+                                    .shrink(1.0f64)
+                                    .min_width(0.0f64)
+                                    .gap(2.0f64)
+                                label(card_state.label(),
+                                font_size: 11.5f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                font_scales: false,
+                                text_color: st_col)
+                                    .shrink(0.0f64)
+                                if has_url {
+                                    text_button("Open", key: open_key.view(),
+                                    font_size: 12.0f64,
+                                    font_weight: vocab::FontWeight::Medium,
+                                    text_color: style::ink(),
+                                    bordered: false,
+                                    corner_radius: vocab::Corners::all(6.0f64),
+                                    on_click: this.on_open_url_click)
+                                        .padding_edge(flex::Edge::Horizontal, 9.0f64)
+                                        .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                        .set_background_color(style::chip())
+                                        .shrink(0.0f64)
+                                }
+                            }
+                            .align(flex::Align::Center)
+                                .gap(10.0f64)
+                                .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                                .padding_edge(flex::Edge::Vertical, 9.0f64)
+                        }
+                        .set_background_color(style::well())
+                            .set_corner_radius(vocab::Corners::all(10.0f64))
+                    }
+                    .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                        .padding_edge(flex::Edge::Vertical, 5.0f64)
+                }
+            }
+            RowKind::OpenUrlChip => {
+                let open_key: text::Text = "chat:open_url:${index}";
+                @ui {
+                    hstack(key: outer_key.view()) {
+                        bordered(stroke: vocab::Brush::solid(style::hairline()),
+                        stroke_width: 1.0f64,
+                        stroke_shape: vocab::Shape::rounded(999.0f64)) {
+                            hstack(key: open_key.view()) {
+                                symbol(icons::language, size: 15.0f64, color: style::lime_text())
+                                    .shrink(0.0f64)
+                                    .set_input_transparent(true)
+                                label(body_txt.view(), key: lbl_key.view(),
+                                font_size: 12.5f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                font_scales: false,
+                                text_color: style::ink(),
+                                line_break: vocab::LineBreak::TailTruncation,
+                                max_lines: 1 as i64)
+                                    .set_input_transparent(true)
+                            }
+                            .align(flex::Align::Center)
+                                .gap(7.0f64)
+                                .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                                .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                .gesture(on_click: this.on_open_url_click_gesture)
+                        }
+                        .set_background_color(style::well())
+                            .set_corner_radius(vocab::Corners::all(999.0f64))
+                        spacer().grow(1.0f64)
+                    }
+                    .align(flex::Align::Center)
+                        .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                        .padding_edge(flex::Edge::Vertical, 4.0f64)
+                }
+            }
+            RowKind::ThoughtNote => @ui {
+                column(key: outer_key.view()) {
+                    hstack {
+                        column {}
+                        .width(2.0f64)
+                            .shrink(0.0f64)
+                            .set_background_color(style::hairline())
+                        label(body_txt.view(), key: lbl_key.view(),
+                        font_size: 13.0f64,
+                        font_scales: false,
+                        line_height: 19.0f64,
+                        italic: true,
+                        text_color: style::muted(),
+                        line_break: vocab::LineBreak::WordWrap,
+                        vertical_align: vocab::TextAlign::Start,
+                        selectable: true)
+                            .height_percent(100.0f64)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .width_percent(100.0f64)
+                        .height_percent(100.0f64)
+                        .gap(10.0f64)
+                        .align(flex::Align::Stretch)
+                }
+                .width_percent(100.0f64)
+                    .height_percent(100.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                    .padding_edge(flex::Edge::Vertical, 6.0f64)
+            },
+            RowKind::QuotaNotice => {
+                let q_title: text::Text = (*rp).title.clone();
+                let q_reset: text::Text = (*rp).reset_label.clone();
+                @ui {
+                    column(key: outer_key.view()) {
+                        bordered(stroke: vocab::Brush::solid(style::danger()),
+                        stroke_width: 1.0f64,
+                        stroke_shape: vocab::Shape::rounded(12.0f64)) {
+                            hstack {
+                                symbol(icons::warning, size: 18.0f64, color: style::danger())
+                                    .shrink(0.0f64)
+                                column {
+                                    label(q_title.view(),
+                                    font_size: 13.5f64,
+                                    font_weight: vocab::FontWeight::Semibold,
+                                    font_scales: false,
+                                    text_color: style::ink())
+                                    label(body_txt.view(), key: lbl_key.view(),
+                                    font_size: 12.5f64,
+                                    font_scales: false,
+                                    text_color: style::muted(),
+                                    line_break: vocab::LineBreak::WordWrap,
+                                    selectable: true)
+                                    if !q_reset.is_empty() {
+                                        label(q_reset.view(),
+                                        font_size: 12.0f64,
+                                        font_weight: vocab::FontWeight::Medium,
+                                        font_scales: false,
+                                        text_color: style::lime_text())
+                                    }
+                                }
+                                .grow(1.0f64)
+                                    .shrink(1.0f64)
+                                    .gap(3.0f64)
+                            }
+                            .align(flex::Align::Start)
+                                .gap(10.0f64)
+                                .padding(12.0f64)
+                        }
+                        .set_background_color(style::danger_wash())
+                            .set_corner_radius(vocab::Corners::all(12.0f64))
+                    }
+                    .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                        .padding_edge(flex::Edge::Vertical, 6.0f64)
+                }
+            }
+            RowKind::StatusNote => @ui {
+                column(key: outer_key.view()) {
+                    label(body_txt.view(), key: lbl_key.view(),
+                    font_size: 13.0f64,
+                    font_scales: false,
+                    italic: true,
+                    text_color: style::muted())
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                }
+                .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                    .padding_edge(flex::Edge::Vertical, 6.0f64)
+            },
+            RowKind::TopSpacer => @ui {
+                column(key: outer_key.view()) {}.height(18.0f64)
+            },
+            RowKind::BottomSpacer => @ui {
+                column(key: outer_key.view()) {}.height(164.0f64)
+            },
+        };
+    }
+
+    fn _approval_row(ref this, index: usize, outer_key: str) -> core::Node {
+        guard let option::Option::Some(rp) = this.rows.at_ptr(index) else {
+            return @ui { column(key: outer_key) {} };
+        };
+        let row_key: text::Text = "chat:msg:${index}";
+        let cmd: text::Text = (*rp).body.clone();
+        let res_lbl: text::Text = (*rp).resolved_label.clone();
+        if !res_lbl.is_empty() {
+            let line: text::Text = if cmd.is_empty() {
+                "${res_lbl.view()} · ${(*rp).title.view()}"
+            } else {
+                "${res_lbl.view()} · ${cmd.view()}"
+            };
+            let col: vocab::Color = if res_lbl.equals("Allowed") { style::lime_text() } else { style::muted() };
+            return @ui {
+                hstack(key: outer_key) {
+                    label(line.view(), key: row_key.view(),
+                    font_family: ftheme::MONOSPACE,
+                    font_size: 13.0f64,
+                    font_scales: false,
+                    text_color: col,
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                }
+                .align(flex::Align::Center)
+                    .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                    .padding_edge(flex::Edge::Vertical, 8.0f64)
+            };
+        }
+        let proj: text::Text = _project_name();
+        let heading: text::Text = if cmd.is_empty() {
+            (*rp).title.clone()
+        } else if proj.is_empty() {
+            text::from_str("Run this command?")
+        } else {
+            "Run this command in ${proj.view()}?"
+        };
+        let has_cmd: bool = !cmd.is_empty();
+        let tcid: text::Text = (*rp).item_id.clone();
+        let opt_count: usize = (*rp).perm_options.count();
+        let body: core::Node = @ui {
+            column {
+                label(heading.view(), key: row_key.view(),
+                font_size: 17.0f64,
+                font_scales: false,
+                font_weight: vocab::FontWeight::Semibold,
+                text_color: style::ink(),
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                if has_cmd {
+                    hstack {
+                        label(cmd.view(),
+                        font_family: ftheme::MONOSPACE,
+                        font_size: 14.0f64,
+                        font_scales: false,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64,
+                        selectable: true)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .align(flex::Align::Center)
+                        .height(44.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                        .set_background_color(style::well())
+                        .set_corner_radius(vocab::Corners::all(8.0f64))
+                }
+                this._approval_buttons(tcid.view(), index, opt_count)
+            }
+            .gap(16.0f64)
+                .padding(22.0f64)
+        };
+        return @ui {
+            column(key: outer_key) {
+                style::card_box("", body, radius: 16.0f64, accent: true)
+            }
+            .padding_edge(flex::Edge::Horizontal, 40.0f64)
+                .padding_edge(flex::Edge::Vertical, 12.0f64)
+        };
+    }
+
+    fn _one_approval_btn(ref this, tcid: str, row_idx: usize, opt_idx: usize) -> core::Node {
+        guard let option::Option::Some(rp) = this.rows.at_ptr(row_idx) else {
+            return @ui { container {} };
+        };
+        guard let option::Option::Some(op) = (*rp).perm_options.at_ptr(opt_idx) else {
+            return @ui { container {} };
+        };
+        let key_txt: text::Text = "approve:${tcid}:${(*op).option_id.view()}";
+        let proj: text::Text = _project_name();
+        let always: text::Text = if proj.is_empty() {
+            text::from_str("Always allow")
+        } else {
+            "Always allow in ${proj.view()}"
+        };
+        return match (*op).kind {
+            types::PermissionKind::AllowOnce =>
+            style::primary_button("Allow once", key_txt.view(), on_click: this.on_approve_click),
+            types::PermissionKind::AllowAlways =>
+            style::outline_button(always.view(), key_txt.view(), on_click: this.on_approve_click),
+            types::PermissionKind::RejectOnce =>
+            style::outline_button("Deny", key_txt.view(), on_click: this.on_approve_click),
+            _ => style::outline_button((*op).name.view(), key_txt.view(), on_click: this.on_approve_click),
+        };
+    }
+
+    fn _approval_buttons(ref this, tcid: str, row_idx: usize, opt_count: usize) -> core::Node {
+        let n: i32 = opt_count as i32;
+        return @ui {
+            hstack {
+                for i in 0..n {
+                    this._one_approval_btn(tcid, row_idx, i as usize)
+                }
+            }
+            .gap(10.0f64)
+        };
+    }
+
+    // ---- run timeline data source -------------------------------------------
+
+    fn step_height_at(ref this, index: usize, _width: f64) -> f64 {
+        guard let option::Option::Some(sp) = this.steps.at_ptr(index) else { return 36.0f64; };
+        var h: f64 = if (*sp).detail.is_empty() { 40.0f64 } else { 60.0f64 };
+        if index == (0 as usize) { h = h + 14.0f64; }
+        if index +% (1 as usize) >= this.steps.count() { h = h + 16.0f64; }
+        return h;
+    }
+
+    fn build_step(ref this, index: usize) -> core::Node {
+        let g: u64 = this.epoch;
+        let outer_key: text::Text = "run:row:${g}:${index}";
+        guard let option::Option::Some(sp) = this.steps.at_ptr(index) else {
+            return @ui { column(key: outer_key.view()) {} };
+        };
+        let title: text::Text = (*sp).title.clone();
+        let detail: text::Text = (*sp).detail.clone();
+        let has_detail: bool = !detail.is_empty();
+        let mono: bool = (*sp).mono;
+        let first: bool = index == (0 as usize);
+        let last: bool = index +% (1 as usize) >= this.steps.count();
+        let waiting: bool = match (*sp).state { StepState::Waiting => true, _ => false };
+        let dot_col: vocab::Color = match (*sp).state {
+            StepState::Waiting => style::lime(),
+            StepState::Working => style::lime(),
+            StepState::Failed => style::danger(),
+            StepState::Done => vocab::Color::ink(0.35f64),
+        };
+        let dot_size: f64 = if waiting { 12.0f64 } else { 8.0f64 };
+        let title_col: vocab::Color = if waiting { style::lime_text() } else { style::ink() };
+        let title_weight: vocab::FontWeight = if waiting { vocab::FontWeight::Semibold } else { vocab::FontWeight::Regular };
+        let step_key: text::Text = "run:step:${index}";
+        let top_line: vocab::Color = if first { vocab::Color::clear() } else { style::hairline() };
+        let bottom_line: vocab::Color = if last { vocab::Color::clear() } else { style::hairline() };
+        let top_pad: f64 = if first { 14.0f64 } else { 0.0f64 };
+        let bot_pad: f64 = if last { 16.0f64 } else { 0.0f64 };
+        return @ui {
+            hstack(key: outer_key.view()) {
+                column {
+                    column {}
+                    .width(1.0f64)
+                        .height(8.0f64)
+                        .set_background_color(top_line)
+                    style::dot(dot_size, dot_col)
+                    column {}
+                    .width(1.0f64)
+                        .grow(1.0f64)
+                        .set_background_color(bottom_line)
+                }
+                .width(20.0f64)
+                    .shrink(0.0f64)
+                    .align(flex::Align::Center)
+                column {
+                    label(title.view(), key: step_key.view(),
+                    font_size: 14.5f64,
+                    font_weight: title_weight,
+                    text_color: title_col,
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                    if has_detail {
+                        label(detail.view(),
+                        font_family: if mono { ftheme::MONOSPACE } else { "" },
+                        font_size: 13.0f64,
+                        text_color: style::muted(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64)
+                    }
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .gap(5.0f64)
+                    .padding_edge(flex::Edge::Top, 3.0f64)
+            }
+            .gap(10.0f64)
+                .padding_edge(flex::Edge::Left, 18.0f64)
+                .padding_edge(flex::Edge::Right, 16.0f64)
+                .padding_edge(flex::Edge::Top, top_pad)
+                .padding_edge(flex::Edge::Bottom, bot_pad)
+                .set_input_transparent(true)
+        };
+    }
+
+    // ---- file tree data source ----------------------------------------------
+
+    fn _toggle_dir_expanded(ref this, rel_path: str) {
+        if !this.expanded_dirs.remove(rel_path) {
+            let _ = this.expanded_dirs.insert(text::from_str(rel_path));
+        }
+    }
+
+    fn _kick_file_tree_job(ref this) {
+        this.tree_dirty = false;
+        this.tree_job.cwd = this.file_tree_cwd.clone();
+        this.tree_job.expanded = file_tree::clone_string_set(this.expanded_dirs);
+        if !services::run_job(this.tree_job, then: this.on_file_tree_loaded) {
+            this.tree_dirty = true;
+        }
+    }
+
+    fn on_file_tree_loaded(ref this) {
+        this.file_tree_epoch = this.file_tree_epoch +% (1 as u64);
+        let fv: *vec::Vec[file_tree::TreeEntry] = this.file_entries.as_vec_ptr();
+        (*fv).remove_all();
+        for e in this.tree_job.entries.drain() {
+            let _ = (*fv).append(e);
+        }
+        this.file_entries.note_reload();
+        let has_files: bool = this.file_entries.count() > (0 as usize);
+        style::show("files:tree", has_files);
+        style::show("files:empty", !has_files);
+        if this.tree_dirty {
+            this._kick_file_tree_job();
+        }
+    }
+
+    fn _sync_file_tree(ref this, force: bool = false) {
+        let cwd: text::Text = engine::active_cwd();
+        let cwd_changed: bool = !cwd.equals(this.file_tree_cwd.view());
+        if cwd_changed {
+            this.expanded_dirs.clear();
+            this.file_tree_cwd = cwd.clone();
+        }
+        if !force && !cwd_changed { return; }
+        this._kick_file_tree_job();
+    }
+
+    fn file_row_height_at(ref this, _index: usize, _width: f64) -> f64 {
+        return 30.0f64;
+    }
+
+    fn build_file_row(ref this, index: usize) -> core::Node {
+        let g: u64 = this.file_tree_epoch;
+        let outer_key: text::Text = "files:outer:${g}:${index}";
+        guard let option::Option::Some(ep) = this.file_entries.at_ptr(index) else {
+            return @ui { hstack(key: outer_key.view()) {} };
+        };
+        let nm: text::Text = (*ep).name.clone();
+        let is_dir: bool = (*ep).is_dir;
+        let expanded: bool = (*ep).expanded;
+        let depth: usize = (*ep).depth;
+        let indent: f64 = (depth as f64) * 14.0f64 + 14.0f64;
+        let row_key: text::Text = "files:row:${index}";
+        let ref_key: text::Text = "files:ref:${index}";
+        let chev_icon: u32 = if expanded { icons::expand_more } else { icons::chevron_right };
+        let item_icon: u32 = if is_dir {
+            if expanded { icons::folder_open } else { icons::folder }
+        } else {
+            icons::description
+        };
+        let name_col: vocab::Color = if is_dir { style::ink() } else { style::muted() };
+        return @ui {
+            hstack(key: outer_key.view()) {
+                hstack(key: row_key.view()) {
+                    if is_dir {
+                        symbol(chev_icon, size: 14.0f64, color: style::muted())
+                            .shrink(0.0f64)
+                            .set_input_transparent(true)
+                    } else {
+                        column {}
+                        .width(14.0f64)
+                            .shrink(0.0f64)
+                            .set_input_transparent(true)
+                    }
+                    symbol(item_icon, size: 14.5f64, color: style::muted())
+                        .shrink(0.0f64)
+                        .set_input_transparent(true)
+                    label(nm.view(),
+                    font_size: 13.0f64,
+                    text_color: name_col,
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                        .set_input_transparent(true)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .min_width(0.0f64)
+                    .height(28.0f64)
+                    .align(flex::Align::Center)
+                    .gap(6.0f64)
+                    .padding_edge(flex::Edge::Left, indent)
+                    .gesture(on_click: this.on_file_row_tapped)
+
+                style::circle_icon(icons::add, ref_key.view(),
+                title: "Reference in prompt",
+                size: 24.0f64, icon_size: 15.0f64,
+                color: style::muted(),
+                on_click: this.on_file_ref_clicked)
+            }
+            .height(30.0f64)
+                .align(flex::Align::Center)
+                .gap(4.0f64)
+                .padding_edge(flex::Edge::Right, 12.0f64)
+        };
+    }
+
+    fn _apply_pending_ref(ref this) {
+        if this.pending_ref_path.is_empty() { return; }
+        let rel: text::Text = this.pending_ref_path.clone();
+        let is_dir: bool = this.pending_ref_is_dir;
+        this.pending_ref_path = text::from_str("");
+        guard let option::Option::Some(ta) = text_area::find("chat:composer") else { return; };
+        let cur: text::Text = text::from_str(ta.text());
+        let next: text::Text = file_tree::append_prompt_ref(cur.view(), rel.view(), is_dir);
+        this.composer_has_text = true;
+        let was_focused: bool = ta.is_focused();
+        let _ta: text_area::TextArea = ta
+            .set_text(next.view())
+            .set_cursor_position(next.count() as i64);
+        if !was_focused {
+            let _f: text_area::TextArea = ta.focus();
+        }
+        this._resize_composer();
+    }
+
+    // Defer by one main-loop turn so AppKit's `textDidEndEditing:` from the
+    // click losing first responder finishes before we write `set_text`.
+    fn _insert_composer_ref(ref this, rel_path: str, is_dir: bool) {
+        this.pending_ref_path = text::from_str(rel_path);
+        this.pending_ref_is_dir = is_dir;
+        services::run_on_main(this._apply_pending_ref);
+    }
+
+    fn on_file_row_tapped(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else {
+            return false;
+        };
+        guard let option::Option::Some(ep) = this.file_entries.at_ptr(idx) else { return false; };
+        let rel: text::Text = (*ep).rel_path.clone();
+        let is_dir: bool = (*ep).is_dir;
+        if is_dir {
+            this._toggle_dir_expanded(rel.view());
+            this._sync_file_tree(force: true);
+        } else {
+            this._insert_composer_ref(rel.view(), false);
+        }
+        return true;
+    }
+
+    fn on_file_ref_clicked(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else {
+            return false;
+        };
+        guard let option::Option::Some(ep) = this.file_entries.at_ptr(idx) else { return false; };
+        let rel: text::Text = (*ep).rel_path.clone();
+        let is_dir: bool = (*ep).is_dir;
+        this._insert_composer_ref(rel.view(), is_dir);
+        return true;
+    }
+
+    fn on_files_refresh(ref this, _sender: *u8) -> bool {
+        this._sync_file_tree(force: true);
+        return true;
+    }
+
+    // ---- live tree synchronization ------------------------------------------
+
+    fn _sync_pickers(ref this) {
+        this.model_values = pickers::fill_config("chat:model", "model");
+        this.effort_values = pickers::fill_config("chat:effort", "reasoning_effort");
+        pickers::fill_mode("chat:mode");
+        this._sync_file_tree(force: false);
+    }
+
+    fn _sync_tabs(ref this) {
+        let tabs: [InspectorTab; 5] = [
+            InspectorTab::Run,
+            InspectorTab::Files,
+            InspectorTab::Browser,
+            InspectorTab::Terminal,
+            InspectorTab::Preview,
+        ];
+        for i in 0..5usize {
+            let t: InspectorTab = tabs[i];
+            let on: bool = t == this.tab;
+            let slug: str = t.slug();
+            let k: text::Text = "conv:tab:${slug}";
+            let lk: text::Text = "conv:tab:${slug}:label";
+            if let option::Option::Some(n) = mount::find(k.view()) {
+                core::set_background_color(n, if on { style::chip() } else { vocab::Color::clear() });
+            }
+            style::set_label_color(lk.view(), if on { style::ink() } else { style::muted() });
+            let pk: text::Text = "conv:pane:${slug}";
+            style::show(pk.view(), on);
+        }
+    }
+
+    fn _sync_side_texts(ref this, term_changed: bool = true, prev_changed: bool = true) {
+        let has_term: bool = !this.terminal_text.is_empty();
+        if term_changed {
+            var next_t: vec::Vec[text::Text] = _chunk_mono_lines(this.terminal_text.view(), 16 as usize, 800 as usize);
+            this.term_epoch = this.term_epoch +% (1 as u64);
+            let tv: *vec::Vec[TextChunk] = this.term_chunks.as_vec_ptr();
+            (*tv).remove_all();
+            for c in next_t.drain() {
+                let _ = (*tv).append(TextChunk { body: c, cached_w: 0.0f64, cached_h: 0.0f64 });
+            }
+            this.term_chunks.note_reload();
+        }
+        style::show("terminal:list", has_term);
+        style::show("terminal:empty", !has_term);
+        let has_prev: bool = !this.preview_text.is_empty();
+        if prev_changed {
+            var next_p: vec::Vec[text::Text] = _chunk_mono_lines(this.preview_text.view(), 16 as usize, 800 as usize);
+            this.preview_epoch = this.preview_epoch +% (1 as u64);
+            let pv: *vec::Vec[TextChunk] = this.preview_chunks.as_vec_ptr();
+            (*pv).remove_all();
+            for c in next_p.drain() {
+                let _ = (*pv).append(TextChunk { body: c, cached_w: 0.0f64, cached_h: 0.0f64 });
+            }
+            this.preview_chunks.note_reload();
+        }
+        style::show("preview:list", has_prev);
+        style::show("preview:empty", !has_prev);
+        let g_act: text::Text = engine::git_action_status();
+        style::set_label("preview:git_status", g_act.view());
+        style::show("preview:git_status", !g_act.is_empty());
+        let cwd: text::Text = engine::active_cwd();
+        let has_repo_cwd: bool = !cwd.is_empty() && !cwd.contains(".desk420/");
+        style::show("preview:git_toolbar", has_repo_cwd);
+        style::show("preview:commit_bar", has_repo_cwd);
+    }
+
+    fn term_chunk_height(ref this, index: usize, width: f64) -> f64 {
+        guard let option::Option::Some(cp) = this.term_chunks.at_ptr(index) else { return 20.0f64; };
+        let cw: f64 = if width > 64.0f64 { width - 40.0f64 } else { 260.0f64 };
+        let dw: f64 = cw - (*cp).cached_w;
+        if (*cp).cached_h > 0.0f64 && dw < 16.0f64 && dw > -16.0f64 {
+            return (*cp).cached_h;
+        }
+        let h: f64 = text_metrics::measure_height(
+            (*cp).body.view(), cw,
+            font_family: ftheme::MONOSPACE,
+            font_size: 12.5f64, font_scales: false, line_height: 18.0f64,
+        );
+        let top: f64 = if index == (0 as usize) { 14.0f64 } else { 0.0f64 };
+        let bot: f64 = if index +% (1 as usize) >= this.term_chunks.count() { 14.0f64 } else { 0.0f64 };
+        let measured: f64 = h + 6.0f64 + top + bot;
+        (*cp).cached_w = cw;
+        (*cp).cached_h = measured;
+        return measured;
+    }
+
+    fn build_term_chunk(ref this, index: usize) -> core::Node {
+        let g: u64 = this.term_epoch;
+        let outer_key: text::Text = "terminal:row:${g}:${index}";
+        guard let option::Option::Some(cp) = this.term_chunks.at_ptr(index) else {
+            return @ui { column(key: outer_key.view()) {} };
+        };
+        let txt: text::Text = (*cp).body.clone();
+        let lbl_key: text::Text = "terminal:chunk:${index}";
+        let top: f64 = if index == (0 as usize) { 14.0f64 } else { 0.0f64 };
+        let bot: f64 = if index +% (1 as usize) >= this.term_chunks.count() { 14.0f64 } else { 0.0f64 };
+        return @ui {
+            column(key: outer_key.view()) {
+                label(txt.view(), key: lbl_key.view(),
+                font_family: ftheme::MONOSPACE,
+                font_size: 12.5f64,
+                font_scales: false,
+                line_height: 18.0f64,
+                text_color: style::ink(),
+                line_break: vocab::LineBreak::WordWrap,
+                vertical_align: vocab::TextAlign::Start,
+                selectable: true)
+                    .width_percent(100.0f64)
+                    .height_percent(100.0f64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .width_percent(100.0f64)
+                .height_percent(100.0f64)
+                .padding_edge(flex::Edge::Horizontal, 18.0f64)
+                .padding_edge(flex::Edge::Top, top)
+                .padding_edge(flex::Edge::Bottom, bot)
+        };
+    }
+
+    fn preview_chunk_height(ref this, index: usize, width: f64) -> f64 {
+        guard let option::Option::Some(cp) = this.preview_chunks.at_ptr(index) else { return 20.0f64; };
+        let cw: f64 = if width > 64.0f64 { width - 36.0f64 } else { 260.0f64 };
+        let dw: f64 = cw - (*cp).cached_w;
+        if (*cp).cached_h > 0.0f64 && dw < 16.0f64 && dw > -16.0f64 {
+            return (*cp).cached_h;
+        }
+        let h: f64 = text_metrics::measure_height(
+            (*cp).body.view(), cw,
+            font_family: ftheme::MONOSPACE,
+            font_size: 12.0f64, font_scales: false, line_height: 17.5f64,
+        );
+        let top: f64 = if index == (0 as usize) { 12.0f64 } else { 0.0f64 };
+        let bot: f64 = if index +% (1 as usize) >= this.preview_chunks.count() { 12.0f64 } else { 0.0f64 };
+        let measured: f64 = h + 6.0f64 + top + bot;
+        (*cp).cached_w = cw;
+        (*cp).cached_h = measured;
+        return measured;
+    }
+
+    fn build_preview_chunk(ref this, index: usize) -> core::Node {
+        let g: u64 = this.preview_epoch;
+        let outer_key: text::Text = "preview:row:${g}:${index}";
+        guard let option::Option::Some(cp) = this.preview_chunks.at_ptr(index) else {
+            return @ui { column(key: outer_key.view()) {} };
+        };
+        let txt: text::Text = (*cp).body.clone();
+        let spans: vocab::Spans = _build_diff_spans(txt.view());
+        let lbl_key: text::Text = "preview:chunk:${index}";
+        let top: f64 = if index == (0 as usize) { 12.0f64 } else { 0.0f64 };
+        let bot: f64 = if index +% (1 as usize) >= this.preview_chunks.count() { 12.0f64 } else { 0.0f64 };
+        return @ui {
+            column(key: outer_key.view()) {
+                label(txt.view(), key: lbl_key.view(),
+                font_family: ftheme::MONOSPACE,
+                font_size: 12.0f64,
+                font_scales: false,
+                line_height: 17.5f64,
+                text_color: style::ink(),
+                line_break: vocab::LineBreak::WordWrap,
+                vertical_align: vocab::TextAlign::Start,
+                selectable: true,
+                formatted_text: spans)
+                    .width_percent(100.0f64)
+                    .height_percent(100.0f64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .width_percent(100.0f64)
+                .height_percent(100.0f64)
+                .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                .padding_edge(flex::Edge::Top, top)
+                .padding_edge(flex::Edge::Bottom, bot)
+        };
+    }
+
+    fn _sync_action_button(ref this, running: bool) {
+        if running == this.action_is_stop { return; }
+        this.action_is_stop = running;
+        if running {
+            style::set_circle_icon("chat:send", icons::stop,
+            title: "Stop response",
+            icon_size: 17.0f64, fill_glyph: 1.0f64,
+            color: style::danger(),
+            bg: style::chip());
+        } else {
+            style::set_circle_icon("chat:send", icons::arrow_upward,
+            title: "Send message",
+            icon_size: 18.0f64, fill_glyph: 0.0f64,
+            color: style::on_lime(),
+            bg: style::lime());
+        }
+    }
+
+    fn _sync_status_with(ref this, sid: str, load_loading: bool, load_failed: bool) {
+        let running: bool = engine::is_active_turn_running();
+        this._sync_action_button(running);
+
+        let has_rows: bool = this.rows.count() > (0 as usize);
+        this.plan.sync_for_session(sid);
+        let status_txt: str = if load_loading && has_rows {
+            "Loading history…"
+        } else if load_failed && has_rows {
+            "Load error"
+        } else if running {
+            "Working…"
+        } else {
+            ""
+        };
+        style::set_label("conv:status", status_txt);
+        style::show("conv:status", status_txt != "");
+
+        let q_sum: text::Text = engine::queued_summary();
+        let has_q: bool = !q_sum.is_empty();
+        if has_q {
+            style::set_label("chat:queue_bar", q_sum.view());
+        }
+        style::show("chat:queue_bar", has_q);
+
+        // Put any rewound prompt text back in the composer ("edit & resend").
+        let rewound: text::Text = engine::rewound_prompt();
+        if !rewound.is_empty() {
+            engine::clear_rewound_prompt();
+            if let option::Option::Some(ta) = text_area::find("chat:composer") {
+                let _ta: text_area::TextArea = ta.set_text(rewound.view());
+            }
+        }
+    }
+
+    fn _sync_status(ref this) {
+        let sid: text::Text = engine::active_session_id();
+        var load_loading: bool = false;
+        var load_failed: bool = false;
+        if !sid.is_empty() {
+            load_loading = conversation::is_loading(sid.view());
+            load_failed = conversation::is_load_failed(sid.view());
+        }
+        this._sync_status_with(sid.view(), load_loading, load_failed);
+    }
+
+    fn _sync_transcript(ref this) {
+        let sid: text::Text = engine::active_session_id();
+        let same_session: bool = sid.equals(this.rendered_sid.view());
+        let no_scroll: bool = this.suppress_auto_scroll;
+        this.suppress_auto_scroll = false;
+
+        if !same_session {
+            this.visible_blocks = INITIAL_TAIL_BLOCKS;
+        }
+
+        // Ask whether the reader is at the bottom BEFORE mutating either list.
+        var follow: bool = !same_session && !no_scroll;
+        if same_session && !no_scroll {
+            if let option::Option::Some(rl) = m_relist::find("chat:transcript") {
+                follow = rl.is_at_end(slack: 36.0f64);
+            }
+        }
+        var follow_steps: bool = !same_session;
+        if same_session {
+            if let option::Option::Some(srl) = m_relist::find("run:timeline") {
+                follow_steps = srl.is_at_end(slack: 36.0f64);
+            }
+        }
+
+        var next_rows: vec::Vec[DisplayRow] = vec::new::[DisplayRow]();
+        var next_steps: vec::Vec[Step] = vec::new::[Step]();
+        var term: text::Text = text::new();
+        var prev: text::Text = text::new();
+        var next_title: text::Text = text::new();
+        this._project(next_rows, next_steps, term, prev, next_title);
+        if !next_title.is_empty() {
+            style::set_label("conv:title", next_title.view());
+        }
+
+        if !same_session || no_scroll {
+            this.epoch = this.epoch +% (1 as u64);
+            this.rendered_sid = sid.clone();
+            let rv: *vec::Vec[DisplayRow] = this.rows.as_vec_ptr();
+            (*rv).remove_all();
+            for r in next_rows.drain() {
+                let _ = (*rv).append(r);
+            }
+            this.rows.note_reload();
+        } else {
+            // Incremental diff: leave settled rows untouched so relist keeps their cached heights.
+            let old_n: usize = this.rows.count();
+            let new_n: usize = next_rows.count();
+            var first_diff: usize = 0 as usize;
+            let min_n: usize = old_n.min(new_n);
+            while first_diff < min_n {
+                var eq: bool = false;
+                if let option::Option::Some(ap) = this.rows.at_ptr(first_diff) {
+                    if let option::Option::Some(bp) = next_rows.at_ptr(first_diff) {
+                        eq = _same_row(ap, bp);
+                    }
+                }
+                if !eq { break; }
+                first_diff = first_diff +% (1 as usize);
+            }
+            if new_n == (0 as usize) && old_n > (0 as usize) {
+                this.rows.remove_all();
+            } else if first_diff < new_n || old_n > new_n {
+                // Trim stale trailing rows first if shrinking.
+                while this.rows.count() > new_n {
+                    let _ = this.rows.remove(this.rows.count() -% (1 as usize));
+                }
+                // Apply updates from first_diff onward in O(N) via drain().
+                var k: usize = 0 as usize;
+                for item in next_rows.drain() {
+                    if k >= first_diff {
+                        if k < this.rows.count() {
+                            let _ = this.rows.set(item, k);
+                        } else {
+                            let _ = this.rows.append(item);
+                        }
+                    }
+                    k = k +% (1 as usize);
+                }
+            }
+        }
+
+        // Sync Run timeline steps via O(N) bulk reload.
+        let sv: *vec::Vec[Step] = this.steps.as_vec_ptr();
+        (*sv).remove_all();
+        for st in next_steps.drain() {
+            let _ = (*sv).append(st);
+        }
+        this.steps.note_reload();
+
+        // Sync center loading / error / empty / transcript visibility.
+        var is_loading: bool = false;
+        var is_failed: bool = false;
+        var err_msg: text::Text = text::from_str("");
+        if !sid.is_empty() {
+            is_loading = conversation::is_loading(sid.view());
+            is_failed = conversation::is_load_failed(sid.view());
+            err_msg = conversation::load_error_message(sid.view());
+        }
+        let has_rows: bool = this.rows.count() > (0 as usize);
+        let show_loading: bool = !has_rows && is_loading;
+        let show_error: bool = !has_rows && is_failed;
+        let show_empty: bool = !has_rows && !is_loading && !is_failed && !sid.is_empty();
+        style::show("chat:transcript", has_rows);
+        style::show("chat:loading_box", show_loading);
+        if let option::Option::Some(spn) = m_spinner::find("chat:spinner") {
+            let _spn: m_spinner::Spinner = spn.set_running(show_loading);
+        }
+        if show_error {
+            style::set_label("chat:error_msg", if err_msg.is_empty() { "Could not load this conversation." } else { err_msg.view() });
+        }
+        style::show("chat:error_box", show_error);
+        style::show("chat:empty_box", show_empty);
+
+        if follow && has_rows {
+            if let option::Option::Some(rl) = m_relist::find("chat:transcript") {
+                let _rl: m_relist::Relist = rl.scroll_to_end();
+            }
+        }
+        let has_steps: bool = this.steps.count() > (0 as usize);
+        style::show("run:empty", !has_steps);
+        style::show("run:timeline", has_steps);
+        if follow_steps && has_steps {
+            if let option::Option::Some(srl) = m_relist::find("run:timeline") {
+                let _srl: m_relist::Relist = srl.scroll_to_end();
+            }
+        }
+        let term_changed: bool = !term.equals(this.terminal_text.view());
+        let prev_changed: bool = !prev.equals(this.preview_text.view());
+        this.terminal_text = term;
+        this.preview_text = prev;
+        this._sync_side_texts(term_changed, prev_changed);
+        this._sync_status_with(sid.view(), is_loading, is_failed);
+    }
+
+    // ---- handlers -------------------------------------------------------------
+
+    fn on_store_changed(ref this, change: conversation::StoreChange) {
+        let sid: text::Text = engine::active_session_id();
+        if sid.is_empty() { return; }
+        if let option::Option::Some(active_idx) = conversation::session_index(sid.view()) {
+            if change.session_index != active_idx {
+                return;
+            }
+        }
+        this._sync_transcript();
+    }
+
+    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
+        let sid: text::Text = engine::active_session_id();
+        if !sid.equals(this.rendered_sid.view()) {
+            this._sync_transcript();
+        } else {
+            this._sync_status();
+        }
+        this._sync_pickers();
+    }
+
+    fn on_load_earlier(ref this, _sender: *u8) {
+        this.visible_blocks = this.visible_blocks +% LOAD_MORE_STEP;
+        this.suppress_auto_scroll = true;
+        this._sync_transcript();
+    }
+
+    fn on_retry_load(ref this, _sender: *u8) {
+        let sid: text::Text = engine::active_session_id();
+        if sid.is_empty() { return; }
+        let cwd: text::Text = engine::active_cwd();
+        engine::reload_session(sid.view(), cwd.view());
+    }
+
+    fn on_approve_click(ref this, sender: *u8) {
+        let key: text::Text = component::key_of(sender);
+        let v: str = key.view();
+        let prefix: str = "approve:";
+        if !v.has_prefix(prefix) { return; }
+        guard let option::Option::Some(rest) = v.slice(from: prefix.count(), to: v.count()) else { return; };
+        guard let option::Option::Some(sep) = rest.find(":") else { return; };
+        guard let option::Option::Some(tcid) = rest.slice(from: 0 as usize, to: sep) else { return; };
+        guard let option::Option::Some(opt_id) = rest.slice(from: sep +% (1 as usize), to: rest.count()) else { return; };
+
+        let sid: text::Text = engine::active_session_id();
+        if sid.is_empty() { return; }
+        if let option::Option::Some(idx) = component::item_index_of(sender) {
+            if let option::Option::Some(rp) = this.rows.at_ptr(idx) {
+                if (*rp).item_id.equals(tcid) {
+                    engine::respond_permission(sid.view(), (*rp).rpc_id.clone(), tcid, opt_id);
+                    if opt_id.contains("reject") {
+                        if let option::Option::Some(ta) = text_area::find("chat:composer") {
+                            let _ta: text_area::TextArea = ta.set_placeholder("Tell Grok what to do differently…");
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn on_model_changed(ref this, _sender: *u8) {
+        let v: text::Text = pickers::picked("chat:model", this.model_values);
+        if v.is_empty() { return; }
+        let sid: text::Text = engine::active_session_id();
+        if !sid.is_empty() {
+            conversation::set_config_value_optimistic(sid.view(), "model", v.view());
+        }
+        engine::set_config_option("model", v.view());
+        this.model_values = pickers::fill_config("chat:model", "model");
+    }
+
+    fn on_effort_changed(ref this, _sender: *u8) {
+        let v: text::Text = pickers::picked("chat:effort", this.effort_values);
+        if v.is_empty() { return; }
+        let sid: text::Text = engine::active_session_id();
+        if !sid.is_empty() {
+            conversation::set_config_value_optimistic(sid.view(), "reasoning_effort", v.view());
+        }
+        engine::set_config_option("reasoning_effort", v.view());
+        this.effort_values = pickers::fill_config("chat:effort", "reasoning_effort");
+    }
+
+    fn on_mode_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(ap) = m_popup::find("chat:mode") else { return; };
+        engine::set_approval_mode(engine::ApprovalMode::from_index(ap.selected_index()));
+    }
+
+    fn _reset_copied_code(ref this) {
+        if this.copied_code_key.is_empty() { return; }
+        style::set_circle_icon(this.copied_code_key.view(), icons::content_copy,
+        title: "Copy code",
+        icon_size: 14.5f64,
+        color: style::muted());
+        this.copied_code_key = text::from_str("");
+    }
+
+    fn on_copy_code(ref this, sender: *u8) -> bool {
+        let key: text::Text = component::key_of(sender);
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else {
+            return true;
+        };
+        guard let option::Option::Some(rp) = this.rows.at_ptr(idx) else { return true; };
+        let _ok: bool = runtime::copy_text((*rp).body.view());
+        this.copied_timer.cancel();
+        if !this.copied_code_key.is_empty() && !this.copied_code_key.equals(key.view()) {
+            this._reset_copied_code();
+        }
+        this.copied_code_key = key.clone();
+        style::set_circle_icon(key.view(), icons::check,
+        title: "Copied!",
+        icon_size: 14.5f64,
+        color: style::lime_text());
+        this.copied_timer = services::after(1.4f64, this._reset_copied_code);
+        return true;
+    }
+
+    fn on_tab(ref this, sender: *u8) -> bool {
+        let key: text::Text = component::key_of(sender);
+        let v: str = key.view();
+        if v == "conv:tab:run" { this.tab = InspectorTab::Run; }
+        if v == "conv:tab:files" {
+            this.tab = InspectorTab::Files;
+            this._sync_file_tree(force: true);
+        }
+        if v == "conv:tab:browser" {
+            this.tab = InspectorTab::Browser;
+            this.browser.sync();
+        }
+        if v == "conv:tab:terminal" { this.tab = InspectorTab::Terminal; }
+        if v == "conv:tab:preview" {
+            this.tab = InspectorTab::Preview;
+            engine::refresh_git_status();
+        }
+        this._sync_tabs();
+        return true;
+    }
+
+    // Grow the composer's flex box between COMPOSER_MIN_H and COMPOSER_MAX_H.
+    // `text_area(auto_size: TextChanges)` only resizes the inner NSTextView
+    // document inside its scroll view, not the outer scroll view's flex height.
+    fn _resize_composer(ref this) {
+        guard let option::Option::Some(ta) = text_area::find("chat:composer") else { return; };
+        let raw: text::Text = text::from_str(ta.text());
+        var target: f64 = COMPOSER_MIN_H;
+        if !raw.is_empty() {
+            let f: core::Frame = ta.frame();
+            let w: f64 = if f.width > 120.0f64 { f.width - 12.0f64 } else { 520.0f64 };
+            let h: f64 = text_metrics::measure_height(raw.view(), w, font_size: 15.5f64, font_scales: false) + 18.0f64;
+            target = h.clamp(COMPOSER_MIN_H, COMPOSER_MAX_H);
+        }
+        if target != this.composer_h {
+            this.composer_h = target;
+            if let option::Option::Some(n) = mount::find("chat:composer") {
+                core::set_height(n, target);
+                core::relayout(n);
+            }
+            if let option::Option::Some(st) = mount::find("conv:stage") {
+                core::relayout(st);
+            }
+        }
+    }
+
+    fn _sync_composer(ref this) {
+        var cur: text::Text = text::from_str("");
+        if let option::Option::Some(ta) = text_area::find("chat:composer") {
+            cur = text::from_str(ta.text());
+            let has_txt: bool = !cur.is_empty();
+            // Workaround: facet_appkit's `did_change_imp` refreshes the editor
+            // placeholder on programmatic `set_text`, not on interactive typing.
+            if has_txt != this.composer_has_text {
+                this.composer_has_text = has_txt;
+                let ph: str = if has_txt { "" } else { style::COMPOSER_PLACEHOLDER };
+                let _ta: text_area::TextArea = ta.set_placeholder(ph);
+            }
+        }
+        let cwd: text::Text = engine::active_cwd();
+        this.popup.update(cur.view(), cwd.view());
+        this._resize_composer();
+    }
+
+    fn on_composer_changed(ref this, _sender: *u8) {
+        this._sync_composer();
+    }
+
+    fn on_show_browser_tab(ref this, _name: str) {
+        this.tab = InspectorTab::Browser;
+        this._sync_tabs();
+    }
+
+    fn on_slash_event(ref this, _name: str) {
+        guard let option::Option::Some(ta) = text_area::find("chat:composer") else { return; };
+        let cur: str = ta.text();
+        let needs_space: bool = !cur.is_empty() && !cur.has_suffix(" ") && !cur.has_suffix("\n") && !cur.has_suffix("/");
+        let next: text::Text = if cur.has_suffix("/") {
+            text::from_str(cur)
+        } else if needs_space {
+            "${cur} /"
+        } else {
+            "${cur}/"
+        };
+        let end_pos: i64 = next.count() as i64;
+        let _t: text_area::TextArea = ta.set_text(next.view()).set_cursor_position(end_pos);
+        if !ta.is_focused() {
+            let _f: text_area::TextArea = ta.focus();
+        }
+        this._sync_composer();
+    }
+
+    fn on_popup_pick(ref this, sender: *u8) -> bool {
+        return this.popup.pick_from_sender(sender);
+    }
+
+    fn _submit_composer(ref this) {
+        guard let option::Option::Some(ta) = text_area::find("chat:composer") else { return; };
+        let raw: text::Text = text::from_str(ta.text());
+        let trimmed: str = raw.view().trim();
+        let has_files: bool = this.files.count() > (0 as usize);
+        if trimmed.is_empty() && !has_files { return; }
+        this.composer_has_text = false;
+        let _ta: text_area::TextArea = ta.set_text("").set_placeholder(style::COMPOSER_PLACEHOLDER);
+        this._resize_composer();
+        this.popup.hide();
+        if has_files {
+            let prompt_txt: str = if trimmed.is_empty() { "Please inspect the attached files." } else { trimmed };
+            engine::send_prompt_with_attachments(prompt_txt, this.files.take_all());
+        } else {
+            engine::send_prompt(trimmed);
+        }
+    }
+
+    fn on_attach_file(ref this, _sender: *u8) -> bool { this.files.choose(); return true; }
+    fn on_remove_attachment(ref this, sender: *u8) -> bool { this.files.remove_from_sender(sender); return true; }
+    fn on_drag_over(ref this, sender: *u8) -> bool { return this.files.handle_drag_over(sender); }
+    fn on_drag_leave(ref this, sender: *u8) -> bool { return this.files.handle_drag_leave(sender); }
+    fn on_drop(ref this, sender: *u8) -> bool { return this.files.handle_drop(sender); }
+    fn on_send(ref this, _sender: *u8) -> bool {
+        if engine::is_active_turn_running() {
+            engine::cancel_turn();
+        } else {
+            this._submit_composer();
+        }
+        return true;
+    }
+
+    fn _open_row_url(ref this, sender: *u8) {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return; };
+        guard let option::Option::Some(rp) = this.rows.at_ptr(idx) else { return; };
+        let u: text::Text = (*rp).url.clone();
+        if !u.is_empty() {
+            browser_pane::open_in_browser(u.view());
+        }
+    }
+
+    fn on_open_url_click(ref this, sender: *u8) {
+        this._open_row_url(sender);
+    }
+
+    fn on_open_url_click_gesture(ref this, sender: *u8) -> bool {
+        this._open_row_url(sender);
+        return true;
+    }
+
+    fn on_rewind_pick(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return true; };
+        guard let option::Option::Some(rp) = this.rows.at_ptr(idx) else { return true; };
+        let ord: i64 = (*rp).user_ordinal as i64;
+        if this.rewind_pick_prompt == ord {
+            this.rewind_pick_prompt = -1 as i64;
+        } else {
+            this.rewind_pick_prompt = ord;
+        }
+        this._sync_transcript();
+        return true;
+    }
+
+    fn on_rewind_cancel(ref this, _sender: *u8) {
+        this.rewind_pick_prompt = -1 as i64;
+        this._sync_transcript();
+    }
+
+    fn on_git_refresh(ref this, _sender: *u8) -> bool {
+        engine::refresh_git_status();
+        return true;
+    }
+
+    fn on_git_stage(ref this, _sender: *u8) {
+        engine::git_stage_all();
+    }
+
+    fn on_git_discard(ref this, _sender: *u8) {
+        engine::git_discard_all();
+    }
+
+    fn on_git_commit(ref this, _sender: *u8) {
+        guard let option::Option::Some(tf) = text_field::find("preview:commit_msg") else { return; };
+        let raw: text::Text = text::from_str(tf.text());
+        let trimmed: str = raw.view().trim();
+        if trimmed.is_empty() { return; }
+        let _tf: text_field::TextField = tf.set_text("");
+        engine::git_commit(trimmed);
+    }
+
+    fn on_rewind_exec(ref this, sender: *u8) {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return; };
+        guard let option::Option::Some(rp) = this.rows.at_ptr(idx) else { return; };
+        let ord: i64 = (*rp).user_ordinal as i64;
+        let key: text::Text = component::key_of(sender);
+        let kv: str = key.view();
+        let mode: engine::RewindMode = if kv.has_prefix("chat:rw_all:") {
+            engine::RewindMode::All
+        } else if kv.has_prefix("chat:rw_conv:") {
+            engine::RewindMode::Conversation
+        } else if kv.has_prefix("chat:rw_files:") {
+            engine::RewindMode::Files
+        } else {
+            return;
+        };
+        this.rewind_pick_prompt = -1 as i64;
+        this._sync_transcript();
+        engine::rewind_to(ord, mode);
+    }
+
+    fn on_composer_key(ref this, event: *u8) -> bool {
+        if this.popup.handle_key(event) { return true; }
+        if gestures::key_named(event) == gestures::key_return() {
+            let mods: u64 = gestures::key_modifiers(event);
+            let want_cmd: bool = prefs::send_key() == prefs::SendKeyPref::CmdReturn;
+            let submit: bool = if want_cmd {
+                gestures::has_modifier(mods, gestures::mod_command()) || gestures::has_modifier(mods, gestures::mod_control())
+            } else {
+                !gestures::has_modifier(mods, gestures::mod_shift())
+            };
+            if submit {
+                this._submit_composer();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- node helpers ---------------------------------------------------------
+
+    // Custom pill-style tab buttons rather than `facet/tabs` (which renders an
+    // NSSegmentedControl on macOS) so the 5-tab inspector stays compact and flat.
+    fn _tab(ref this, title: str, name: str) -> core::Node {
+        let k: text::Text = "conv:tab:${name}";
+        let lk: text::Text = "conv:tab:${name}:label";
+        return @ui {
+            column(key: k.view()) {
+                label(title, key: lk.view(),
+                font_size: 13.5f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::muted())
+                    .set_input_transparent(true)
+            }
+            .height(30.0f64)
+                .shrink(0.0f64)
+                .justify(flex::Justify::Center)
+                .align(flex::Align::Center)
+                .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                .set_corner_radius(vocab::Corners::all(8.0f64))
+                .gesture(on_click: this.on_tab)
+        };
+    }
+
+    fn _empty_note(this, key: str, line: str) -> core::Node {
+        return @ui {
+            column(key: key) {
+                label(line, font_size: 14.0f64, text_color: style::muted(),
+                text_align: vocab::TextAlign::Center,
+                line_break: vocab::LineBreak::WordWrap)
+            }
+            .grow(1.0f64)
+                .align(flex::Align::Center)
+                .justify(flex::Justify::Center)
+                .padding(24.0f64)
+        };
+    }
+
+    fn _composer(ref this) -> core::Node {
+        let body: core::Node = @ui {
+            column {
+                this.files.build_drop_hint()
+                this.files.build_strip(on_remove: this.on_remove_attachment)
+                text_area("", key: "chat:composer",
+                font_size: 15.5f64,
+                font_scales: false,
+                placeholder: style::COMPOSER_PLACEHOLDER,
+                placeholder_color: style::faint(),
+                text_color: style::ink(),
+                bordered: false,
+                on_text_changed: this.on_composer_changed)
+                    .height(44.0f64)
+                    .gesture(on_key: this.on_composer_key,
+                    allow_file_drop: true,
+                    on_drag_over: this.on_drag_over,
+                    on_drag_leave: this.on_drag_leave,
+                    on_drop: this.on_drop)
+                hstack {
+                    style::circle_icon(icons::add, "chat:attach",
+                    title: "Attach file or image",
+                    size: 30.0f64, icon_size: 18.0f64,
+                    color: style::muted(),
+                    on_click: this.on_attach_file)
+                    style::picker_chip("chat:model", "", on_changed: this.on_model_changed)
+                    style::picker_chip("chat:effort", "", on_changed: this.on_effort_changed)
+                    style::picker_chip("chat:mode", "", on_changed: this.on_mode_changed)
+                    spacer().grow(1.0f64)
+                    style::circle_icon(icons::arrow_upward, "chat:send",
+                    title: "Send message",
+                    size: 34.0f64, icon_size: 18.0f64,
+                    color: style::on_lime(),
+                    bg: style::lime(),
+                    on_click: this.on_send)
+                }
+                .align(flex::Align::Center)
+                    .gap(8.0f64)
+            }
+            .gap(10.0f64)
+                .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                .padding_edge(flex::Edge::Top, 14.0f64)
+                .padding_edge(flex::Edge::Bottom, 12.0f64)
+        };
+        var card: core::Node = style::card_box("chat:composer_card", body, radius: 16.0f64,
+            fill: style::floating_card())
+            .gesture(allow_file_drop: true,
+            on_drag_over: this.on_drag_over,
+            on_drag_leave: this.on_drag_leave,
+            on_drop: this.on_drop);
+        card.set_shadow(vocab::Shadow {
+            color: vocab::Color::rgba(0.0f64, 0.0f64, 0.0f64, 1.0f64),
+            offset: vocab::Point::of(0.0f64, 6.0f64),
+            radius: 18.0f64,
+            opacity: 0.34f64,
+        });
+        return card;
+    }
+}
+
+// ───────────────────────────── Component / Lifecycle ─────────────────────────────
+
+impl ChatScreen: component::Component {
+    fn build(ref this) -> core::Node {
+        return @ui {
+            split(key: "conv:split",
+            position: 678.0f64,
+            min_leading: panels::CENTRE_MIN,
+            min_trailing: panels::PANEL_MIN,
+            divider_color: style::hairline(),
+            divider_thickness: 1.0f64,
+            role_leading: m_split::PaneRole::Content,
+            role_trailing: m_split::PaneRole::Content) {
+                // ── Centre: full-height transcript + floating composer ──
+                zstack(key: "conv:stage") {
+                    column(key: "conv:center") {
+                        column(key: "chat:loading_box") {
+                            spinner(style::lime(), key: "chat:spinner", running: false)
+                            label("Loading conversation…",
+                            font_size: 14.5f64,
+                            text_color: style::muted())
+                        }
+                        .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .justify(flex::Justify::Center)
+                            .align(flex::Align::Center)
+                            .gap(12.0f64)
+                            .padding_edge(flex::Edge::Bottom, 130.0f64)
+
+                        column(key: "chat:error_box") {
+                            style::card_box("", @ui {
+                                column {
+                                    label("Couldn't load conversation",
+                                    font_size: 16.0f64,
+                                    font_weight: vocab::FontWeight::Semibold,
+                                    text_color: style::ink())
+                                    label("", key: "chat:error_msg",
+                                    font_size: 13.5f64,
+                                    text_color: style::muted(),
+                                    line_break: vocab::LineBreak::WordWrap)
+                                    hstack {
+                                        style::outline_button("Retry", "chat:retry_load", on_click: this.on_retry_load)
+                                    }
+                                    .padding_edge(flex::Edge::Top, 4.0f64)
+                                }
+                                .gap(10.0f64)
+                                    .padding(20.0f64)
+                            }, radius: 14.0f64)
+                                .max_width(420.0f64)
+                        }
+                        .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .justify(flex::Justify::Center)
+                            .align(flex::Align::Center)
+                            .padding_edge(flex::Edge::Bottom, 130.0f64)
+
+                        column(key: "chat:empty_box") {
+                            label("No messages in this run yet",
+                            font_size: 15.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::muted())
+                            label("Send a message below to continue.",
+                            font_size: 13.5f64,
+                            text_color: style::faint())
+                        }
+                        .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .justify(flex::Justify::Center)
+                            .align(flex::Align::Center)
+                            .gap(6.0f64)
+                            .padding_edge(flex::Edge::Bottom, 130.0f64)
+
+                        relist(this.rows,
+                        key: "chat:transcript",
+                        builder: this.build_row,
+                        uneven_rows: true,
+                        row_height_at: this.row_height_at)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .position_edge(flex::Edge::All, 0.0f64)
+
+                    hstack {
+                        column(key: "chat:composer_dock") {
+                            label("", key: "chat:queue_bar",
+                            font_size: 13.0f64,
+                            italic: true,
+                            text_color: style::muted())
+
+                            this.plan.build()
+
+                            this.popup.build(on_pick: this.on_popup_pick)
+
+                            this._composer()
+                        }
+                        .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .max_width(560.0f64)
+                            .gap(8.0f64)
+                            .set_z_index(10 as i32)
+                    }
+                    .justify(flex::Justify::Center)
+                        .position_edge(flex::Edge::Left, 56.0f64)
+                        .position_edge(flex::Edge::Right, 56.0f64)
+                        .position_edge(flex::Edge::Bottom, 20.0f64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .set_background_color(style::content())
+
+                // ── Right: Run / Files / Browser / Terminal / Changes ──
+                column(key: "conv:panel") {
+                    scroll(key: "conv:tabs_scroll",
+                    axis: vocab::ScrollAxis::Horizontal,
+                    horizontal_scroll_bars: vocab::ScrollBars::Never,
+                    vertical_scroll_bars: vocab::ScrollBars::Never) {
+                        hstack {
+                            this._tab("Run", "run")
+                            this._tab("Files", "files")
+                            this._tab("Browser", "browser")
+                            this._tab("Terminal", "terminal")
+                            this._tab("Changes", "preview")
+                        }
+                        .align(flex::Align::Center)
+                            .gap(4.0f64)
+                            .height(56.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                    }
+                    .height(56.0f64)
+                        .shrink(0.0f64)
+                    style::rule()
+
+                    column(key: "conv:pane:run") {
+                        this._empty_note("run:empty", "Steps appear here while Grok works.")
+                        relist(this.steps,
+                        key: "run:timeline",
+                        builder: this.build_step,
+                        uneven_rows: true,
+                        row_height_at: this.step_height_at)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+
+                    column(key: "conv:pane:files") {
+                        hstack {
+                            label("Click a file or + to reference in prompt",
+                            font_size: 12.0f64,
+                            text_color: style::faint(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                            style::circle_icon(icons::refresh, "files:refresh",
+                            title: "Refresh files",
+                            size: 24.0f64, icon_size: 15.0f64,
+                            color: style::muted(),
+                            on_click: this.on_files_refresh)
+                        }
+                        .align(flex::Align::Center)
+                            .gap(6.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                            .padding_edge(flex::Edge::Top, 10.0f64)
+                            .padding_edge(flex::Edge::Bottom, 6.0f64)
+                        this._empty_note("files:empty", "No project folder is linked to this run.")
+                        relist(this.file_entries,
+                        key: "files:tree",
+                        builder: this.build_file_row,
+                        row_height_at: this.file_row_height_at)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+
+                    column(key: "conv:pane:browser") {
+                        this.browser.build()
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+
+                    column(key: "conv:pane:terminal") {
+                        this._empty_note("terminal:empty", "Commands Grok runs, and their output, show here.")
+                        relist(this.term_chunks,
+                        key: "terminal:list",
+                        builder: this.build_term_chunk,
+                        uneven_rows: true,
+                        row_height_at: this.term_chunk_height)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+
+                    column(key: "conv:pane:preview") {
+                        hstack(key: "preview:git_toolbar") {
+                            text_button("Stage all", key: "preview:stage_all",
+                            font_size: 11.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::ink(),
+                            bordered: false,
+                            corner_radius: vocab::Corners::all(6.0f64),
+                            on_click: this.on_git_stage)
+                                .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                                .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                .set_background_color(style::chip())
+                            text_button("Discard", key: "preview:discard_all",
+                            font_size: 11.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::danger(),
+                            bordered: false,
+                            on_click: this.on_git_discard)
+                            spacer().grow(1.0f64)
+                            style::circle_icon(icons::refresh, "preview:refresh",
+                            title: "Refresh git diff",
+                            size: 24.0f64, icon_size: 15.0f64,
+                            color: style::muted(),
+                            on_click: this.on_git_refresh)
+                        }
+                        .align(flex::Align::Center)
+                            .gap(8.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                            .padding_edge(flex::Edge::Vertical, 8.0f64)
+                            .shrink(0.0f64)
+
+                        hstack(key: "preview:commit_bar") {
+                            text_field("", key: "preview:commit_msg",
+                            font_size: 12.0f64,
+                            placeholder: "Commit message…",
+                            on_submit: this.on_git_commit)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                                .height(26.0f64)
+                            text_button("Commit", key: "preview:commit_btn",
+                            font_size: 11.5f64,
+                            font_weight: vocab::FontWeight::Semibold,
+                            text_color: style::on_lime(),
+                            bordered: false,
+                            corner_radius: vocab::Corners::all(6.0f64),
+                            on_click: this.on_git_commit)
+                                .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                .set_background_color(style::lime())
+                        }
+                        .align(flex::Align::Center)
+                            .gap(8.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                            .padding_edge(flex::Edge::Bottom, 8.0f64)
+                            .shrink(0.0f64)
+
+                        label("", key: "preview:git_status",
+                        font_size: 11.5f64,
+                        text_color: style::lime_text(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64)
+                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                            .padding_edge(flex::Edge::Bottom, 6.0f64)
+                            .shrink(0.0f64)
+
+                        style::rule()
+
+                        this._empty_note("preview:empty", "File changes in this run show here.")
+                        relist(this.preview_chunks,
+                        key: "preview:list",
+                        builder: this.build_preview_chunk,
+                        uneven_rows: true,
+                        row_height_at: this.preview_chunk_height)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .set_background_color(style::panel())
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+        };
+    }
+}
+
+const EV_CHAT_SLASH: str = "desk420.chat.slash";
+
+impl ChatScreen: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+
+        this.store_sub = conversation::watch(this.on_store_changed);
+        this.status_sub = engine::watch_status(this.on_status_changed);
+        this.browser_tab_sub = events::on(browser_pane::EV_SHOW_BROWSER_TAB, this.on_show_browser_tab);
+        this.slash_sub = events::on(EV_CHAT_SLASH, this.on_slash_event);
+
+        this.panel.arm();
+        panels::sync_panel("conv:split", "conv:panel");
+        style::show("chat:queue_bar", false);
+        this.popup.hide();
+        style::show("chat:loading_box", false);
+        style::show("chat:error_box", false);
+        style::show("chat:empty_box", false);
+        this.files.sync();
+        this.browser.arm();
+        this._sync_tabs();
+        this._sync_pickers();
+        this._sync_transcript();
+    }
+
+    fn on_detach(ref this, why: component::Detach) {
+        if why == component::Detach::Unmount {
+            this.browser.disarm();
+        }
+    }
+}
+
+fn open_slash_commands() {
+    events::emit(EV_CHAT_SLASH);
+}
+
+#[test]
+fn localhost_extraction_quota_detection_and_browser_card_summaries() {
+    assert extract_localhost_url("Server ready at http://localhost:3000/app.").equals("http://localhost:3000/app");
+    assert extract_localhost_url("Visit http://127.0.0.1:5173/demo)").equals("http://127.0.0.1:5173/demo");
+    assert extract_localhost_url("Not local: http://localhost.evil.com/x").is_empty();
+    assert extract_localhost_url("https://example.com").is_empty();
+
+    assert is_quota_error("Weekly usage quota exceeded");
+    assert is_quota_error("HTTP 429 rate limit reached");
+    assert !is_quota_error("Connection refused");
+
+    assert browser_card_summary("browser_open", "{\"url\":\"http://localhost:3000\"}").equals("Opened http://localhost:3000");
+    assert browser_card_summary("browser_click", "{\"ref\":\"e2\"}").equals("Clicked [e2]");
+    assert browser_card_summary("browser_console", "{}").equals("Read browser console");
+    assert browser_card_summary("browser_screenshot", "{}").equals("Captured browser screenshot");
+}

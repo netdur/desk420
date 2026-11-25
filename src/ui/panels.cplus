@@ -1,0 +1,144 @@
+// src/ui/panels.cplus — the main window's two side panels: the sidebar on the
+// left and the inspector on the right (Engine/Usage on Home, Run/Browser/
+// Terminal/Preview in a run). Each sits behind a draggable divider and can
+// be hidden from the title bar or the View menu.
+//
+// The sidebar is the LEADING pane of `main:split`, so the split keeps its
+// width as the window resizes, which is what a sidebar should do. The
+// inspector is the TRAILING pane of `home:split` and `conv:split`, and a split
+// holds its leading width — so `TrailingPanel` watches the split and puts the
+// divider back where the panel keeps the width the person dragged it to.
+//
+// Hidden or shown is one fact for both inspectors, so switching between Home
+// and a run does not bring back a panel that was put away.
+
+import "facet/facet" as core;
+import "facet/mount" as mount;
+import "facet/services" as services;
+import "facet/split" as m_split;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+const SIDEBAR_W: f64 = 320.0f64;
+const SIDEBAR_MIN: f64 = 240.0f64;
+const SIDEBAR_MAX: f64 = 440.0f64;
+const PANEL_MIN: f64 = 260.0f64;
+const CENTRE_MIN: f64 = 460.0f64;
+const DIVIDER: f64 = 1.0f64;
+
+static _SIDEBAR_HIDDEN: bool = false;
+static _PANEL_HIDDEN: bool = false;
+
+fn sidebar_hidden() -> bool { return _SIDEBAR_HIDDEN; }
+fn panel_hidden() -> bool { return _PANEL_HIDDEN; }
+
+fn _set_pane(split_key: str, pane_key: str, pane: m_split::Pane, hidden: bool) {
+    guard let option::Option::Some(sp) = m_split::find(split_key) else { return; };
+    if hidden {
+        let _a: m_split::Split = sp.collapse(pane);
+        if let option::Option::Some(n) = mount::find(pane_key) { core::set_visible(n, false); }
+    } else {
+        if let option::Option::Some(n) = mount::find(pane_key) { core::set_visible(n, true); }
+        let _b: m_split::Split = sp.expand(pane);
+    }
+}
+
+fn toggle_sidebar() {
+    _SIDEBAR_HIDDEN = !_SIDEBAR_HIDDEN;
+    _set_pane("main:split", "side:pane", m_split::Pane::Leading, _SIDEBAR_HIDDEN);
+}
+
+fn show_sidebar() {
+    if _SIDEBAR_HIDDEN {
+        toggle_sidebar();
+    }
+}
+
+fn toggle_panel() {
+    _PANEL_HIDDEN = !_PANEL_HIDDEN;
+    _set_pane("home:split", "home:panel", m_split::Pane::Trailing, _PANEL_HIDDEN);
+    _set_pane("conv:split", "conv:panel", m_split::Pane::Trailing, _PANEL_HIDDEN);
+}
+
+fn show_panel() {
+    if _PANEL_HIDDEN {
+        toggle_panel();
+    }
+}
+
+// Bring a freshly mounted inspector in line with the shared hidden state.
+fn sync_panel(split_key: str, pane_key: str) {
+    if _PANEL_HIDDEN {
+        _set_pane(split_key, pane_key, m_split::Pane::Trailing, true);
+    }
+}
+
+// Keeps a split's TRAILING pane at the width it was dragged to while the
+// split itself changes size. Held as a field of the component that owns the
+// split; `arm` once the split is mounted.
+struct TrailingPanel {
+    split_key: text::Text,
+    width: f64,
+    // The split's width when the panel was last placed. A divider move at
+    // that same width is the person dragging; at any other width it is
+    // AppKit sharing out a window resize, which facet reports through the
+    // same `on_move`, and which must not become the panel's chosen width.
+    placed_total: f64,
+    watch: services::Cancellable,
+}
+
+impl TrailingPanel {
+    fn new(split_key: str, width: f64) -> TrailingPanel {
+        return TrailingPanel {
+            split_key: text::from_str(split_key),
+            width: width,
+            placed_total: 0.0f64,
+            watch: services::Cancellable::none(),
+        };
+    }
+
+    fn arm(ref this) {
+        guard let option::Option::Some(sp) = m_split::find(this.split_key.view()) else { return; };
+        let _s: m_split::Split = sp.set_on_move(this.on_moved);
+        this.watch = services::observe_size(sp.node(), this.on_resized);
+        this._place();
+    }
+
+    // The divider moved. Only a drag (the split's width unchanged) sets the
+    // panel's width. Never write `set_position` from inside `on_moved`: AppKit
+    // fires this on every live-resize frame and writing back causes a feedback
+    // loop + double relayout. `on_resized` handles re-placing on resize.
+    fn on_moved(ref this, _sender: *u8) {
+        guard let option::Option::Some(sp) = m_split::find(this.split_key.view()) else { return; };
+        if sp.is_collapsed(m_split::Pane::Trailing) { return; }
+        if !core::is_visible(sp.node()) { return; }
+        let total: f64 = sp.width();
+        let delta: f64 = total - this.placed_total;
+        let resized: bool = delta > 0.5f64 || delta < -0.5f64;
+        if resized {
+            return;
+        }
+        let w: f64 = total - sp.position() - DIVIDER;
+        if w >= PANEL_MIN { this.width = w; }
+    }
+
+    // The split changed size (window resize, sidebar shown or hidden): keep
+    // the panel's width and give the change to the centre.
+    fn on_resized(ref this) { this._place(); }
+
+    fn _place(ref this) {
+        guard let option::Option::Some(sp) = m_split::find(this.split_key.view()) else { return; };
+        if sp.is_collapsed(m_split::Pane::Trailing) { return; }
+        if !core::is_visible(sp.node()) { return; }
+        let total: f64 = sp.width();
+        if total <= 0.0f64 { return; }
+        this.placed_total = total;
+        var pos: f64 = total - this.width - DIVIDER;
+        if pos < CENTRE_MIN { pos = CENTRE_MIN; }
+        let cur: f64 = sp.position();
+        let diff: f64 = pos - cur;
+        if diff > 1.0f64 || diff < -1.0f64 {
+            let _s: m_split::Split = sp.set_position(pos);
+        }
+    }
+}

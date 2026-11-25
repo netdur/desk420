@@ -1,0 +1,303 @@
+// src/store/account.cplus — user identity, subscription tier, quota & context meter.
+//
+// Populated exclusively from ACP (`_x.ai/auth/info`, `_x.ai/billing`,
+// `_x.ai/session/info`). Never opens `~/.grok/auth.json` or logs token material.
+
+import "events/events" as events;
+import "stdlib/date" as date;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+import "../acp/types" as types;
+
+struct AccountChange {
+    generation: u64,
+}
+
+struct AccountStore {
+    identity: types::AccountInfo,
+    billing: types::BillingSnapshot,
+    billing_unsupported: bool,
+    context_info: types::SessionContextInfo,
+    _gen: u64,
+    _changes: events::Signal[AccountChange],
+}
+
+fn _format_cents(cents: i64) -> text::Text {
+    let neg: bool = cents < (0 as i64);
+    let abs_c: i64 = if neg { (0 as i64) -% cents } else { cents };
+    let dollars: i64 = abs_c / (100 as i64);
+    let rem: i64 = abs_c % (100 as i64);
+    let pad: str = if rem < (10 as i64) { "0" } else { "" };
+    let sym: str = "$";
+    if neg {
+        return "-${sym}${dollars}.${pad}${rem}";
+    }
+    return "${sym}${dollars}.${pad}${rem}";
+}
+
+impl AccountStore {
+    fn new() -> AccountStore {
+        return AccountStore {
+            identity: types::AccountInfo::empty(),
+            billing: types::BillingSnapshot::empty(),
+            billing_unsupported: false,
+            context_info: types::SessionContextInfo::empty(),
+            _gen: 0 as u64,
+            _changes: events::Signal[AccountChange]::new(),
+        };
+    }
+
+    fn _emit(ref this) {
+        this._gen = this._gen +% (1 as u64);
+        this._changes.emit(AccountChange { generation: this._gen });
+    }
+
+    fn watch(ref this, f: fn(AccountChange, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[AccountChange] {
+        return this._changes.on(f, ctx: ctx);
+    }
+
+    fn set_identity(ref this, take info: types::AccountInfo) {
+        this.identity = info;
+        this._emit();
+    }
+
+    fn set_billing(ref this, take snap: types::BillingSnapshot) {
+        this.billing = snap;
+        this.billing_unsupported = false;
+        this._emit();
+    }
+
+    fn set_billing_unsupported(ref this) {
+        this.billing = types::BillingSnapshot::empty();
+        this.billing_unsupported = true;
+        this._emit();
+    }
+
+    fn set_context_info(ref this, take info: types::SessionContextInfo) {
+        this.context_info = info;
+        this._emit();
+    }
+
+    fn clear(ref this) {
+        this.identity = types::AccountInfo::empty();
+        this.billing = types::BillingSnapshot::empty();
+        this.billing_unsupported = false;
+        this.context_info = types::SessionContextInfo::empty();
+        this._emit();
+    }
+}
+
+// ───────────────────────────── app-wide singleton surface ─────────────────────────────
+
+static _ACC_LIVE: bool = false;
+static _ACC: AccountStore = #zero::[AccountStore]();
+
+fn _ensure() {
+    if !_ACC_LIVE {
+        _ACC = AccountStore::new();
+        _ACC_LIVE = true;
+    }
+}
+
+fn watch(f: fn(AccountChange, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[AccountChange] {
+    _ensure();
+    return _ACC.watch(f, ctx: ctx);
+}
+
+fn set_identity(take info: types::AccountInfo) {
+    _ensure();
+    _ACC.set_identity(info);
+}
+
+fn set_billing(take snap: types::BillingSnapshot) {
+    _ensure();
+    _ACC.set_billing(snap);
+}
+
+fn set_billing_unsupported() {
+    _ensure();
+    _ACC.set_billing_unsupported();
+}
+
+fn set_context_info(take info: types::SessionContextInfo) {
+    _ensure();
+    _ACC.set_context_info(info);
+}
+
+fn clear() {
+    _ensure();
+    _ACC.clear();
+}
+
+fn _format_iso_date(iso: str) -> text::Text {
+    // Convert "YYYY-MM-DDT..." -> "Mon DD, YYYY"
+    guard let option::Option::Some(dt) = date::parse_iso8601(iso) else {
+        return text::from_str(iso);
+    };
+    let months: [str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mon: str = months[(dt.month - (1 as i64)) as usize];
+    return "${mon} ${dt.day}, ${dt.year}";
+}
+
+fn user_name() -> text::Text {
+    _ensure();
+    let n: text::Text = _ACC.identity.display_name();
+    if !n.is_empty() { return n; }
+    return text::from_str("Not signed in");
+}
+
+fn user_email() -> text::Text {
+    _ensure();
+    if !_ACC.identity.email.is_empty() { return _ACC.identity.email.clone(); }
+    if !_ACC.identity.team_name.is_empty() { return _ACC.identity.team_name.clone(); }
+    return text::from_str("Sign in via Grok CLI to sync account");
+}
+
+fn plan_label() -> text::Text {
+    _ensure();
+    if !_ACC.billing.subscription_tier.is_empty() {
+        return _ACC.billing.subscription_tier.clone();
+    }
+    if !_ACC.identity.team_name.is_empty() {
+        return _ACC.identity.team_name.clone();
+    }
+    return text::from_str("Grok");
+}
+
+fn usage_period_title() -> text::Text {
+    _ensure();
+    if !_ACC.billing.period_label.is_empty() {
+        return "${_ACC.billing.period_label.view()} usage";
+    }
+    return text::from_str("Usage");
+}
+
+// "weekly" / "monthly" / "daily", or empty when the plan has no period.
+fn period_word() -> text::Text {
+    _ensure();
+    let p: str = _ACC.billing.period_label.view();
+    if p == "Weekly" { return text::from_str("weekly"); }
+    if p == "Monthly" { return text::from_str("monthly"); }
+    if p == "Daily" { return text::from_str("daily"); }
+    return text::from_str("");
+}
+
+// What the big percentage is a share of: "of this week", "of this month".
+fn usage_period_phrase() -> text::Text {
+    _ensure();
+    let p: str = _ACC.billing.period_label.view();
+    if p == "Weekly" { return text::from_str("of this week"); }
+    if p == "Monthly" { return text::from_str("of this month"); }
+    if p == "Daily" { return text::from_str("of today"); }
+    return text::from_str("used");
+}
+
+// "SuperGrok · weekly" — the plan and, when it has one, its period.
+fn plan_and_period() -> text::Text {
+    let plan: text::Text = plan_label();
+    let w: text::Text = period_word();
+    if w.is_empty() { return plan; }
+    return "${plan.view()} · ${w.view()}";
+}
+
+// The short reset date: "Nov 28" (the year dropped).
+fn usage_reset_short() -> text::Text {
+    _ensure();
+    if _ACC.billing.period_end.is_empty() { return text::from_str(""); }
+    let d: text::Text = _format_iso_date(_ACC.billing.period_end.view());
+    if let option::Option::Some(comma) = d.find(",") {
+        if let option::Option::Some(head) = d.view().slice(from: 0 as usize, to: comma) {
+            return "Resets ${head}";
+        }
+    }
+    return "Resets ${d.view()}";
+}
+
+fn usage_fraction() -> f64 {
+    _ensure();
+    if !_ACC.billing.available || !_ACC.billing.has_percent { return 0.0f64; }
+    return (_ACC.billing.usage_percent / 100.0f64).clamp(0.0f64, 1.0f64);
+}
+
+fn usage_percent_label() -> text::Text {
+    _ensure();
+    if _ACC.billing_unsupported { return text::from_str("Not supported"); }
+    if !_ACC.identity.team_name.is_empty() && !_ACC.billing.has_percent {
+        return text::from_str("Team plan");
+    }
+    if _ACC.billing.available && _ACC.billing.has_percent {
+        let pct: i64 = (_ACC.billing.usage_percent + 0.5f64) as i64;
+        return "${pct}%";
+    }
+    if _ACC.billing.available { return text::from_str("Unavailable"); }
+    return text::from_str("Loading…");
+}
+
+fn usage_reset_pretty() -> text::Text {
+    _ensure();
+    if _ACC.billing.period_end.is_empty() { return text::from_str(""); }
+    let d: text::Text = _format_iso_date(_ACC.billing.period_end.view());
+    return "Resets ${d.view()}";
+}
+
+fn prepaid_label() -> text::Text {
+    _ensure();
+    if !_ACC.billing.has_prepaid { return text::from_str(""); }
+    let money: text::Text = _format_cents(_ACC.billing.prepaid_cents);
+    return "Prepaid ${money.view()}";
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn account_labels_never_show_false_zero_and_handle_team_and_unsupported() {
+    clear();
+
+    // 1. Weekly 42% + prepaid balance $12.50
+    var b: types::BillingSnapshot = types::BillingSnapshot::empty();
+    b.available = true;
+    b.has_percent = true;
+    b.usage_percent = 42.0f64;
+    b.period_label = text::from_str("Weekly");
+    b.period_end = text::from_str("2026-11-29T09:00:00Z");
+    b.has_prepaid = true;
+    b.prepaid_cents = 1250 as i64;
+    b.subscription_tier = text::from_str("SuperGrok");
+    set_billing(b);
+    assert plan_and_period().equals("SuperGrok · weekly");
+    assert usage_percent_label().equals("42%");
+    assert prepaid_label().equals("Prepaid $12.50");
+    assert usage_reset_short().equals("Resets Nov 29");
+    assert usage_reset_pretty().equals("Resets Nov 29, 2026");
+
+    // 2. Period with no percentage -> "Unavailable", never "0%"
+    var b_missing: types::BillingSnapshot = types::BillingSnapshot::empty();
+    b_missing.available = true;
+    b_missing.has_percent = false;
+    b_missing.subscription_tier = text::from_str("SuperGrok");
+    set_billing(b_missing);
+    let p_miss: text::Text = usage_percent_label();
+    assert p_miss.equals("Unavailable");
+    assert !p_miss.contains("0%");
+
+    // 3. Team account without usage
+    var id: types::AccountInfo = types::AccountInfo::empty();
+    id.email = text::from_str("dev@acme.io");
+    id.team_name = text::from_str("Acme");
+    set_identity(id);
+    assert usage_percent_label().equals("Team plan");
+    assert user_name().equals("dev@acme.io");
+
+    // 4. Billing unsupported (-32601)
+    set_billing_unsupported();
+    assert usage_percent_label().equals("Not supported");
+    assert plan_label().equals("Acme");
+
+    // 5. Pretty ISO date formatting
+    assert _format_iso_date("2026-11-28T22:37:26.399+00:00").equals("Nov 28, 2026");
+    assert _format_iso_date("2026-01-05T00:00:00Z").equals("Jan 5, 2026");
+
+    clear();
+}

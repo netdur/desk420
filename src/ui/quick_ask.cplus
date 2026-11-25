@@ -1,0 +1,260 @@
+// src/ui/quick_ask.cplus — Spotlight-style floating Quick Ask panel (Option-Space).
+//
+// Opens over any app / Space without switching Spaces (`panel: true, floating: true`),
+// focuses the prompt field, sends directly to Grok in a fresh run in the selected
+// project, and dismisses cleanly on Escape, blur, or submit.
+
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/label" as label;
+import "facet/nav" as nav;
+import "facet/screen" as screen;
+import "facet/services" as services;
+import "facet/symbol" as symbol;
+import "facet/text_button" as text_button;
+import "facet/text_field" as text_field;
+import "facet/vocabulary" as vocab;
+import "facet/window" as window;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/text" as text;
+
+import "../engine/runtime" as engine;
+import "../store/sessions" as sessions;
+import "./style" as style;
+
+const PANEL_W: f64 = 620.0f64;
+const PANEL_H: f64 = 108.0f64;
+
+// Label for the active global Quick Ask hotkey, updated by `app::DesktopShell`
+// when it registers Option-Space (or its fallback) at launch.
+static _HOTKEY_LABEL: str = "⌥Space";
+
+fn set_hotkey_label(label: str) {
+    _HOTKEY_LABEL = text::intern(label);
+}
+
+fn toggle() {
+    if let option::Option::Some(w) = runtime::app().find_window("quick_ask") {
+        if w.is_visible() && w.is_active() {
+            let _h: bool = w.hide();
+            return;
+        }
+        place_on_active_screen(w);
+        prepare_for_show(w);
+        let _a: bool = w.activate();
+    } else {
+        let _w = runtime::app().open_window("quick_ask");
+    }
+}
+
+fn hotkey_label() -> str {
+    return _HOTKEY_LABEL;
+}
+
+// Upper-centre of whichever display currently holds the pointer.
+fn place_on_active_screen(w: window::Window) {
+    let s: vocab::Rect = window::active_screen_frame();
+    if s.width <= 0.0f64 { return; }
+    let f: vocab::Rect = w.frame();
+    let pw: f64 = if f.width > 0.0f64 { f.width } else { PANEL_W };
+    let ph: f64 = if f.height > 0.0f64 { f.height } else { PANEL_H };
+    w.set_frame(vocab::Rect {
+        x: s.x + (s.width - pw) / 2.0f64,
+        y: s.y + (s.height - ph) * 0.62f64,
+        width: pw,
+        height: ph,
+    });
+}
+
+fn _project_badge_text() -> text::Text {
+    let proj: text::Text = sessions::selected_project();
+    if proj.is_empty() { return text::from_str("General"); }
+    let base: str = path::file_name(proj.view());
+    if base.is_empty() { return proj; }
+    return text::from_str(base);
+}
+
+// Refresh the project badge and focus the input when re-summoned.
+fn prepare_for_show(w: window::Window) {
+    let root: *core::Node = w.root();
+    if let option::Option::Some(pl) = label::find("quick:project", within: root) {
+        let ptxt: text::Text = _project_badge_text();
+        let _pl: label::Label = pl.set_text(ptxt.view());
+    }
+    if let option::Option::Some(tf) = text_field::find("quick:input", within: root) {
+        let _tf: text_field::TextField = tf.focus();
+    }
+}
+
+struct QuickAskScreen {
+    context: nav::Context,
+    blur: services::Cancellable,
+}
+
+impl QuickAskScreen {
+    fn new() -> QuickAskScreen {
+        return QuickAskScreen {
+            context: nav::Context::none(),
+            blur: services::Cancellable::none(),
+        };
+    }
+
+    fn put_away(ref this) {
+        if let option::Option::Some(w) = runtime::app().find_window("quick_ask") {
+            let _h: bool = w.hide();
+        }
+    }
+
+    fn _submit_prompt(ref this) {
+        guard let option::Option::Some(tf) = text_field::find("quick:input", within: this.context.root()) else {
+            return;
+        };
+        let raw: text::Text = text::from_str(tf.text());
+        let trimmed: str = raw.view().trim();
+        if trimmed.is_empty() { return; }
+
+        let proj: text::Text = sessions::selected_project();
+        engine::new_chat(cwd: proj.view());
+        engine::send_prompt(trimmed);
+
+        let _tf: text_field::TextField = tf.set_text("");
+        this.put_away();
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("home");
+    }
+
+    fn on_submit(ref this, _sender: *u8) {
+        this._submit_prompt();
+    }
+
+    fn on_send_click(ref this, _sender: *u8) -> bool {
+        this._submit_prompt();
+        return true;
+    }
+
+    fn on_open_app(ref this, _sender: *u8) {
+        this.put_away();
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("home");
+    }
+
+    fn on_key(ref this, event: *u8) -> bool {
+        if gestures::key_named(event) != gestures::key_escape() { return false; }
+        this.put_away();
+        return true;
+    }
+
+    fn on_blur(ref this) {
+        this.put_away();
+    }
+}
+
+impl QuickAskScreen: component::Component {
+    fn build(ref this) -> core::Node {
+        let proj_lbl: text::Text = _project_badge_text();
+        var root: core::Node = @ui {
+            bordered(key: "quick:shell",
+            stroke: vocab::Brush::solid(style::hairline()),
+            stroke_width: 1.0f64,
+            stroke_shape: vocab::Shape::rounded(16.0f64)) {
+                column {
+                    hstack {
+                        symbol(icons::bolt, size: 22.0f64, color: style::lime_text())
+                            .shrink(0.0f64)
+                        text_field("", key: "quick:input",
+                        placeholder: "Ask Grok anything…",
+                        font_size: 18.0f64,
+                        bordered: false,
+                        on_submit: this.on_submit)
+                            .gesture(on_key: this.on_key)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                        style::circle_icon(icons::arrow_upward, "quick:send",
+                        title: "Send to Grok",
+                        size: 32.0f64, icon_size: 18.0f64,
+                        color: style::on_lime(),
+                        bg: style::lime(),
+                        on_click: this.on_send_click)
+                    }
+                    .align(flex::Align::Center)
+                        .gap(12.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                        .padding_edge(flex::Edge::Top, 14.0f64)
+                        .padding_edge(flex::Edge::Bottom, 10.0f64)
+
+                    style::rule()
+
+                    hstack {
+                        hstack {
+                            symbol(icons::folder, size: 13.0f64, color: style::muted())
+                                .shrink(0.0f64)
+                            label(proj_lbl.view(), key: "quick:project",
+                            font_size: 12.0f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::ink(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                        }
+                        .align(flex::Align::Center)
+                            .gap(6.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                            .padding_edge(flex::Edge::Vertical, 3.0f64)
+                            .set_background_color(style::chip())
+                            .set_corner_radius(vocab::Corners::all(6.0f64))
+
+                        label("Return to send · Esc to dismiss",
+                        font_size: 11.5f64,
+                        text_color: style::faint())
+                            .margin_edge(flex::Edge::Left, 6.0f64)
+
+                        spacer().grow(1.0f64)
+
+                        text_button("Open Desk420", key: "quick:open_app",
+                        font_size: 11.5f64,
+                        font_weight: vocab::FontWeight::Medium,
+                        text_color: style::muted(),
+                        bordered: false,
+                        on_click: this.on_open_app)
+                    }
+                    .align(flex::Align::Center)
+                        .gap(6.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                        .padding_edge(flex::Edge::Vertical, 8.0f64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .set_background_color(style::canvas())
+                .set_corner_radius(vocab::Corners::all(16.0f64))
+        };
+        root.set_safe_area(vocab::SafeArea::None);
+        return root;
+    }
+}
+
+impl QuickAskScreen: component::Lifecycle {}
+
+impl QuickAskScreen: screen::Screen {
+    fn on_context(ref this, context: nav::Context) { this.context = context; }
+
+    fn on_navigation(ref this, _state: nav::State) {
+        guard let option::Option::Some(w) = runtime::app().find_window("quick_ask") else { return; };
+        if !this.blur.pending() {
+            this.blur = w.on_inactive(this.on_blur);
+        }
+        place_on_active_screen(w);
+        prepare_for_show(w);
+    }
+}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[QuickAskScreen](QuickAskScreen::new());
+}

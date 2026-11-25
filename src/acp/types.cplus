@@ -1,0 +1,1407 @@
+// src/acp/types.cplus — typed ACP protocol messages, encoders, and defensive decoders.
+//
+// Decoders follow the Grok 1.0.92 ACP protocol over stdio and degrade gracefully
+// on unknown update kinds, tool kinds, or missing fields.
+
+import "json/json" as json;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "./wire" as wire;
+
+// ───────────────────────────── enums ─────────────────────────────
+
+enum StopReason {
+    EndTurn,
+    Cancelled,
+    MaxTokens,
+    Refusal,
+    Unknown(text::Text),
+}
+
+impl StopReason {
+    #[keeps(nothing)]
+    fn from_str(s: str) -> StopReason {
+        if s == "end_turn" { return StopReason::EndTurn; }
+        if s == "cancelled" { return StopReason::Cancelled; }
+        if s == "max_tokens" { return StopReason::MaxTokens; }
+        if s == "refusal" { return StopReason::Refusal; }
+        return StopReason::Unknown(text::from_str(s));
+    }
+
+    fn clone(this) -> StopReason {
+        return match this {
+            StopReason::EndTurn => StopReason::EndTurn,
+            StopReason::Cancelled => StopReason::Cancelled,
+            StopReason::MaxTokens => StopReason::MaxTokens,
+            StopReason::Refusal => StopReason::Refusal,
+            StopReason::Unknown(t) => StopReason::Unknown(t.clone()),
+        };
+    }
+
+    fn is_end_turn(this) -> bool {
+        return match this {
+            StopReason::EndTurn => true,
+            _ => false,
+        };
+    }
+
+    fn is_cancelled(this) -> bool {
+        return match this {
+            StopReason::Cancelled => true,
+            _ => false,
+        };
+    }
+}
+
+enum ToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Unknown(text::Text),
+}
+
+impl ToolStatus {
+    #[keeps(nothing)]
+    fn from_str(s: str) -> ToolStatus {
+        if s == "pending" { return ToolStatus::Pending; }
+        if s == "in_progress" { return ToolStatus::InProgress; }
+        if s == "completed" { return ToolStatus::Completed; }
+        if s == "failed" { return ToolStatus::Failed; }
+        return ToolStatus::Unknown(text::from_str(s));
+    }
+
+    fn clone(this) -> ToolStatus {
+        return match this {
+            ToolStatus::Pending => ToolStatus::Pending,
+            ToolStatus::InProgress => ToolStatus::InProgress,
+            ToolStatus::Completed => ToolStatus::Completed,
+            ToolStatus::Failed => ToolStatus::Failed,
+            ToolStatus::Unknown(t) => ToolStatus::Unknown(t.clone()),
+        };
+    }
+
+    fn is_completed(this) -> bool {
+        return match this {
+            ToolStatus::Completed => true,
+            _ => false,
+        };
+    }
+
+    fn is_failed(this) -> bool {
+        return match this {
+            ToolStatus::Failed => true,
+            _ => false,
+        };
+    }
+}
+
+enum ToolKind {
+    Read,
+    Edit,
+    Execute,
+    Search,
+    Other,
+    Unknown(text::Text),
+}
+
+impl ToolKind {
+    #[keeps(nothing)]
+    fn from_str(s: str) -> ToolKind {
+        if s == "read" { return ToolKind::Read; }
+        if s == "edit" { return ToolKind::Edit; }
+        if s == "execute" { return ToolKind::Execute; }
+        if s == "search" { return ToolKind::Search; }
+        if s == "other" { return ToolKind::Other; }
+        return ToolKind::Unknown(text::from_str(s));
+    }
+
+    fn clone(this) -> ToolKind {
+        return match this {
+            ToolKind::Read => ToolKind::Read,
+            ToolKind::Edit => ToolKind::Edit,
+            ToolKind::Execute => ToolKind::Execute,
+            ToolKind::Search => ToolKind::Search,
+            ToolKind::Other => ToolKind::Other,
+            ToolKind::Unknown(t) => ToolKind::Unknown(t.clone()),
+        };
+    }
+}
+
+enum PermissionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    Unknown(text::Text),
+}
+
+impl PermissionKind {
+    #[keeps(nothing)]
+    fn from_str(s: str) -> PermissionKind {
+        if s == "allow_once" { return PermissionKind::AllowOnce; }
+        if s == "allow_always" { return PermissionKind::AllowAlways; }
+        if s == "reject_once" { return PermissionKind::RejectOnce; }
+        if s == "reject_always" { return PermissionKind::RejectAlways; }
+        return PermissionKind::Unknown(text::from_str(s));
+    }
+
+    fn clone(this) -> PermissionKind {
+        return match this {
+            PermissionKind::AllowOnce => PermissionKind::AllowOnce,
+            PermissionKind::AllowAlways => PermissionKind::AllowAlways,
+            PermissionKind::RejectOnce => PermissionKind::RejectOnce,
+            PermissionKind::RejectAlways => PermissionKind::RejectAlways,
+            PermissionKind::Unknown(t) => PermissionKind::Unknown(t.clone()),
+        };
+    }
+}
+
+// ───────────────────────────── structs ─────────────────────────────
+
+struct ConfigChoice {
+    value: text::Text,
+    name: text::Text,
+}
+
+impl ConfigChoice: Clone {}
+
+struct ConfigOption {
+    id: text::Text,
+    name: text::Text,
+    category: text::Text,
+    current_value: text::Text,
+    choices: vec::Vec[ConfigChoice],
+}
+
+impl ConfigOption {
+    fn clone(this) -> ConfigOption {
+        var out: vec::Vec[ConfigChoice] = vec::new::[ConfigChoice]();
+        var i: usize = 0 as usize;
+        while i < this.choices.count() {
+            if let option::Option::Some(p) = this.choices.at_ptr(i) {
+                let _ = out.append((*p).clone());
+            }
+            i = i +% (1 as usize);
+        }
+        return ConfigOption {
+            id: this.id.clone(),
+            name: this.name.clone(),
+            category: this.category.clone(),
+            current_value: this.current_value.clone(),
+            choices: out,
+        };
+    }
+}
+
+struct AvailableCommand {
+    name: text::Text,
+    description: text::Text,
+    input_hint: text::Text,
+}
+
+impl AvailableCommand: Clone {}
+
+struct SessionSummary {
+    session_id: text::Text,
+    cwd: text::Text,
+    title: text::Text,
+    updated_at: text::Text,
+}
+
+impl SessionSummary: Clone {}
+
+struct SearchHit {
+    session_id: text::Text,
+    cwd: text::Text,
+    summary: text::Text,
+    score: f64,
+}
+
+impl SearchHit: Clone {}
+
+struct AccountInfo {
+    email: text::Text,
+    first_name: text::Text,
+    last_name: text::Text,
+    team_name: text::Text,
+    principal_type: text::Text,
+    method_id: text::Text,
+}
+
+impl AccountInfo: Clone {}
+
+impl AccountInfo {
+    fn empty() -> AccountInfo {
+        return AccountInfo {
+            email: text::from_str(""),
+            first_name: text::from_str(""),
+            last_name: text::from_str(""),
+            team_name: text::from_str(""),
+            principal_type: text::from_str(""),
+            method_id: text::from_str(""),
+        };
+    }
+
+    fn display_name(this) -> text::Text {
+        if !this.first_name.is_empty() && !this.last_name.is_empty() {
+            return "${this.first_name.view()} ${this.last_name.view()}";
+        }
+        if !this.first_name.is_empty() {
+            return this.first_name.clone();
+        }
+        return this.email.clone();
+    }
+}
+
+struct BillingSnapshot {
+    available: bool,
+    is_team: bool,
+    has_percent: bool,
+    usage_percent: f64,
+    period_label: text::Text,
+    period_end: text::Text,
+    has_prepaid: bool,
+    prepaid_cents: i64,
+    subscription_tier: text::Text,
+}
+
+impl BillingSnapshot: Clone {}
+
+impl BillingSnapshot {
+    fn empty() -> BillingSnapshot {
+        return BillingSnapshot {
+            available: false,
+            is_team: false,
+            has_percent: false,
+            usage_percent: 0.0f64,
+            period_label: text::from_str("Credits"),
+            period_end: text::from_str(""),
+            has_prepaid: false,
+            prepaid_cents: 0 as i64,
+            subscription_tier: text::from_str(""),
+        };
+    }
+}
+
+struct SessionContextInfo {
+    has_context: bool,
+    used_tokens: i64,
+    total_tokens: i64,
+    percent: f64,
+    model_id: text::Text,
+}
+
+impl SessionContextInfo: Clone {}
+
+impl SessionContextInfo {
+    fn empty() -> SessionContextInfo {
+        return SessionContextInfo {
+            has_context: false,
+            used_tokens: 0 as i64,
+            total_tokens: 0 as i64,
+            percent: 0.0f64,
+            model_id: text::from_str(""),
+        };
+    }
+}
+
+struct Attachment {
+    path: text::Text,
+    mime_type: text::Text,
+    is_image: bool,
+    data_or_text: text::Text,
+}
+
+impl Attachment: Clone {}
+
+struct RewindResult {
+    success: bool,
+    prompt_text: text::Text,
+}
+
+impl RewindResult: Clone {}
+
+struct QueueState {
+    session_id: text::Text,
+    entries: vec::Vec[text::Text],
+}
+
+struct GitFileChange {
+    path: text::Text,
+    change_type: text::Text,
+    additions: i64,
+    deletions: i64,
+}
+
+impl GitFileChange: Clone {}
+
+struct GitStatusInfo {
+    is_repo: bool,
+    branch: text::Text,
+    staged: vec::Vec[GitFileChange],
+    unstaged: vec::Vec[GitFileChange],
+}
+
+impl GitStatusInfo {
+    fn empty() -> GitStatusInfo {
+        return GitStatusInfo {
+            is_repo: false,
+            branch: text::from_str(""),
+            staged: vec::new::[GitFileChange](),
+            unstaged: vec::new::[GitFileChange](),
+        };
+    }
+
+    fn format_summary(this) -> text::Text {
+        if !this.is_repo { return text::from_str(""); }
+        var out: text::Text = text::new();
+        if !this.branch.is_empty() {
+            let _ = out.append("Branch: ${this.branch.view()}\n");
+        }
+        if this.staged.count() > (0 as usize) {
+            let _ = out.append("Staged:\n");
+            var i: usize = 0 as usize;
+            while i < this.staged.count() {
+                if let option::Option::Some(fp) = this.staged.at_ptr(i) {
+                    let _ = out.append("  ${(*fp).change_type.view()} ${(*fp).path.view()} (+${(*fp).additions}/-${(*fp).deletions})\n");
+                }
+                i = i +% (1 as usize);
+            }
+        }
+        if this.unstaged.count() > (0 as usize) {
+            let _ = out.append("Unstaged:\n");
+            var i: usize = 0 as usize;
+            while i < this.unstaged.count() {
+                if let option::Option::Some(fp) = this.unstaged.at_ptr(i) {
+                    let _ = out.append("  ${(*fp).change_type.view()} ${(*fp).path.view()} (+${(*fp).additions}/-${(*fp).deletions})\n");
+                }
+                i = i +% (1 as usize);
+            }
+        }
+        return out;
+    }
+}
+
+struct PermissionOption {
+    option_id: text::Text,
+    kind: PermissionKind,
+    name: text::Text,
+}
+
+impl PermissionOption {
+    fn clone(this) -> PermissionOption {
+        return PermissionOption {
+            option_id: this.option_id.clone(),
+            kind: this.kind.clone(),
+            name: this.name.clone(),
+        };
+    }
+}
+
+struct PermissionRequest {
+    rpc_id: wire::JsonRpcId,
+    session_id: text::Text,
+    tool_call_id: text::Text,
+    title: text::Text,
+    kind: ToolKind,
+    command: text::Text,
+    description: text::Text,
+    options: vec::Vec[PermissionOption],
+}
+
+struct ToolCallInfo {
+    tool_call_id: text::Text,
+    title: text::Text,
+    kind: ToolKind,
+    has_kind: bool,
+    status: ToolStatus,
+    has_status: bool,
+    raw_input_json: text::Text,
+    output_text: text::Text,
+    diff_path: text::Text,
+    diff_old: text::Text,
+    diff_new: text::Text,
+    tool_not_run: text::Text,
+    family: text::Text,
+}
+
+enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PlanStatus {
+    fn from_str(s: str) -> PlanStatus {
+        if s == "completed" || s == "done" { return PlanStatus::Completed; }
+        if s == "in_progress" || s == "in-progress" || s == "running" { return PlanStatus::InProgress; }
+        return PlanStatus::Pending;
+    }
+
+}
+
+struct PlanEntry {
+    content: text::Text,
+    priority: text::Text,
+    status: PlanStatus,
+}
+
+impl PlanEntry {
+    fn clone(this) -> PlanEntry {
+        return PlanEntry {
+            content: this.content.clone(),
+            priority: this.priority.clone(),
+            status: this.status,
+        };
+    }
+}
+
+enum SessionUpdate {
+    AgentMessageChunk(text::Text),
+    AgentThoughtChunk(text::Text),
+    UserMessageChunk(text::Text),
+    ToolCall(ToolCallInfo),
+    ToolCallUpdate(ToolCallInfo),
+    Plan(vec::Vec[PlanEntry]),
+    SessionInfoUpdate(text::Text),
+    ConfigOptionUpdate(vec::Vec[ConfigOption]),
+    AvailableCommandsUpdate(vec::Vec[AvailableCommand]),
+    Unknown(text::Text, text::Text),
+}
+
+struct SessionUpdateEnvelope {
+    session_id: text::Text,
+    update: SessionUpdate,
+}
+
+struct SessionNewResult {
+    session_id: text::Text,
+    config_options: vec::Vec[ConfigOption],
+}
+
+struct PromptResult {
+    stop_reason: StopReason,
+    total_tokens: i64,
+    input_tokens: i64,
+    model_id: text::Text,
+}
+
+// ───────────────────────────── JSON helpers ─────────────────────────────
+
+fn _opt_str_field(obj: json::Value, key: str) -> option::Option[text::Text] {
+    return match obj.value(for_key: key) {
+        option::Option::Some(v) => v.as_text(),
+        option::Option::None => option::Option[text::Text]::None,
+    };
+}
+
+// ───────────────────────────── outgoing param builders ─────────────────────────────
+
+fn params_initialize() -> json::Value {
+    var fs_m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = fs_m.append(json::Member::new("readTextFile", json::Value::boolean(false)));
+    let _ = fs_m.append(json::Member::new("writeTextFile", json::Value::boolean(false)));
+
+    var cap_m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = cap_m.append(json::Member::new("fs", json::Value::object(fs_m)));
+    let _ = cap_m.append(json::Member::new("terminal", json::Value::boolean(false)));
+
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("protocolVersion", json::Value::number(1.0)));
+    let _ = m.append(json::Member::new("clientCapabilities", json::Value::object(cap_m)));
+    return json::Value::object(m);
+}
+
+fn params_session_new_with_mcp(cwd: str, take mcp_servers: vec::Vec[json::Value]) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("cwd", json::Value::text(cwd)));
+    let _ = m.append(json::Member::new("mcpServers", json::Value::array(mcp_servers)));
+    return json::Value::object(m);
+}
+
+fn params_session_new(cwd: str) -> json::Value {
+    return params_session_new_with_mcp(cwd, vec::new::[json::Value]());
+}
+
+fn params_session_load_with_mcp(session_id: str, cwd: str, take mcp_servers: vec::Vec[json::Value]) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("cwd", json::Value::text(cwd)));
+    let _ = m.append(json::Member::new("mcpServers", json::Value::array(mcp_servers)));
+    return json::Value::object(m);
+}
+
+fn params_session_prompt_text(session_id: str, prompt_text: str) -> json::Value {
+    var blk: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = blk.append(json::Member::new("type", json::Value::text("text")));
+    let _ = blk.append(json::Member::new("text", json::Value::text(prompt_text)));
+
+    var arr: vec::Vec[json::Value] = vec::new::[json::Value]();
+    let _ = arr.append(json::Value::object(blk));
+
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("prompt", json::Value::array(arr)));
+    return json::Value::object(m);
+}
+
+fn params_session_cancel(session_id: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    return json::Value::object(m);
+}
+
+fn params_set_config_option(session_id: str, config_id: str, value: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("configId", json::Value::text(config_id)));
+    let _ = m.append(json::Member::new("value", json::Value::text(value)));
+    return json::Value::object(m);
+}
+
+fn params_session_rename(session_id: str, title: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("title", json::Value::text(title)));
+    return json::Value::object(m);
+}
+
+fn params_session_delete(session_id: str, cwd: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("cwd", json::Value::text(cwd)));
+    return json::Value::object(m);
+}
+
+fn params_session_search(query: str, limit: i64 = 20 as i64, cwd: str = "") -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("query", json::Value::text(query)));
+    let _ = m.append(json::Member::new("limit", json::Value::number(limit as f64)));
+    if cwd != "" {
+        let _ = m.append(json::Member::new("cwd", json::Value::text(cwd)));
+    }
+    return json::Value::object(m);
+}
+
+fn params_empty() -> json::Value {
+    return json::Value::object(vec::new::[json::Member]());
+}
+
+fn params_session_prompt(session_id: str, prompt_text: str, attachments: vec::Vec[Attachment]) -> json::Value {
+    var arr: vec::Vec[json::Value] = vec::new::[json::Value]();
+
+    var blk: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = blk.append(json::Member::new("type", json::Value::text("text")));
+    let _ = blk.append(json::Member::new("text", json::Value::text(prompt_text)));
+    let _ = arr.append(json::Value::object(blk));
+
+    var i: usize = 0 as usize;
+    while i < attachments.count() {
+        if let option::Option::Some(ap) = attachments.at_ptr(i) {
+            if (*ap).is_image {
+                var ib: vec::Vec[json::Member] = vec::new::[json::Member]();
+                let _ = ib.append(json::Member::new("type", json::Value::text("image")));
+                let _ = ib.append(json::Member::new("mimeType", json::Value::text((*ap).mime_type.view())));
+                let _ = ib.append(json::Member::new("data", json::Value::text((*ap).data_or_text.view())));
+                let _ = arr.append(json::Value::object(ib));
+            } else {
+                var res_m: vec::Vec[json::Member] = vec::new::[json::Member]();
+                let uri: text::Text = "file://${(*ap).path.view()}";
+                let _ = res_m.append(json::Member::new("uri", json::Value::text(uri.view())));
+                let _ = res_m.append(json::Member::new("mimeType", json::Value::text((*ap).mime_type.view())));
+                let _ = res_m.append(json::Member::new("text", json::Value::text((*ap).data_or_text.view())));
+                var rb: vec::Vec[json::Member] = vec::new::[json::Member]();
+                let _ = rb.append(json::Member::new("type", json::Value::text("resource")));
+                let _ = rb.append(json::Member::new("resource", json::Value::object(res_m)));
+                let _ = arr.append(json::Value::object(rb));
+            }
+        }
+        i = i +% (1 as usize);
+    }
+
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("prompt", json::Value::array(arr)));
+    return json::Value::object(m);
+}
+
+fn params_rewind_points(session_id: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    return json::Value::object(m);
+}
+
+fn params_rewind_execute(session_id: str, target_prompt_index: i64, mode: str = "all", force: bool = true) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("targetPromptIndex", json::Value::number(target_prompt_index as f64)));
+    let _ = m.append(json::Member::new("mode", json::Value::text(mode)));
+    let _ = m.append(json::Member::new("force", json::Value::boolean(force)));
+    return json::Value::object(m);
+}
+
+fn params_git_status(session_id: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    let _ = m.append(json::Member::new("includeUntracked", json::Value::boolean(true)));
+    let _ = m.append(json::Member::new("includeStats", json::Value::boolean(true)));
+    return json::Value::object(m);
+}
+
+fn params_session_info(session_id: str) -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("sessionId", json::Value::text(session_id)));
+    return json::Value::object(m);
+}
+
+fn params_authenticate_grok() -> json::Value {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("methodId", json::Value::text("grok.com")));
+    return json::Value::object(m);
+}
+
+fn result_permission_selected(option_id: str) -> json::Value {
+    var inner: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = inner.append(json::Member::new("outcome", json::Value::text("selected")));
+    let _ = inner.append(json::Member::new("optionId", json::Value::text(option_id)));
+
+    var outer: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = outer.append(json::Member::new("outcome", json::Value::object(inner)));
+    return json::Value::object(outer);
+}
+
+// ───────────────────────────── decoders ─────────────────────────────
+
+fn decode_config_options(arr_val: json::Value) -> vec::Vec[ConfigOption] {
+    var out: vec::Vec[ConfigOption] = vec::new::[ConfigOption]();
+    let n: usize = arr_val.item_count();
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(item) = arr_val.item(at: i) {
+            var choices: vec::Vec[ConfigChoice] = vec::new::[ConfigChoice]();
+            if let option::Option::Some(opts) = item.value(for_key: "options") {
+                let cn: usize = opts.item_count();
+                var j: usize = 0 as usize;
+                while j < cn {
+                    if let option::Option::Some(c) = opts.item(at: j) {
+                        let _ = choices.append(ConfigChoice {
+                            value: c.field_str("value", ""),
+                            name: c.field_str("name", ""),
+                        });
+                    }
+                    j = j +% (1 as usize);
+                }
+            }
+            let _ = out.append(ConfigOption {
+                id: item.field_str("id", ""),
+                name: item.field_str("name", ""),
+                category: item.field_str("category", ""),
+                current_value: item.field_str("currentValue", ""),
+                choices: choices,
+            });
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn decode_available_commands(arr_val: json::Value) -> vec::Vec[AvailableCommand] {
+    var out: vec::Vec[AvailableCommand] = vec::new::[AvailableCommand]();
+    let n: usize = arr_val.item_count();
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(item) = arr_val.item(at: i) {
+            let hint: text::Text = match item.value(for_key: "input") {
+                option::Option::Some(iv) => iv.field_str("hint", ""),
+                option::Option::None => text::from_str(""),
+            };
+            let _ = out.append(AvailableCommand {
+                name: item.field_str("name", ""),
+                description: item.field_str("description", ""),
+                input_hint: hint,
+            });
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn decode_session_new(result_val: json::Value) -> option::Option[SessionNewResult] {
+    let sid: text::Text = result_val.field_str("sessionId", "");
+    if sid.is_empty() {
+        return option::Option[SessionNewResult]::None;
+    }
+    let opts: vec::Vec[ConfigOption] = match result_val.value(for_key: "configOptions") {
+        option::Option::Some(v) => decode_config_options(v),
+        option::Option::None => vec::new::[ConfigOption](),
+    };
+    return option::Option[SessionNewResult]::Some(SessionNewResult {
+        session_id: sid,
+        config_options: opts,
+    });
+}
+
+fn decode_session_list(result_val: json::Value) -> vec::Vec[SessionSummary] {
+    var out: vec::Vec[SessionSummary] = vec::new::[SessionSummary]();
+    guard let option::Option::Some(arr) = result_val.value(for_key: "sessions") else {
+        return out;
+    };
+    let n: usize = arr.item_count();
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(item) = arr.item(at: i) {
+            let _ = out.append(SessionSummary {
+                session_id: item.field_str("sessionId", ""),
+                cwd: item.field_str("cwd", ""),
+                title: item.field_str("title", ""),
+                updated_at: item.field_str("updatedAt", ""),
+            });
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn decode_session_search(result_val: json::Value) -> vec::Vec[SearchHit] {
+    var out: vec::Vec[SearchHit] = vec::new::[SearchHit]();
+    guard let option::Option::Some(arr) = result_val.value(for_key: "results") else {
+        return out;
+    };
+    let n: usize = arr.item_count();
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(item) = arr.item(at: i) {
+            let sc: f64 = match item.value(for_key: "score") {
+                option::Option::Some(sv) => match sv.as_number() {
+                    option::Option::Some(v) => v,
+                    option::Option::None => 0.0f64,
+                },
+                option::Option::None => 0.0f64,
+            };
+            let _ = out.append(SearchHit {
+                session_id: item.field_str("sessionId", ""),
+                cwd: item.field_str("cwd", ""),
+                summary: item.field_str("summary", ""),
+                score: sc,
+            });
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn decode_auth_info(result_val: json::Value) -> AccountInfo {
+    return AccountInfo {
+        email: result_val.field_str("email", ""),
+        first_name: result_val.field_str("firstName", ""),
+        last_name: result_val.field_str("lastName", ""),
+        team_name: result_val.field_str("teamName", ""),
+        principal_type: result_val.field_str("principalType", ""),
+        method_id: result_val.field_str("methodId", ""),
+    };
+}
+
+fn _period_label_from_type(t: str) -> text::Text {
+    if t.contains("WEEKLY") { return text::from_str("Weekly"); }
+    if t.contains("MONTHLY") { return text::from_str("Monthly"); }
+    if t.contains("DAILY") { return text::from_str("Daily"); }
+    return text::from_str("Credits");
+}
+
+fn decode_billing(result_val: json::Value) -> BillingSnapshot {
+    var snap: BillingSnapshot = BillingSnapshot::empty();
+    snap.available = true;
+    snap.subscription_tier = result_val.field_str("subscription_tier", "");
+    if snap.subscription_tier.is_empty() {
+        snap.subscription_tier = result_val.field_str("subscriptionTier", "");
+    }
+
+    // Nested `config` shape (grok 1.0.92).
+    if let option::Option::Some(cfg) = result_val.value(for_key: "config") {
+        if let option::Option::Some(pv) = cfg.value(for_key: "creditUsagePercent") {
+            if let option::Option::Some(n) = pv.as_number() {
+                snap.has_percent = true;
+                snap.usage_percent = n;
+            }
+        }
+        if let option::Option::Some(cp) = cfg.value(for_key: "currentPeriod") {
+            let pt: text::Text = cp.field_str("type", "");
+            if !pt.is_empty() {
+                snap.period_label = _period_label_from_type(pt.view());
+            }
+            snap.period_end = cp.field_str("end", "");
+        }
+        if snap.period_end.is_empty() {
+            snap.period_end = cfg.field_str("billingPeriodEnd", "");
+        }
+        if let option::Option::Some(pb) = cfg.value(for_key: "prepaidBalance") {
+            if let option::Option::Some(vv) = pb.value(for_key: "val") {
+                if let option::Option::Some(n) = vv.as_number() {
+                    snap.has_prepaid = true;
+                    snap.prepaid_cents = n as i64;
+                }
+            }
+        }
+        return snap;
+    }
+
+    // Legacy shape: `monthlyLimit` + `usage.totalUsed`.
+    if let option::Option::Some(lim_v) = result_val.value(for_key: "monthlyLimit") {
+        if let option::Option::Some(lim) = lim_v.as_number() {
+            if lim > 0.0f64 {
+                if let option::Option::Some(u) = result_val.value(for_key: "usage") {
+                    if let option::Option::Some(used_v) = u.value(for_key: "totalUsed") {
+                        if let option::Option::Some(used) = used_v.as_number() {
+                            snap.has_percent = true;
+                            snap.usage_percent = (used / lim) * 100.0f64;
+                            snap.period_label = text::from_str("Monthly");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return snap;
+}
+
+fn decode_rewind_point_at(result_val: json::Value, ordinal: i64) -> option::Option[i64] {
+    guard let option::Option::Some(arr) = result_val.value(for_key: "rewind_points") else {
+        return option::Option[i64]::None;
+    };
+    let n: usize = arr.item_count();
+    if n == (0 as usize) {
+        return option::Option[i64]::None;
+    }
+    var idx: usize = n -% (1 as usize);
+    if ordinal >= (0 as i64) && (ordinal as usize) < n {
+        idx = ordinal as usize;
+    }
+    guard let option::Option::Some(item) = arr.item(at: idx) else {
+        return option::Option[i64]::None;
+    };
+    return match item.value(for_key: "prompt_index") {
+        option::Option::Some(v) => match v.as_number() {
+            option::Option::Some(num) => option::Option[i64]::Some(num as i64),
+            option::Option::None => option::Option[i64]::None,
+        },
+        option::Option::None => option::Option[i64]::None,
+    };
+}
+
+fn decode_rewind_execute(result_val: json::Value) -> RewindResult {
+    let ok: bool = result_val.field_bool("success", false);
+    let ptxt: text::Text = result_val.field_str("prompt_text", "");
+    return RewindResult {
+        success: ok,
+        prompt_text: ptxt,
+    };
+}
+
+struct McpServerInfo {
+    name: text::Text,
+    status: text::Text,
+}
+
+fn decode_mcp_servers_updated(params: json::Value) -> vec::Vec[McpServerInfo] {
+    var out: vec::Vec[McpServerInfo] = vec::new::[McpServerInfo]();
+    let arr_opt: option::Option[json::Value] = match params.value(for_key: "mcpServers") {
+        option::Option::Some(v) => option::Option[json::Value]::Some(v),
+        option::Option::None => params.value(for_key: "servers"),
+    };
+    if let option::Option::Some(arr) = arr_opt {
+        var i: usize = 0 as usize;
+        while i < arr.item_count() {
+            if let option::Option::Some(item) = arr.item(at: i) {
+                let nm: text::Text = item.field_str("name", "");
+                if !nm.is_empty() {
+                    var st: text::Text = item.field_str("status", "");
+                    if st.is_empty() {
+                        if item.field_bool("connected", false) {
+                            st = text::from_str("connected");
+                        } else {
+                            st = text::from_str("configured");
+                        }
+                    }
+                    let _ = out.append(McpServerInfo { name: nm, status: st });
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+    return out;
+}
+
+fn decode_queue_changed(params: json::Value) -> QueueState {
+    let sid: text::Text = params.field_str("sessionId", "");
+    var entries: vec::Vec[text::Text] = vec::new::[text::Text]();
+    if let option::Option::Some(arr) = params.value(for_key: "entries") {
+        let n: usize = arr.item_count();
+        var i: usize = 0 as usize;
+        while i < n {
+            if let option::Option::Some(item) = arr.item(at: i) {
+                let t: text::Text = item.field_str("text", "");
+                if !t.is_empty() {
+                    let _ = entries.append(t);
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+    return QueueState {
+        session_id: sid,
+        entries: entries,
+    };
+}
+
+fn _decode_git_files(arr: json::Value) -> vec::Vec[GitFileChange] {
+    var out: vec::Vec[GitFileChange] = vec::new::[GitFileChange]();
+    var i: usize = 0 as usize;
+    while i < arr.item_count() {
+        if let option::Option::Some(item) = arr.item(at: i) {
+            let _ = out.append(GitFileChange {
+                path: item.field_str("path", ""),
+                change_type: item.field_str("type", ""),
+                additions: item.field_number("additions", 0.0f64) as i64,
+                deletions: item.field_number("deletions", 0.0f64) as i64,
+            });
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _decode_git_status_obj(inner: json::Value) -> GitStatusInfo {
+    var info: GitStatusInfo = GitStatusInfo::empty();
+    let root: text::Text = inner.field_str("root", "");
+    let branch: text::Text = inner.field_str("branch", "");
+    if root.is_empty() && branch.is_empty() {
+        return info;
+    }
+    info.is_repo = true;
+    info.branch = branch;
+    if let option::Option::Some(st) = inner.value(for_key: "staged") {
+        info.staged = _decode_git_files(st);
+    }
+    if let option::Option::Some(un) = inner.value(for_key: "unstaged") {
+        info.unstaged = _decode_git_files(un);
+    }
+    return info;
+}
+
+fn decode_git_status(result_val: json::Value) -> GitStatusInfo {
+    if let option::Option::Some(v) = result_val.value(for_key: "result") {
+        return _decode_git_status_obj(v);
+    }
+    return _decode_git_status_obj(result_val);
+}
+
+fn decode_session_info(result_val: json::Value) -> SessionContextInfo {
+    var info: SessionContextInfo = SessionContextInfo::empty();
+    info.model_id = result_val.field_str("model", "");
+    if info.model_id.is_empty() {
+        info.model_id = result_val.field_str("modelId", "");
+    }
+    if let option::Option::Some(ctx) = result_val.value(for_key: "context") {
+        info.used_tokens = ctx.field_number("used", 0.0f64) as i64;
+        if info.used_tokens == (0 as i64) {
+            info.used_tokens = ctx.field_number("tokensUsed", 0.0f64) as i64;
+        }
+        info.total_tokens = ctx.field_number("total", 0.0f64) as i64;
+        if info.total_tokens == (0 as i64) {
+            info.total_tokens = ctx.field_number("tokensTotal", 0.0f64) as i64;
+        }
+        if let option::Option::Some(pv) = ctx.value(for_key: "percent") {
+            if let option::Option::Some(p) = pv.as_number() {
+                info.percent = p;
+                info.has_context = true;
+            }
+        } else {
+            if info.total_tokens > (0 as i64) {
+                info.percent = ((info.used_tokens as f64) / (info.total_tokens as f64)) * 100.0f64;
+                info.has_context = true;
+            }
+        }
+    }
+    return info;
+}
+
+fn decode_prompt_result(result_val: json::Value) -> PromptResult {
+    let sr_str: text::Text = result_val.field_str("stopReason", "");
+    var total_tokens: i64 = 0 as i64;
+    var input_tokens: i64 = 0 as i64;
+    var model_id: text::Text = text::from_str("");
+    if let option::Option::Some(meta) = result_val.value(for_key: "_meta") {
+        total_tokens = meta.field_number("totalTokens", 0.0f64) as i64;
+        input_tokens = meta.field_number("inputTokens", 0.0f64) as i64;
+        model_id = meta.field_str("modelId", "");
+    }
+    return PromptResult {
+        stop_reason: StopReason::from_str(sr_str.view()),
+        total_tokens: total_tokens,
+        input_tokens: input_tokens,
+        model_id: model_id,
+    };
+}
+
+fn _cap_text(take t: text::Text, max_bytes: usize) -> text::Text {
+    if t.count() <= max_bytes { return t; }
+    if let option::Option::Some(sl) = t.view().slice(from: 0 as usize, to: max_bytes) {
+        return "${sl}\n… (truncated)";
+    }
+    return t;
+}
+
+fn _decode_tool_call_info(u: json::Value) -> ToolCallInfo {
+    let id: text::Text = u.field_str("toolCallId", "");
+    let title: text::Text = u.field_str("title", "");
+
+    var has_kind: bool = false;
+    var kind_str: text::Text = text::from_str("");
+    if let option::Option::Some(ks) = _opt_str_field(u, "kind") {
+        has_kind = true;
+        kind_str = ks;
+    }
+    let kind: ToolKind = if has_kind { ToolKind::from_str(kind_str.view()) } else { ToolKind::Other };
+
+    var has_status: bool = false;
+    var status_str: text::Text = text::from_str("");
+    if let option::Option::Some(ss) = _opt_str_field(u, "status") {
+        has_status = true;
+        status_str = ss;
+    }
+    let status: ToolStatus = if has_status { ToolStatus::from_str(status_str.view()) } else { ToolStatus::Pending };
+
+    let raw_input_json: text::Text = match u.value(for_key: "rawInput") {
+        option::Option::Some(ri) => if ri.is_null() { text::from_str("") } else { ri.to_text() },
+        option::Option::None => text::from_str(""),
+    };
+
+    var output_text: text::Text = text::from_str("");
+    var diff_path: text::Text = text::from_str("");
+    var diff_old: text::Text = text::from_str("");
+    var diff_new: text::Text = text::from_str("");
+    var family: text::Text = text::from_str("");
+
+    // Extract diff or text content items if present.
+    if let option::Option::Some(content_arr) = u.value(for_key: "content") {
+        let cn: usize = content_arr.item_count();
+        var i: usize = 0 as usize;
+        while i < cn {
+            if let option::Option::Some(ci) = content_arr.item(at: i) {
+                let ctype: text::Text = ci.field_str("type", "");
+                if ctype.equals("diff") {
+                    diff_path = ci.field_str("path", "");
+                    diff_old = ci.field_str("oldText", "");
+                    diff_new = ci.field_str("newText", "");
+                } else if ctype.equals("content") {
+                    if let option::Option::Some(inner) = ci.value(for_key: "content") {
+                        let txt: text::Text = inner.field_str("text", "");
+                        if !txt.is_empty() {
+                            output_text = txt;
+                        }
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    // Extract family-specific fields from rawOutput (overrides/supplements content).
+    if let option::Option::Some(ro) = u.value(for_key: "rawOutput") {
+        if ro.is_object() {
+            family = ro.field_str("type", "");
+            if family.equals("Bash") {
+                let prompt_out: text::Text = ro.field_str("output_for_prompt", "");
+                if !prompt_out.is_empty() {
+                    output_text = prompt_out;
+                }
+            } else if family.equals("SearchReplace") {
+                if let option::Option::Some(ea) = ro.value(for_key: "EditsApplied") {
+                    if diff_old.is_empty() && diff_new.is_empty() {
+                        diff_old = ea.field_str("old_string", "");
+                        diff_new = ea.field_str("new_string", "");
+                    }
+                    let summary: text::Text = ea.field_str("tool_output_for_prompt", "");
+                    if !summary.is_empty() {
+                        output_text = summary;
+                    }
+                }
+            } else if family.equals("SearchTool") {
+                let sc: text::Text = ro.field_str("content", "");
+                if !sc.is_empty() {
+                    output_text = sc;
+                }
+            }
+        }
+    }
+
+    var tool_not_run: text::Text = text::from_str("");
+    if let option::Option::Some(meta) = u.value(for_key: "_meta") {
+        tool_not_run = meta.field_str("toolNotRun", "");
+    }
+
+    return ToolCallInfo {
+        tool_call_id: id,
+        title: title,
+        kind: kind,
+        has_kind: has_kind,
+        status: status,
+        has_status: has_status,
+        raw_input_json: _cap_text(raw_input_json, 4096 as usize),
+        output_text: _cap_text(output_text, 8192 as usize),
+        diff_path: diff_path,
+        diff_old: diff_old,
+        diff_new: diff_new,
+        tool_not_run: tool_not_run,
+        family: family,
+    };
+}
+
+fn _chunk_text(u: json::Value) -> text::Text {
+    guard let option::Option::Some(c) = u.value(for_key: "content") else {
+        return text::from_str("");
+    };
+    return c.field_str("text", "");
+}
+
+fn decode_plan_entries(arr: json::Value) -> vec::Vec[PlanEntry] {
+    var out: vec::Vec[PlanEntry] = vec::new::[PlanEntry]();
+    let n: usize = arr.item_count();
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(item) = arr.item(at: i) {
+            var content: text::Text = item.field_str("content", "");
+            if content.is_empty() { content = item.field_str("title", ""); }
+            if content.is_empty() { content = item.field_str("text", ""); }
+            if !content.is_empty() {
+                let st: text::Text = item.field_str("status", "");
+                let _ = out.append(PlanEntry {
+                    content: content,
+                    priority: item.field_str("priority", ""),
+                    status: PlanStatus::from_str(st.view()),
+                });
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn decode_session_update(params: json::Value) -> option::Option[SessionUpdateEnvelope] {
+    let sid: text::Text = params.field_str("sessionId", "");
+    if sid.is_empty() {
+        return option::Option[SessionUpdateEnvelope]::None;
+    }
+    guard let option::Option::Some(u) = params.value(for_key: "update") else {
+        return option::Option[SessionUpdateEnvelope]::None;
+    };
+    let kind_str: text::Text = u.field_str("sessionUpdate", "");
+
+    if kind_str.equals("agent_message_chunk") {
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::AgentMessageChunk(_chunk_text(u)),
+        });
+    }
+    if kind_str.equals("agent_thought_chunk") {
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::AgentThoughtChunk(_chunk_text(u)),
+        });
+    }
+    if kind_str.equals("user_message_chunk") {
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::UserMessageChunk(_chunk_text(u)),
+        });
+    }
+    if kind_str.equals("tool_call") {
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::ToolCall(_decode_tool_call_info(u)),
+        });
+    }
+    if kind_str.equals("tool_call_update") {
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::ToolCallUpdate(_decode_tool_call_info(u)),
+        });
+    }
+    if kind_str.equals("plan") {
+        let entries: vec::Vec[PlanEntry] = match u.value(for_key: "entries") {
+            option::Option::Some(v) => decode_plan_entries(v),
+            option::Option::None => vec::new::[PlanEntry](),
+        };
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::Plan(entries),
+        });
+    }
+    if kind_str.equals("session_info_update") {
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::SessionInfoUpdate(u.field_str("title", "")),
+        });
+    }
+    if kind_str.equals("config_option_update") {
+        let opts: vec::Vec[ConfigOption] = match u.value(for_key: "configOptions") {
+            option::Option::Some(v) => decode_config_options(v),
+            option::Option::None => vec::new::[ConfigOption](),
+        };
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::ConfigOptionUpdate(opts),
+        });
+    }
+    if kind_str.equals("available_commands_update") {
+        let cmds: vec::Vec[AvailableCommand] = match u.value(for_key: "availableCommands") {
+            option::Option::Some(v) => decode_available_commands(v),
+            option::Option::None => vec::new::[AvailableCommand](),
+        };
+        return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+            session_id: sid,
+            update: SessionUpdate::AvailableCommandsUpdate(cmds),
+        });
+    }
+
+    return option::Option[SessionUpdateEnvelope]::Some(SessionUpdateEnvelope {
+        session_id: sid,
+        update: SessionUpdate::Unknown(kind_str, u.to_text()),
+    });
+}
+
+fn decode_permission_request(rpc_id: wire::JsonRpcId, params: json::Value) -> option::Option[PermissionRequest] {
+    let sid: text::Text = params.field_str("sessionId", "");
+    if sid.is_empty() {
+        return option::Option[PermissionRequest]::None;
+    }
+
+    var tool_call_id: text::Text = text::from_str("");
+    var title: text::Text = text::from_str("");
+    var kind: ToolKind = ToolKind::Other;
+    var command: text::Text = text::from_str("");
+    var description: text::Text = text::from_str("");
+
+    var kind_str: text::Text = text::from_str("");
+    if let option::Option::Some(tc) = params.value(for_key: "toolCall") {
+        tool_call_id = tc.field_str("toolCallId", "");
+        title = tc.field_str("title", "");
+        kind_str = tc.field_str("kind", "");
+        if let option::Option::Some(ri) = tc.value(for_key: "rawInput") {
+            command = ri.field_str("command", "");
+            description = ri.field_str("description", "");
+        }
+    }
+    if !kind_str.is_empty() {
+        kind = ToolKind::from_str(kind_str.view());
+    }
+
+    var options: vec::Vec[PermissionOption] = vec::new::[PermissionOption]();
+    if let option::Option::Some(arr) = params.value(for_key: "options") {
+        let n: usize = arr.item_count();
+        var i: usize = 0 as usize;
+        while i < n {
+            if let option::Option::Some(item) = arr.item(at: i) {
+                let ks: text::Text = item.field_str("kind", "");
+                let _ = options.append(PermissionOption {
+                    option_id: item.field_str("optionId", ""),
+                    kind: PermissionKind::from_str(ks.view()),
+                    name: item.field_str("name", ""),
+                });
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    return option::Option[PermissionRequest]::Some(PermissionRequest {
+        rpc_id: rpc_id.clone(),
+        session_id: sid,
+        tool_call_id: tool_call_id,
+        title: title,
+        kind: kind,
+        command: command,
+        description: description,
+        options: options,
+    });
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn decode_unknown_update_preserves_raw_json() {
+    let raw: str = "{\"sessionId\":\"s1\",\"update\":{\"sessionUpdate\":\"future_widget\",\"foo\":123}}";
+    guard let result::Result::Ok(v) = json::Value::parse(source: raw) else { assert false; return; };
+    guard let option::Option::Some(env) = decode_session_update(v) else { assert false; return; };
+    assert env.session_id.equals("s1");
+    match env.update {
+        SessionUpdate::Unknown(k, body) => {
+            assert k.equals("future_widget");
+            assert body.contains("123");
+        }
+        _other => { assert false; }
+    }
+}
+
+#[test]
+fn decode_permission_request_extracts_options() {
+    let raw: str = "{\"sessionId\":\"s2\",\"toolCall\":{\"toolCallId\":\"tc1\",\"kind\":\"execute\",\"title\":\"Execute `rm a.txt`\",\"rawInput\":{\"command\":\"rm a.txt\",\"description\":\"Remove a.txt\"}},\"options\":[{\"optionId\":\"allow-once\",\"kind\":\"allow_once\",\"name\":\"Yes, proceed\"},{\"optionId\":\"reject-once\",\"kind\":\"reject_once\",\"name\":\"No\"}]}";
+    guard let result::Result::Ok(v) = json::Value::parse(source: raw) else { assert false; return; };
+    guard let option::Option::Some(req) = decode_permission_request(wire::JsonRpcId::Num(9 as i64), v) else {
+        assert false;
+        return;
+    };
+    assert req.rpc_id.equals_num(9 as i64);
+    assert req.session_id.equals("s2");
+    assert req.tool_call_id.equals("tc1");
+    assert req.command.equals("rm a.txt");
+    assert req.options.count() == (2 as usize);
+}
+
+#[test]
+fn decode_billing_handles_nested_legacy_and_missing_percent() {
+    // Nested grok 1.0.92 shape
+    let nested: str = "{\"config\":{\"creditUsagePercent\":42.5,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"end\":\"2026-11-29T09:00:00Z\"},\"prepaidBalance\":{\"val\":1250}},\"subscription_tier\":\"SuperGrok\"}";
+    guard let result::Result::Ok(v1) = json::Value::parse(source: nested) else { assert false; return; };
+    let b1: BillingSnapshot = decode_billing(v1);
+    assert b1.available && b1.has_percent && b1.period_label.equals("Weekly");
+    assert (b1.usage_percent as i64) == (42 as i64);
+    assert b1.has_prepaid && b1.prepaid_cents == (1250 as i64);
+    assert b1.subscription_tier.equals("SuperGrok");
+
+    // Legacy shape
+    let legacy: str = "{\"monthlyLimit\":1000,\"usage\":{\"totalUsed\":250},\"subscription_tier\":\"SuperGrok Heavy\"}";
+    guard let result::Result::Ok(v2) = json::Value::parse(source: legacy) else { assert false; return; };
+    let b2: BillingSnapshot = decode_billing(v2);
+    assert b2.has_percent && b2.period_label.equals("Monthly");
+    assert (b2.usage_percent as i64) == (25 as i64);
+
+    // Missing percent -> unknown, NOT 0%
+    let missing: str = "{\"config\":{\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\"}},\"subscription_tier\":\"SuperGrok\"}";
+    guard let result::Result::Ok(v3) = json::Value::parse(source: missing) else { assert false; return; };
+    let b3: BillingSnapshot = decode_billing(v3);
+    assert b3.available && !b3.has_percent;
+}
+
+#[test]
+fn decode_plan_update_extracts_entries_and_statuses() {
+    let raw: str = "{\"sessionId\":\"s9\",\"update\":{\"sessionUpdate\":\"plan\",\"entries\":[{\"content\":\"Read repo\",\"priority\":\"high\",\"status\":\"completed\"},{\"content\":\"Edit code\",\"status\":\"in_progress\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}}";
+    guard let result::Result::Ok(v) = json::Value::parse(source: raw) else { assert false; return; };
+    guard let option::Option::Some(env) = decode_session_update(v) else { assert false; return; };
+    assert env.session_id.equals("s9");
+    match env.update {
+        SessionUpdate::Plan(entries) => {
+            assert entries.count() == (3 as usize);
+            guard let option::Option::Some(e0) = entries.at_ptr(0 as usize) else { assert false; return; };
+            guard let option::Option::Some(e1) = entries.at_ptr(1 as usize) else { assert false; return; };
+            guard let option::Option::Some(e2) = entries.at_ptr(2 as usize) else { assert false; return; };
+            assert (*e0).content.equals("Read repo") && (*e0).status == PlanStatus::Completed;
+            assert (*e1).content.equals("Edit code") && (*e1).status == PlanStatus::InProgress;
+            assert (*e2).content.equals("Run tests") && (*e2).status == PlanStatus::Pending;
+        }
+        _other => { assert false; }
+    }
+}

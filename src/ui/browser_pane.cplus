@@ -1,0 +1,777 @@
+// src/ui/browser_pane.cplus — built-in Browser pane in the conversation inspector.
+//
+// Provides an isolated (non-persistent) native WKWebView (`facet/web` +
+// `facet/web_driver`) with Back / Forward / Reload, an address bar, an agent
+// Take Over banner, and a document-start script that captures console logs,
+// uncaught errors, and failed fetch requests for the `desk420-browser` MCP server.
+
+import "events/events" as events;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/mount" as mount;
+import "facet/symbol" as m_symbol;
+import "facet/text_button" as m_text_button;
+import "facet/text_field" as m_text_field;
+import "facet/vocabulary" as vocab;
+import "facet/web" as m_web;
+import "facet/web_driver" as web_driver;
+import "flex_layout/flex_layout" as flex;
+import "json/json" as json;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../store/prefs" as prefs;
+import "./panels" as panels;
+import "./style" as style;
+
+const CONSOLE_CAPTURE_JS: str = "(function(){if(window.__d420_hooked)return;window.__d420_hooked=true;window.__d420_logs=[];window.__d420_net=[];function push(lvl,args){try{var s=Array.prototype.map.call(args,function(a){if(typeof a==='string')return a;try{return JSON.stringify(a);}catch(e){return String(a);}}).join(' ');window.__d420_logs.push('['+lvl+'] '+s);if(window.__d420_logs.length>200)window.__d420_logs.shift();}catch(e){}}function pushNet(entry){try{window.__d420_net.push(entry);if(window.__d420_net.length>100)window.__d420_net.shift();}catch(e){}}['log','warn','error','info'].forEach(function(m){var orig=console[m];console[m]=function(){push(m,arguments);if(orig)orig.apply(console,arguments);};});window.addEventListener('error',function(e){push('uncaught',[e.message||String(e)]);});window.addEventListener('unhandledrejection',function(e){push('rejection',[e.reason?String(e.reason):'unhandled rejection']);});var origFetch=window.fetch;if(origFetch){window.fetch=function(){var u=arguments[0]&&arguments[0].url?arguments[0].url:String(arguments[0]||'');var m=(arguments[1]&&arguments[1].method)||'GET';var t0=Date.now();return origFetch.apply(this,arguments).then(function(r){var dt=Date.now()-t0;if(!r.ok){push('network',['HTTP '+r.status+' '+u]);pushNet({kind:'fetch',method:m,url:u,status:r.status,ms:dt,failed:true});}else if(dt>=500){pushNet({kind:'fetch',method:m,url:u,status:r.status,ms:dt,slow:true});}return r;},function(err){var dt=Date.now()-t0;push('network',['FAILED '+u+': '+String(err)]);pushNet({kind:'fetch',method:m,url:u,status:0,ms:dt,failed:true,error:String(err)});throw err;});};}if(window.XMLHttpRequest){var xo=XMLHttpRequest.prototype.open;var xs=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this.__d420_m=m;this.__d420_u=String(u||'');return xo.apply(this,arguments);};XMLHttpRequest.prototype.send=function(){var self=this;var t0=Date.now();self.addEventListener('loadend',function(){var dt=Date.now()-t0;if(self.status===0||self.status>=400){pushNet({kind:'xhr',method:self.__d420_m||'GET',url:self.__d420_u||'',status:self.status,ms:dt,failed:true});}else if(dt>=500){pushNet({kind:'xhr',method:self.__d420_m||'GET',url:self.__d420_u||'',status:self.status,ms:dt,slow:true});}});return xs.apply(this,arguments);};}})();";
+
+fn _is_localhost_input(s: str) -> bool {
+    return s == "localhost"
+        || s.has_prefix("localhost:")
+        || s.has_prefix("localhost/")
+        || s.has_prefix("127.0.0.1")
+        || s.has_prefix("[::1]");
+}
+
+fn normalize_url(raw: str) -> text::Text {
+    let trimmed: str = raw.trim();
+    if trimmed.is_empty() { return text::from_str(""); }
+    if trimmed.has_prefix("http://")
+        || trimmed.has_prefix("https://")
+        || trimmed.has_prefix("file://")
+        || trimmed.has_prefix("about:") {
+        return text::from_str(trimmed);
+    }
+    if trimmed.has_prefix(":") {
+        return "http://localhost${trimmed}";
+    }
+    if _is_localhost_input(trimmed) {
+        return "http://${trimmed}";
+    }
+    return "https://${trimmed}";
+}
+
+const EV_SHOW_BROWSER_TAB: str = "desk420.chat.show_browser_tab";
+
+struct BrowserTab {
+    title: text::Text,
+    url: text::Text,
+}
+
+const MAX_TAB_SLOTS: usize = 6 as usize;
+
+fn _tab_label_for(title: str, url: str) -> text::Text {
+    if title != "" { return text::from_str(title); }
+    if url == "" { return text::from_str("New Tab"); }
+    var s: str = url;
+    if s.has_prefix("https://") {
+        if let option::Option::Some(r) = s.slice(from: 8 as usize, to: s.count()) { s = r; }
+    } else if s.has_prefix("http://") {
+        if let option::Option::Some(r) = s.slice(from: 7 as usize, to: s.count()) { s = r; }
+    }
+    if let option::Option::Some(sl) = s.find("/") {
+        if sl > (0 as usize) {
+            if let option::Option::Some(h) = s.slice(from: 0 as usize, to: sl) { s = h; }
+        }
+    }
+    if s.is_empty() { return text::from_str("New Tab"); }
+    return text::from_str(s);
+}
+
+// Module-private browser state so MCP tools, deep links, and chat cards can
+// drive the singleton browser pane without holding a raw `*BrowserPane`.
+struct _BrowserState {
+    mounted: bool,
+    tabs: vec::Vec[BrowserTab],
+    active_tab: usize,
+    current_url: text::Text,
+    has_page: bool,
+    loading: bool,
+    agent_driving: bool,
+    taken_over: bool,
+    hook_installed: bool,
+    pending_origin: text::Text,
+    origin_cb: fn(bool, *u8),
+    opaque origin_ctx: *u8,
+}
+
+static _STATE_LIVE: bool = false;
+static _STATE: _BrowserState = #zero::[_BrowserState]();
+
+fn _ensure_state() {
+    if !_STATE_LIVE {
+        var init_tabs: vec::Vec[BrowserTab] = vec::new::[BrowserTab]();
+        let _ = init_tabs.append(BrowserTab { title: text::from_str("New Tab"), url: text::from_str("") });
+        _STATE = _BrowserState {
+            mounted: false,
+            tabs: init_tabs,
+            active_tab: 0 as usize,
+            current_url: text::from_str(""),
+            has_page: false,
+            loading: false,
+            agent_driving: false,
+            taken_over: false,
+            hook_installed: false,
+            pending_origin: text::from_str(""),
+            origin_cb: #zero::[fn(bool, *u8)](),
+            origin_ctx: 0 as *u8,
+        };
+        _STATE_LIVE = true;
+    }
+}
+
+fn _ensure_hook() {
+    _ensure_state();
+    if _STATE.hook_installed { return; }
+    if let option::Option::Some(w) = m_web::find("web:view") {
+        let wn: *core::Node = w.node();
+        if wn.is_not_null() && core::native(wn).is_not_null() {
+            web_driver::add_user_script(wn, CONSOLE_CAPTURE_JS);
+            _STATE.hook_installed = true;
+        }
+    }
+}
+
+fn _sync_view() {
+    _ensure_state();
+    _ensure_hook();
+    style::show("browser:empty", !_STATE.has_page);
+    style::show("web:view", _STATE.has_page);
+    style::show("web:agent_bar", _STATE.agent_driving || _STATE.taken_over);
+    style::show("web:origin_bar", !_STATE.pending_origin.is_empty());
+    if !_STATE.pending_origin.is_empty() {
+        let prompt_lbl: text::Text = "Allow Grok to open ${_STATE.pending_origin.view()}?";
+        style::set_label("web:origin_label", prompt_lbl.view());
+    }
+    if _STATE.taken_over {
+        style::set_label("web:agent_label", "You took over — Grok paused");
+        if let option::Option::Some(btn) = m_text_button::find("web:takeover") {
+            let _b: m_text_button::TextButton = btn.set_title("Hand back");
+        }
+        if let option::Option::Some(bar) = mount::find("web:agent_bar") {
+            core::set_background_color(bar, style::chip());
+        }
+        if let option::Option::Some(dn) = mount::find("web:agent_dot") {
+            core::set_background_color(dn, style::muted());
+        }
+    } else if _STATE.agent_driving {
+        style::set_label("web:agent_label", "Grok is driving this page");
+        if let option::Option::Some(btn) = m_text_button::find("web:takeover") {
+            let _b: m_text_button::TextButton = btn.set_title("Take over");
+        }
+        if let option::Option::Some(bar) = mount::find("web:agent_bar") {
+            core::set_background_color(bar, style::lime_wash());
+        }
+        if let option::Option::Some(dn) = mount::find("web:agent_dot") {
+            core::set_background_color(dn, style::lime());
+        }
+    }
+    var can_back: bool = false;
+    var can_fwd: bool = false;
+    if let option::Option::Some(w) = m_web::find("web:view") {
+        can_back = w.can_go_back();
+        can_fwd = w.can_go_forward();
+    }
+    if let option::Option::Some(sym) = m_symbol::find("web:back:sym") {
+        let _s: m_symbol::Symbol = sym.set_color(if can_back { style::ink() } else { style::faint() });
+    }
+    if let option::Option::Some(sym) = m_symbol::find("web:forward:sym") {
+        let _s: m_symbol::Symbol = sym.set_color(if can_fwd { style::ink() } else { style::faint() });
+    }
+    var ti: usize = 0 as usize;
+    while ti < MAX_TAB_SLOTS {
+        let tk: text::Text = "web:tab:${ti}";
+        let lk: text::Text = "web:tab_label:${ti}";
+        let ck: text::Text = "web:tab_close:${ti}";
+        let exists: bool = ti < _STATE.tabs.count();
+        style::show(tk.view(), exists);
+        if exists {
+            if let option::Option::Some(tp) = _STATE.tabs.at_ptr(ti) {
+                let lbl: text::Text = _tab_label_for((*tp).title.view(), (*tp).url.view());
+                style::set_label(lk.view(), lbl.view());
+            }
+            let is_cur: bool = ti == _STATE.active_tab;
+            if let option::Option::Some(tn) = mount::find(tk.view()) {
+                core::set_background_color(tn, if is_cur { style::chip() } else { vocab::Color::clear() });
+            }
+            style::show(ck.view(), _STATE.tabs.count() > (1 as usize));
+        }
+        ti = ti +% (1 as usize);
+    }
+    style::show("web:tab_new", _STATE.tabs.count() < MAX_TAB_SLOTS);
+}
+
+fn _save_active_tab() {
+    _ensure_state();
+    if let option::Option::Some(tp) = _STATE.tabs.at_ptr(_STATE.active_tab) {
+        (*tp).url = _STATE.current_url.clone();
+        if !_STATE.loading {
+            if let option::Option::Some(w) = m_web::find("web:view") {
+                let t: text::Text = web_driver::current_title(w.node());
+                if !t.is_empty() { (*tp).title = t; }
+            }
+        }
+    }
+}
+
+fn _open_url_in_active_tab(raw_url: str) {
+    _ensure_state();
+    let url: text::Text = normalize_url(raw_url);
+    if url.is_empty() { return; }
+    _ensure_hook();
+    _STATE.current_url = url.clone();
+    _STATE.has_page = true;
+    _STATE.loading = true;
+    if let option::Option::Some(tp) = _STATE.tabs.at_ptr(_STATE.active_tab) {
+        (*tp).url = url.clone();
+        (*tp).title = _tab_label_for("", url.view());
+    }
+    if let option::Option::Some(tf) = m_text_field::find("web:url") {
+        let _tf: m_text_field::TextField = tf.set_text(url.view());
+    }
+    if let option::Option::Some(w) = m_web::find("web:view") {
+        let _w: m_web::Web = w.set_source(url.view());
+    }
+    _sync_view();
+}
+
+fn _reset_to_empty() {
+    _STATE.current_url = text::from_str("");
+    _STATE.has_page = false;
+    _STATE.loading = false;
+    if let option::Option::Some(tf) = m_text_field::find("web:url") {
+        let _tf: m_text_field::TextField = tf.set_text("");
+    }
+    _sync_view();
+}
+
+fn _show_browser_tab() {
+    panels::show_panel();
+    events::emit(EV_SHOW_BROWSER_TAB);
+}
+
+fn _select_tab(idx: usize) {
+    _ensure_state();
+    if idx >= _STATE.tabs.count() { return; }
+    _save_active_tab();
+    _STATE.active_tab = idx;
+    var next_url: text::Text = text::from_str("");
+    if let option::Option::Some(tp) = _STATE.tabs.at_ptr(idx) {
+        next_url = (*tp).url.clone();
+    }
+    if next_url.is_empty() {
+        _reset_to_empty();
+    } else {
+        _open_url_in_active_tab(next_url.view());
+    }
+}
+
+fn _new_tab(raw_url: str = "") {
+    _ensure_state();
+    if _STATE.tabs.count() >= MAX_TAB_SLOTS {
+        if raw_url != "" { _open_url_in_active_tab(raw_url); }
+        return;
+    }
+    _save_active_tab();
+    let norm: text::Text = normalize_url(raw_url);
+    let _ = _STATE.tabs.append(BrowserTab { title: text::from_str("New Tab"), url: norm.clone() });
+    _STATE.active_tab = _STATE.tabs.count() -% (1 as usize);
+    if norm.is_empty() {
+        _reset_to_empty();
+    } else {
+        _open_url_in_active_tab(norm.view());
+    }
+}
+
+fn _close_tab(idx: usize) {
+    _ensure_state();
+    if _STATE.tabs.count() <= (1 as usize) || idx >= _STATE.tabs.count() { return; }
+    let _ = _STATE.tabs.remove(at: idx);
+    if _STATE.active_tab >= _STATE.tabs.count() {
+        _STATE.active_tab = _STATE.tabs.count() -% (1 as usize);
+    }
+    var next_url: text::Text = text::from_str("");
+    if let option::Option::Some(tp) = _STATE.tabs.at_ptr(_STATE.active_tab) {
+        next_url = (*tp).url.clone();
+    }
+    if next_url.is_empty() {
+        _reset_to_empty();
+    } else {
+        _open_url_in_active_tab(next_url.view());
+    }
+}
+
+fn _tabs_json() -> text::Text {
+    _ensure_state();
+    _save_active_tab();
+    var items: vec::Vec[json::Value] = vec::new::[json::Value]();
+    var i: usize = 0 as usize;
+    while i < _STATE.tabs.count() {
+        if let option::Option::Some(tp) = _STATE.tabs.at_ptr(i) {
+            let lbl: text::Text = _tab_label_for((*tp).title.view(), (*tp).url.view());
+            var obj: vec::Vec[json::Member] = vec::new::[json::Member]();
+            let _ = obj.append(json::Member::new("index", json::Value::number(i as f64)));
+            let _ = obj.append(json::Member::new("active", json::Value::boolean(i == _STATE.active_tab)));
+            let _ = obj.append(json::Member::new("title", json::Value::text(lbl.view())));
+            let _ = obj.append(json::Member::new("url", json::Value::text((*tp).url.view())));
+            let _ = items.append(json::Value::object(obj));
+        }
+        i = i +% (1 as usize);
+    }
+    return json::Value::array(items).to_text();
+}
+
+fn _resolve_origin(allowed: bool) {
+    _ensure_state();
+    let cb: fn(bool, *u8) = _STATE.origin_cb;
+    let ctx: *u8 = _STATE.origin_ctx;
+    _STATE.pending_origin = text::from_str("");
+    _STATE.origin_cb = #zero::[fn(bool, *u8)]();
+    _STATE.origin_ctx = 0 as *u8;
+    _sync_view();
+    if cb.is_not_null() {
+        cb(allowed, ctx);
+    }
+}
+
+struct BrowserPane {}
+
+impl BrowserPane {
+    fn new() -> BrowserPane {
+        _ensure_state();
+        return BrowserPane {};
+    }
+
+    fn _build_tab_slot(ref this, idx: usize) -> core::Node {
+        let tk: text::Text = "web:tab:${idx}";
+        let lk: text::Text = "web:tab_label:${idx}";
+        let ck: text::Text = "web:tab_close:${idx}";
+        return @ui {
+            hstack(key: tk.view()) {
+                label("Tab", key: lk.view(),
+                font_size: 11.5f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::ink(),
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                    .max_width(110.0f64)
+                    .shrink(1.0f64)
+                    .set_input_transparent(true)
+                style::circle_icon(icons::close, ck.view(),
+                title: "Close tab",
+                size: 16.0f64, icon_size: 11.0f64,
+                color: style::muted(),
+                on_click: this.on_close_tab)
+            }
+            .height(24.0f64)
+                .align(flex::Align::Center)
+                .gap(4.0f64)
+                .padding_edge(flex::Edge::Left, 9.0f64)
+                .padding_edge(flex::Edge::Right, 5.0f64)
+                .set_background_color(style::chip())
+                .set_corner_radius(vocab::Corners::all(6.0f64))
+                .gesture(on_click: this.on_select_tab)
+        };
+    }
+
+    fn build(ref this) -> core::Node {
+        // Isolate the built-in browser in a non-persistent WKWebsiteDataStore
+        // so it never shares the user's Safari cookies or logins.
+        web_driver::set_next_non_persistent(true);
+        return @ui {
+            column {
+                hstack(key: "web:tabs") {
+                    this._build_tab_slot(0 as usize)
+                    this._build_tab_slot(1 as usize)
+                    this._build_tab_slot(2 as usize)
+                    this._build_tab_slot(3 as usize)
+                    this._build_tab_slot(4 as usize)
+                    this._build_tab_slot(5 as usize)
+                    style::circle_icon(icons::add, "web:tab_new",
+                    title: "New tab",
+                    size: 24.0f64, icon_size: 15.0f64,
+                    color: style::muted(),
+                    on_click: this.on_new_tab)
+                    spacer().grow(1.0f64)
+                }
+                .height(32.0f64)
+                    .shrink(0.0f64)
+                    .align(flex::Align::Center)
+                    .gap(5.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                style::rule()
+
+                hstack {
+                    style::circle_icon(icons::arrow_back, "web:back",
+                    title: "Back",
+                    size: 28.0f64, icon_size: 16.5f64,
+                    color: style::faint(),
+                    on_click: this.on_back)
+                    style::circle_icon(icons::arrow_forward, "web:forward",
+                    title: "Forward",
+                    size: 28.0f64, icon_size: 16.5f64,
+                    color: style::faint(),
+                    on_click: this.on_forward)
+                    style::circle_icon(icons::refresh, "web:reload",
+                    title: "Reload",
+                    size: 28.0f64, icon_size: 16.5f64,
+                    color: style::muted(),
+                    on_click: this.on_reload)
+                    text_field("", key: "web:url",
+                    font_size: 12.5f64,
+                    placeholder: "Enter URL or localhost:port…",
+                    on_submit: this.on_url_submit)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(60.0f64)
+                        .height(28.0f64)
+                    style::circle_icon(icons::open_in_new, "web:open_external",
+                    title: "Open in system browser",
+                    size: 28.0f64, icon_size: 16.0f64,
+                    color: style::muted(),
+                    on_click: this.on_open_external)
+                }
+                .align(flex::Align::Center)
+                    .gap(4.0f64)
+                    .height(44.0f64)
+                    .shrink(0.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                style::rule()
+
+                hstack(key: "web:agent_bar") {
+                    style::dot(7.0f64, style::lime(), key: "web:agent_dot")
+                    label("Grok is driving this page", key: "web:agent_label",
+                    font_size: 12.0f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                    text_button("Take over", key: "web:takeover",
+                    font_size: 12.0f64,
+                    font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::lime_text(),
+                    bordered: false,
+                    on_click: this.on_takeover)
+                        .shrink(0.0f64)
+                }
+                .align(flex::Align::Center)
+                    .gap(8.0f64)
+                    .height(34.0f64)
+                    .shrink(0.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                    .set_background_color(style::lime_wash())
+
+                hstack(key: "web:origin_bar") {
+                    symbol(icons::warning, size: 15.0f64, color: style::lime_text())
+                        .shrink(0.0f64)
+                    label("Allow Grok to open external site?", key: "web:origin_label",
+                    font_size: 12.0f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                    text_button("Allow", key: "web:origin_allow",
+                    font_size: 12.0f64,
+                    font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::on_lime(),
+                    bordered: false,
+                    corner_radius: vocab::Corners::all(6.0f64),
+                    on_click: this.on_origin_allow)
+                        .padding_edge(flex::Edge::Horizontal, 9.0f64)
+                        .padding_edge(flex::Edge::Vertical, 4.0f64)
+                        .set_background_color(style::lime())
+                        .shrink(0.0f64)
+                    text_button("Deny", key: "web:origin_deny",
+                    font_size: 12.0f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::muted(),
+                    bordered: false,
+                    on_click: this.on_origin_deny)
+                        .shrink(0.0f64)
+                }
+                .align(flex::Align::Center)
+                    .gap(8.0f64)
+                    .height(38.0f64)
+                    .shrink(0.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                    .set_background_color(style::chip())
+
+                column(key: "browser:empty") {
+                    symbol(icons::language, size: 28.0f64, color: style::faint())
+                        .set_input_transparent(true)
+                    label("No page open yet",
+                    font_size: 14.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    text_align: vocab::TextAlign::Center)
+                    label("Enter a URL above or preview a local server.",
+                    font_size: 13.0f64,
+                    text_color: style::muted(),
+                    text_align: vocab::TextAlign::Center,
+                    line_break: vocab::LineBreak::WordWrap)
+                    style::outline_button("Open localhost:3000", "web:quick_local",
+                    height: 30.0f64,
+                    on_click: this.on_quick_local)
+                }
+                .grow(1.0f64)
+                    .align(flex::Align::Center)
+                    .justify(flex::Justify::Center)
+                    .gap(10.0f64)
+                    .padding(24.0f64)
+
+                web("", key: "web:view",
+                on_navigating: this.on_navigating,
+                on_navigated: this.on_navigated)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+        };
+    }
+
+    fn arm(ref this) {
+        _ensure_state();
+        _STATE.mounted = true;
+        _STATE.hook_installed = false;
+        _ensure_hook();
+        _sync_view();
+    }
+
+    fn disarm(ref this) {
+        _ensure_state();
+        _STATE.mounted = false;
+    }
+
+    fn sync(ref this) {
+        _sync_view();
+    }
+
+    fn on_new_tab(ref this, _sender: *u8) -> bool {
+        _new_tab("");
+        return true;
+    }
+
+    fn _tab_index_from(sender: *u8, prefix: str) -> option::Option[usize] {
+        let k: text::Text = component::key_of(sender);
+        let kv: str = k.view();
+        if !kv.has_prefix(prefix) { return option::Option[usize]::None; }
+        guard let option::Option::Some(rest) = kv.slice(from: prefix.count(), to: kv.count()) else {
+            return option::Option[usize]::None;
+        };
+        guard let option::Option::Some(n) = rest.to_i64() else { return option::Option[usize]::None; };
+        if n < (0 as i64) { return option::Option[usize]::None; }
+        return option::Option[usize]::Some(n as usize);
+    }
+
+    fn on_select_tab(ref this, sender: *u8) -> bool {
+        if let option::Option::Some(idx) = BrowserPane::_tab_index_from(sender, "web:tab:") {
+            _select_tab(idx);
+        }
+        return true;
+    }
+
+    fn on_close_tab(ref this, sender: *u8) -> bool {
+        if let option::Option::Some(idx) = BrowserPane::_tab_index_from(sender, "web:tab_close:") {
+            _close_tab(idx);
+        }
+        return true;
+    }
+
+    fn on_takeover(ref this, _sender: *u8) {
+        _ensure_state();
+        _STATE.taken_over = !_STATE.taken_over;
+        _sync_view();
+    }
+
+    fn on_origin_allow(ref this, _sender: *u8) {
+        _resolve_origin(true);
+    }
+
+    fn on_origin_deny(ref this, _sender: *u8) {
+        _resolve_origin(false);
+    }
+
+    fn on_url_submit(ref this, _sender: *u8) {
+        guard let option::Option::Some(tf) = m_text_field::find("web:url") else { return; };
+        let entered: text::Text = text::from_str(tf.text());
+        _open_url_in_active_tab(entered.view());
+    }
+
+    fn on_quick_local(ref this, _sender: *u8) {
+        _open_url_in_active_tab("http://localhost:3000");
+    }
+
+    fn on_back(ref this, _sender: *u8) -> bool {
+        if let option::Option::Some(w) = m_web::find("web:view") {
+            if w.can_go_back() { let _w: m_web::Web = w.go_back(); }
+        }
+        return true;
+    }
+
+    fn on_forward(ref this, _sender: *u8) -> bool {
+        if let option::Option::Some(w) = m_web::find("web:view") {
+            if w.can_go_forward() { let _w: m_web::Web = w.go_forward(); }
+        }
+        return true;
+    }
+
+    fn on_reload(ref this, _sender: *u8) -> bool {
+        _ensure_state();
+        if !_STATE.has_page { return true; }
+        if let option::Option::Some(w) = m_web::find("web:view") {
+            let _w: m_web::Web = w.reload();
+        }
+        return true;
+    }
+
+    fn on_open_external(ref this, _sender: *u8) -> bool {
+        _ensure_state();
+        if !_STATE.current_url.is_empty() {
+            prefs::open_url(_STATE.current_url.view());
+        }
+        return true;
+    }
+
+    fn on_navigating(ref this, _sender: *u8) {
+        _ensure_state();
+        _STATE.loading = true;
+        _sync_view();
+    }
+
+    fn on_navigated(ref this, _sender: *u8) {
+        _ensure_state();
+        _STATE.loading = false;
+        if let option::Option::Some(w) = m_web::find("web:view") {
+            let live: text::Text = web_driver::current_url(w.node());
+            let cur: str = if !live.is_empty() { live.view() } else { w.source() };
+            if cur != "" {
+                _STATE.current_url = text::from_str(cur);
+                if let option::Option::Some(tf) = m_text_field::find("web:url") {
+                    if !tf.is_focused() {
+                        let _tf: m_text_field::TextField = tf.set_text(cur);
+                    }
+                }
+            }
+        }
+        _sync_view();
+    }
+}
+
+// ───────────────────────────── agent driver bridge (main thread) ─────────────────────────────
+
+fn is_taken_over() -> bool {
+    _ensure_state();
+    return _STATE.mounted && _STATE.taken_over;
+}
+
+fn is_loading() -> bool {
+    _ensure_state();
+    return _STATE.mounted && _STATE.loading;
+}
+
+fn has_active_browser() -> bool {
+    _ensure_state();
+    return _STATE.mounted;
+}
+
+fn request_origin_approval(origin: str, cb: fn(bool, *u8), ctx: *u8) {
+    _ensure_state();
+    if !_STATE.mounted {
+        cb(false, ctx);
+        return;
+    }
+    // Deny any previous stale prompt so its waiting thread never leaks.
+    if !_STATE.pending_origin.is_empty() {
+        _resolve_origin(false);
+    }
+    _show_browser_tab();
+    _STATE.pending_origin = text::from_str(origin);
+    _STATE.origin_cb = cb;
+    _STATE.origin_ctx = ctx;
+    _sync_view();
+}
+
+fn web_node() -> *core::Node {
+    if let option::Option::Some(w) = m_web::find("web:view") {
+        return w.node();
+    }
+    return 0 as *core::Node;
+}
+
+fn show_for_agent() {
+    _ensure_state();
+    _show_browser_tab();
+    if _STATE.mounted {
+        _STATE.agent_driving = true;
+        _sync_view();
+    }
+}
+
+fn agent_open_url(url: str, new_tab: bool = false) {
+    show_for_agent();
+    if _STATE.mounted {
+        if new_tab {
+            _new_tab(url);
+        } else {
+            _open_url_in_active_tab(url);
+        }
+    }
+}
+
+fn agent_tabs_op(action: str, idx: i64, url: str) -> text::Text {
+    _ensure_state();
+    if !_STATE.mounted { return text::from_str("[]"); }
+    if action == "new" {
+        _new_tab(url);
+    } else if action == "select" && idx >= (0 as i64) {
+        _select_tab(idx as usize);
+    } else if action == "close" && idx >= (0 as i64) {
+        _close_tab(idx as usize);
+    }
+    return _tabs_json();
+}
+
+fn open_in_browser(url: str) {
+    _ensure_state();
+    _show_browser_tab();
+    if _STATE.mounted {
+        _open_url_in_active_tab(url);
+    }
+}
+
+fn set_viewport_size(width: f64, height: f64) {
+    guard let option::Option::Some(w) = m_web::find("web:view") else { return; };
+    let wn: *core::Node = w.node();
+    if wn.is_null() { return; }
+    if width > 0.0f64 && height > 0.0f64 {
+        core::set_width(wn, width);
+        core::set_height(wn, height);
+        core::set_grow(wn, 0.0f64);
+    } else {
+        core::set_width_percent(wn, 100.0f64);
+        core::set_height_percent(wn, 100.0f64);
+        core::set_grow(wn, 1.0f64);
+    }
+}
+
+#[test]
+fn normalize_url_handles_schemes_localhost_and_ports() {
+    assert normalize_url("").equals("");
+    assert normalize_url("   ").equals("");
+    assert normalize_url("https://x.ai/grok").equals("https://x.ai/grok");
+    assert normalize_url("http://localhost:8080").equals("http://localhost:8080");
+    assert normalize_url("localhost:3000").equals("http://localhost:3000");
+    assert normalize_url("127.0.0.1:5173/app").equals("http://127.0.0.1:5173/app");
+    assert normalize_url(":3000").equals("http://localhost:3000");
+    assert normalize_url("example.com/docs").equals("https://example.com/docs");
+}

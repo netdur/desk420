@@ -1,0 +1,91 @@
+// src/engine/locate.cplus — locate the `grok` binary and read its version.
+//
+// Finder-launched macOS apps do not inherit the shell PATH, so we check
+// ~/.grok/bin/grok first, then Homebrew/system paths, then PATH.
+
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/process" as process;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+fn find_grok() -> option::Option[text::Text] {
+    if let option::Option::Some(home) = env::var("HOME") {
+        let p1: text::Text = path::join(base: home.view(), child: ".grok/bin/grok");
+        if fs::is_file(p1.view()) {
+            return option::Option[text::Text]::Some(p1);
+        }
+    }
+
+    if fs::is_file("/opt/homebrew/bin/grok") {
+        return option::Option[text::Text]::Some(text::from_str("/opt/homebrew/bin/grok"));
+    }
+    if fs::is_file("/usr/local/bin/grok") {
+        return option::Option[text::Text]::Some(text::from_str("/usr/local/bin/grok"));
+    }
+
+    if let option::Option::Some(path_env) = env::var("PATH") {
+        let dirs: vec::Vec[str] = path_env.view().split(separator: ":");
+        var i: usize = 0 as usize;
+        while i < dirs.count() {
+            if let option::Option::Some(dir) = dirs.at(i) {
+                if !dir.is_empty() {
+                    let cand: text::Text = path::join(base: dir, child: "grok");
+                    if fs::is_file(cand.view()) {
+                        return option::Option[text::Text]::Some(cand);
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    return option::Option[text::Text]::None;
+}
+
+// Parse "grok 1.0.92 (b06756fd6256) [stable]" -> "1.0.92".
+fn parse_version(raw: str) -> text::Text {
+    let trimmed: str = raw.trim();
+    if trimmed.is_empty() {
+        return text::from_str("");
+    }
+    let parts: vec::Vec[str] = trimmed.split(separator: " ");
+    guard let option::Option::Some(first) = parts.at(0 as usize) else {
+        return text::from_str(trimmed);
+    };
+    if first == "grok" {
+        if let option::Option::Some(ver) = parts.at(1 as usize) {
+            return text::from_str(ver);
+        }
+    }
+    return text::from_str(first);
+}
+
+fn read_version(binary_path: str) -> option::Option[text::Text] {
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str(binary_path));
+    let _ = argv.append(text::from_str("--version"));
+    let out: process::Output = process::capture(argv);
+    if out.code != (0 as i32) {
+        return option::Option[text::Text]::None;
+    }
+    let v: text::Text = parse_version(out.stdout.view());
+    if v.is_empty() {
+        return option::Option[text::Text]::None;
+    }
+    return option::Option[text::Text]::Some(v);
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn parse_version_extracts_semver_from_grok_output() {
+    let v: text::Text = parse_version("grok 1.0.92 (b06756fd6256) [stable]\n");
+    assert v.equals("1.0.92");
+    let v2: text::Text = parse_version("1.2.3\n");
+    assert v2.equals("1.2.3");
+    let v3: text::Text = parse_version("   ");
+    assert v3.is_empty();
+}

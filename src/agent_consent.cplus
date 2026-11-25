@@ -1,0 +1,61 @@
+// Ask before an agent may drive this app.
+//
+// Wire it in src/app.cplus, before `agent::enable()`:
+//
+//     agent_consent::install();
+
+import "agent_core/auth" as auth;
+import "facet/services" as services;
+import "facet_agent/agent" as agent;
+import "facet_agent/consent" as consent;
+import "facet_runtime/runtime" as runtime;
+import "stdlib/text" as text;
+
+import "./store/prefs" as prefs;
+
+static _FORCE_ASK: bool = false;
+
+fn force_ask(on: bool) {
+    _FORCE_ASK = on;
+}
+
+fn revoke_all() {
+    consent::forget_all();
+}
+
+fn answered(index: i32, ctx: *u8) {
+    if index == 0 { consent::allow_pending(); return; }
+    consent::deny_pending();
+}
+
+fn show(ctx: *u8) {
+    let message: text::Text = "${consent::pending()} wants to read this app and press its buttons.";
+    runtime::alert("Allow agent access?", message.view(), "Allow",
+    secondary: "Deny", on_answer: answered);
+}
+
+fn ask(client: str, ctx: *u8) {
+    // `ask` runs on the serve thread. A dialog built there is an
+    // NSWindow off the main thread, which aborts the process.
+    if !services::has_main_hop() { consent::cancel_pending(); return; }
+    services::run_on_main(show, 0 as *u8);
+}
+
+fn _policy_gate(req: auth::Request) -> auth::Grant {
+    if auth::channel_eq(req.channel, auth::Channel::InApp) {
+        return auth::operator();
+    }
+    if _FORCE_ASK {
+        return consent::gate(req);
+    }
+    return match prefs::agent_access() {
+        prefs::AgentAccessPref::Open => auth::operator(),
+        prefs::AgentAccessPref::Ask => consent::gate(req),
+        prefs::AgentAccessPref::Off => auth::nothing(),
+    };
+}
+
+fn install() {
+    consent::on_ask(ask);
+    agent::set_policy(_policy_gate);
+}

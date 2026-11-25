@@ -1,0 +1,589 @@
+// Desk420 — the app: the main window (MainScreen), Settings, and the runtime that hosts them.
+
+import "applinks/applinks" as applinks;
+import "events/events" as events;
+import "facet/application" as fapp;
+import "facet/facet" as core;
+import "facet/hotkey" as hotkey;
+import "facet/icons" as icons;
+import "facet/mount" as mount;
+import "facet/screen" as screen;
+import "facet/services" as services;
+import "facet/status_item" as status_item;
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "facet/window" as window;
+import "facet_agent/agent" as agent;
+import "facet_runtime/runtime" as runtime;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/status" as status;
+import "stdlib/text" as text;
+import "stdlib/url" as url;
+import "stdlib/vec" as vec;
+
+import "./agent_consent" as agent_consent;
+import "./browser/mcp_server" as browser_mcp;
+import "./engine/runtime" as engine;
+import "./store/conversation" as conversation;
+import "./store/prefs" as prefs;
+import "./store/sessions" as sessions;
+import "./ui/about_screen" as about_screen;
+import "./ui/browser_pane" as browser_pane;
+import "./ui/chat_screen" as chat_screen;
+import "./ui/home_view" as home_view;
+import "./ui/main_screen" as main_screen;
+import "./ui/panels" as panels;
+import "./ui/pickers" as pickers;
+import "./ui/quick_ask" as quick_ask;
+import "./ui/settings_screen" as settings_screen;
+import "./ui/sidebar" as sidebar;
+import "./ui/style" as style;
+
+fn _menu_about(_sender: *u8, _ctx: *u8) {
+    let _ = runtime::app().open_window("about");
+}
+
+fn _menu_settings(_sender: *u8, _ctx: *u8) {
+    let _ = runtime::app().open_window("settings");
+}
+
+fn _menu_new_chat(_sender: *u8, _ctx: *u8) {
+    let proj: text::Text = sessions::selected_project();
+    engine::new_chat(cwd: proj.view());
+}
+
+fn _menu_add_project(_sender: *u8, _ctx: *u8) {
+    pickers::choose_and_open_project();
+}
+
+fn _menu_quick_ask(_sender: *u8, _ctx: *u8) {
+    quick_ask::toggle();
+}
+
+fn _menu_stop_turn(_sender: *u8, _ctx: *u8) {
+    engine::cancel_turn();
+}
+
+fn _menu_rewind(_sender: *u8, _ctx: *u8) {
+    engine::rewind_last();
+}
+
+fn _menu_refresh(_sender: *u8, _ctx: *u8) {
+    engine::refresh_sessions();
+    engine::refresh_account();
+}
+
+fn _menu_mode_ask(_sender: *u8, _ctx: *u8) {
+    engine::set_approval_mode(engine::ApprovalMode::Ask);
+}
+
+fn _menu_mode_auto(_sender: *u8, _ctx: *u8) {
+    engine::set_approval_mode(engine::ApprovalMode::AutoApprove);
+}
+
+fn _menu_mode_custom(_sender: *u8, _ctx: *u8) {
+    engine::set_approval_mode(engine::ApprovalMode::Custom);
+}
+
+fn _menu_toggle_sidebar(_sender: *u8, _ctx: *u8) {
+    panels::toggle_sidebar();
+}
+
+fn _menu_toggle_panel(_sender: *u8, _ctx: *u8) {
+    panels::toggle_panel();
+}
+
+fn _menu_pin_active(_sender: *u8, _ctx: *u8) {
+    let sid: text::Text = engine::active_session_id();
+    if sid.is_empty() { return; }
+    sessions::toggle_pin(sid.view());
+}
+
+fn _menu_rename_active(_sender: *u8, _ctx: *u8) {
+    main_screen::begin_rename_active();
+}
+
+fn _menu_delete_active(_sender: *u8, _ctx: *u8) {
+    let sid: text::Text = engine::active_session_id();
+    if sid.is_empty() { return; }
+    let cwd: text::Text = engine::active_cwd();
+    engine::delete_session(sid.view(), cwd.view());
+}
+
+fn _menu_copy_last_answer(_sender: *u8, _ctx: *u8) {
+    let sid: text::Text = engine::active_session_id();
+    if sid.is_empty() { return; }
+    let out: text::Text = conversation::last_answer_text(sid.view());
+    if out.is_empty() { return; }
+    let _ok: bool = runtime::copy_text(out.view());
+}
+
+fn _menu_slash_commands(_sender: *u8, _ctx: *u8) {
+    if engine::active_session_id().is_empty() {
+        home_view::open_slash_commands();
+    } else {
+        chat_screen::open_slash_commands();
+    }
+}
+
+fn _menu_search_chats(_sender: *u8, _ctx: *u8) {
+    sidebar::open_search();
+}
+
+fn _build_app_menu() -> screen::AppMenu {
+    var m: screen::AppMenu = runtime::app_menu("Desk420");
+
+    // App menu
+    m.add_command("Desk420", "About Desk420", on_click: _menu_about);
+    m.add_separator("Desk420");
+    m.add_command("Desk420", "Settings…", key: ",", on_click: _menu_settings);
+    m.add_separator("Desk420");
+    m.add_item("Desk420", "Quit Desk420", "q", runtime::menu_action_quit());
+
+    // File menu
+    m.add_command("File", "New Chat", key: "n", on_click: _menu_new_chat);
+    m.add_command("File", "Add Project Folder…", key: "o", on_click: _menu_add_project);
+    m.add_command("File", "Quick Ask…", on_click: _menu_quick_ask);
+    m.add_separator("File");
+    m.add_item("File", "Close Window", "w", runtime::menu_action_close_window());
+
+    // Edit menu (standard macOS responder chain actions)
+    m.add_item("Edit", "Undo", "z", runtime::menu_action_undo());
+    m.add_item("Edit", "Redo", "z", runtime::menu_action_redo(), shift: true);
+    m.add_separator("Edit");
+    m.add_item("Edit", "Cut", "x", runtime::menu_action_cut());
+    m.add_item("Edit", "Copy", "c", runtime::menu_action_copy());
+    m.add_item("Edit", "Paste", "v", runtime::menu_action_paste());
+    m.add_item("Edit", "Select All", "a", runtime::menu_action_select_all());
+    m.add_separator("Edit");
+    m.add_item("Edit", "Find…", "f", runtime::menu_action_find());
+
+    // Chat menu
+    m.add_command("Chat", "Stop Response", key: ".", on_click: _menu_stop_turn);
+    m.add_command("Chat", "Copy Last Answer", key: "c", on_click: _menu_copy_last_answer, shift: true);
+    m.add_command("Chat", "Slash Commands…", key: "/", on_click: _menu_slash_commands);
+    m.add_command("Chat", "Search Conversations…", key: "k", on_click: _menu_search_chats);
+    m.add_command("Chat", "Rewind Last Turn", on_click: _menu_rewind);
+    m.add_separator("Chat");
+    m.add_command("Chat", "Pin / Unpin Conversation", on_click: _menu_pin_active);
+    m.add_command("Chat", "Rename Conversation…", on_click: _menu_rename_active);
+    m.add_command("Chat", "Delete Conversation", on_click: _menu_delete_active);
+    m.add_separator("Chat");
+    m.add_command("Chat", "Approval: Ask", on_click: _menu_mode_ask);
+    m.add_command("Chat", "Approval: Auto-approve", on_click: _menu_mode_auto);
+    m.add_command("Chat", "Approval: Custom", on_click: _menu_mode_custom);
+    m.add_separator("Chat");
+    m.add_command("Chat", "Refresh Chats & Usage", key: "r", on_click: _menu_refresh);
+
+    // View menu
+    m.add_command("View", "Toggle Sidebar", key: "s", on_click: _menu_toggle_sidebar, alt: true);
+    m.add_command("View", "Toggle Inspector", key: "i", on_click: _menu_toggle_panel, alt: true);
+
+    return m;
+}
+
+// Surfaces and text are the platform's own semantic colours, so the app
+// follows the system appearance; the theme names only the brand accent.
+fn _install_theme() {
+    ftheme::set_theme(ftheme::Theme::new(
+        primary: style::lime(),
+        on_primary: style::on_lime(),
+    ));
+}
+
+// ───────────────────────────── DesktopShell (Tray + Global Hotkey) ─────────────────────────────
+
+struct _TraySessionRef {
+    sid: text::Text,
+    cwd: text::Text,
+    title: text::Text,
+    needs_you: bool,
+}
+
+struct DesktopShell {
+    tray: status_item::StatusItem,
+    summon: services::Cancellable,
+    hotkey_text: str,
+    tray_sessions: vec::Vec[_TraySessionRef],
+    sessions_sub: events::SignalSubscription[sessions::SessionsChange],
+    status_sub: events::SignalSubscription[engine::EngineStateEvent],
+}
+
+impl DesktopShell {
+    fn new() -> DesktopShell {
+        return DesktopShell {
+            tray: status_item::StatusItem::none(),
+            summon: services::Cancellable::none(),
+            hotkey_text: "⌥Space",
+            tray_sessions: vec::new::[_TraySessionRef](),
+            sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
+            status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+        };
+    }
+
+    fn on_launch(ref this) {
+        style::apply_appearance(prefs::appearance());
+
+        // 1. Register global hotkey: Option-Space, falling back to Ctrl-Option-Space if taken.
+        match hotkey::register("space", this.toggle_quick_ask, alt: true) {
+            result::Result[services::Cancellable, hotkey::Refusal]::Ok(h) => {
+                this.summon = h;
+                this.hotkey_text = "⌥Space";
+            }
+            result::Result[services::Cancellable, hotkey::Refusal]::Err(_why) => {
+                match hotkey::register("space", this.toggle_quick_ask, ctrl: true, alt: true) {
+                    result::Result[services::Cancellable, hotkey::Refusal]::Ok(h2) => {
+                        this.summon = h2;
+                        this.hotkey_text = "⌃⌥Space";
+                    }
+                    result::Result[services::Cancellable, hotkey::Refusal]::Err(_why2) => {
+                        this.summon = services::Cancellable::none();
+                        this.hotkey_text = "Unavailable";
+                    }
+                }
+            }
+        }
+        quick_ask::set_hotkey_label(this.hotkey_text);
+
+        // 2. Menu bar status item (keeps Desk420 alive even if the main window is closed).
+        this.tray = status_item::StatusItem::new(symbol: icons::bolt, tooltip: "Desk420 — Quick Ask (${this.hotkey_text})");
+        this._sync_tray();
+
+        // 3. Watch live sessions & engine state to keep tray count and recent runs fresh.
+        this.sessions_sub = sessions::watch(this.on_sessions_changed);
+        this.status_sub = engine::watch_status(this.on_status_changed);
+    }
+
+    fn toggle_quick_ask(ref this) {
+        quick_ask::toggle();
+    }
+
+    fn _sync_tray(ref this) {
+        let needs: usize = sessions::needs_you_count();
+        if needs > (0 as usize) {
+            let badge: text::Text = "${needs}";
+            fapp::set_badge_label(badge.view());
+        } else {
+            fapp::set_badge_label("");
+        }
+        if !this.tray.is_live() { return; }
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        this.tray_sessions.remove_all();
+
+        // Collect Needs You rows first, then fill up to 5 total recent chats.
+        var i: usize = 0 as usize;
+        while i < rows.count() && this.tray_sessions.count() < (5 as usize) {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if (*rp).task_state == sessions::TaskState::NeedsYou {
+                    let _ = this.tray_sessions.append(_TraySessionRef {
+                        sid: (*rp).session_id.clone(),
+                        cwd: (*rp).cwd.clone(),
+                        title: (*rp).title.clone(),
+                        needs_you: true,
+                    });
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        i = 0 as usize;
+        while i < rows.count() && this.tray_sessions.count() < (5 as usize) {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if (*rp).task_state != sessions::TaskState::NeedsYou && !(*rp).session_id.is_empty() {
+                    let _ = this.tray_sessions.append(_TraySessionRef {
+                        sid: (*rp).session_id.clone(),
+                        cwd: (*rp).cwd.clone(),
+                        title: (*rp).title.clone(),
+                        needs_you: false,
+                    });
+                }
+            }
+            i = i +% (1 as usize);
+        }
+
+        if needs > (0 as usize) {
+            let badge: text::Text = "${needs}";
+            this.tray.set_title(badge.view());
+        } else {
+            this.tray.set_title("");
+        }
+
+        var m: screen::AppMenu = screen::app_menu("");
+        let qa_lbl: text::Text = "Quick Ask  ${this.hotkey_text}";
+        m.add_command("", qa_lbl.view(), on_click: this.on_tray_quick_ask);
+        m.add_command("", "New Chat", on_click: this.on_tray_new_chat);
+
+        if this.tray_sessions.count() > (0 as usize) {
+            m.add_separator("");
+            var si: usize = 0 as usize;
+            while si < this.tray_sessions.count() {
+                if let option::Option::Some(tp) = this.tray_sessions.at_ptr(si) {
+                    let raw_t: str = if (*tp).title.is_empty() { "Untitled run" } else { (*tp).title.view() };
+                    let short_t: text::Text = if raw_t.count() > (42 as usize) {
+                        match raw_t.slice(from: 0 as usize, to: 42 as usize) {
+                            option::Option::Some(sl) => "${sl}…",
+                            option::Option::None => text::from_str(raw_t),
+                        }
+                    } else {
+                        text::from_str(raw_t)
+                    };
+                    let item_t: text::Text = if (*tp).needs_you {
+                        "● ${short_t.view()}"
+                    } else {
+                        short_t
+                    };
+                    if si == (0 as usize) {
+                        m.add_command("", item_t.view(), on_click: this.on_tray_session_0);
+                    } else if si == (1 as usize) {
+                        m.add_command("", item_t.view(), on_click: this.on_tray_session_1);
+                    } else if si == (2 as usize) {
+                        m.add_command("", item_t.view(), on_click: this.on_tray_session_2);
+                    } else if si == (3 as usize) {
+                        m.add_command("", item_t.view(), on_click: this.on_tray_session_3);
+                    } else if si == (4 as usize) {
+                        m.add_command("", item_t.view(), on_click: this.on_tray_session_4);
+                    }
+                }
+                si = si +% (1 as usize);
+            }
+        }
+
+        m.add_separator("");
+        m.add_command("", "Show Desk420", on_click: this.on_tray_show);
+        m.add_command("", "Settings…", on_click: this.on_tray_settings);
+        m.add_separator("");
+        m.add_item("", "Quit Desk420", "q", screen::menu_action_quit());
+        this.tray.set_menu(m);
+    }
+
+    fn open_tray_session(ref this, idx: usize) {
+        guard let option::Option::Some(tp) = this.tray_sessions.at_ptr(idx) else { return; };
+        let sid: text::Text = (*tp).sid.clone();
+        let cwd: text::Text = (*tp).cwd.clone();
+        let title: text::Text = (*tp).title.clone();
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("home");
+        engine::load_session(sid.view(), cwd.view(), title: title.view());
+    }
+
+    fn on_tray_session_0(ref this, _sender: *u8) { this.open_tray_session(0 as usize); }
+    fn on_tray_session_1(ref this, _sender: *u8) { this.open_tray_session(1 as usize); }
+    fn on_tray_session_2(ref this, _sender: *u8) { this.open_tray_session(2 as usize); }
+    fn on_tray_session_3(ref this, _sender: *u8) { this.open_tray_session(3 as usize); }
+    fn on_tray_session_4(ref this, _sender: *u8) { this.open_tray_session(4 as usize); }
+
+    fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) { this._sync_tray(); }
+    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) { this._sync_tray(); }
+
+    fn on_tray_quick_ask(ref this, _sender: *u8) { this.toggle_quick_ask(); }
+
+    fn on_tray_new_chat(ref this, _sender: *u8) {
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("home");
+        let proj: text::Text = sessions::selected_project();
+        engine::new_chat(cwd: proj.view());
+    }
+
+    fn on_tray_show(ref this, _sender: *u8) {
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("home");
+    }
+
+    fn on_tray_settings(ref this, _sender: *u8) {
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("settings");
+    }
+}
+
+enum DeepLinkAction {
+    None,
+    OpenChat(text::Text),
+    NewChat(text::Text, text::Text), // cwd, prompt
+    OpenBrowser(text::Text),
+}
+
+fn parse_deep_link(raw_url: str) -> DeepLinkAction {
+    guard let option::Option::Some(u) = url::parse(raw_url) else {
+        return DeepLinkAction::None;
+    };
+    if !u.is_scheme("desk420") {
+        return DeepLinkAction::None;
+    }
+    let seg0: str = u.segment(0 as usize);
+    if seg0 == "chat" {
+        let sid: str = u.segment(1 as usize);
+        if sid != "" {
+            return DeepLinkAction::OpenChat(url::decode(sid));
+        }
+        return DeepLinkAction::None;
+    }
+    if seg0 == "new" {
+        let cwd: text::Text = match u.query_value("cwd") {
+            option::Option::Some(v) => v,
+            option::Option::None => text::from_str(""),
+        };
+        let prompt: text::Text = match u.query_value("prompt") {
+            option::Option::Some(v) => v,
+            option::Option::None => text::from_str(""),
+        };
+        return DeepLinkAction::NewChat(cwd, prompt);
+    }
+    if seg0 == "browser" {
+        if let option::Option::Some(target) = u.query_value("url") {
+            if !target.is_empty() {
+                return DeepLinkAction::OpenBrowser(target);
+            }
+        }
+        return DeepLinkAction::None;
+    }
+    return DeepLinkAction::None;
+}
+
+fn _on_deep_link(raw_url: str, _ctx: *u8) {
+    let act: DeepLinkAction = parse_deep_link(raw_url);
+    match act {
+        DeepLinkAction::None => { return; }
+        _ => {
+            let _front: bool = runtime::app().activate();
+            let _w = runtime::app().open_window("home");
+        }
+    }
+    match act {
+        DeepLinkAction::OpenChat(sid) => {
+            var cwd: text::Text = text::from_str("");
+            var title: text::Text = text::from_str("");
+            let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+            var i: usize = 0 as usize;
+            while i < rows.count() {
+                if let option::Option::Some(rp) = rows.at_ptr(i) {
+                    if (*rp).session_id.equals(sid.view()) {
+                        cwd = (*rp).cwd.clone();
+                        title = (*rp).title.clone();
+                        break;
+                    }
+                }
+                i = i +% (1 as usize);
+            }
+            engine::load_session(sid.view(), cwd.view(), title: title.view());
+        }
+        DeepLinkAction::NewChat(cwd, prompt) => {
+            let use_cwd: text::Text = if cwd.is_empty() { sessions::selected_project() } else { cwd };
+            engine::new_chat(cwd: use_cwd.view());
+            if !prompt.is_empty() {
+                engine::set_prefill_prompt(prompt.view());
+            }
+        }
+        DeepLinkAction::OpenBrowser(target) => {
+            browser_pane::open_in_browser(target.view());
+        }
+        DeepLinkAction::None => {}
+    }
+}
+
+fn run(require_consent: bool = false) -> i32 {
+    agent_consent::force_ask(require_consent);
+    agent_consent::install();
+    prefs::apply_browser(prefs::browser());
+    browser_mcp::set_policy_hooks(engine::active_cwd, engine::is_auto_approve, engine::active_session_id);
+    let _ = browser_mcp::start();
+    let _ = applinks::on_link(_on_deep_link, scheme: "desk420");
+    agent::enable();
+
+    var shell: DesktopShell = DesktopShell::new();
+
+    let app: runtime::App = runtime::App::new("Desk420");
+    _install_theme();
+    app.on_launch(shell.on_launch);
+    app.menu(_build_app_menu);
+    app.window(
+        "home",
+        main_screen::boxed,
+        chrome: screen::Chrome::new(
+            title: "Desk420",
+            width: 1360.0f64,
+            height: 860.0f64,
+            min_width: 1120.0f64,
+            min_height: 640.0f64,
+            bar: screen::Bar::Blended,
+            zoomable: true,
+        ),
+    );
+    app.window(
+        "about",
+        about_screen::boxed,
+        chrome: screen::Chrome::new(
+            title: "About Desk420",
+            width: 340.0f64,
+            height: 300.0f64,
+            min_width: 340.0f64,
+            min_height: 300.0f64,
+            max_width: 340.0f64,
+            max_height: 300.0f64,
+            bar: screen::Bar::Blended,
+            maximizable: false,
+            minimizable: false,
+        ),
+    );
+    app.window(
+        "settings",
+        settings_screen::boxed,
+        chrome: screen::Chrome::new(
+            title: "Settings",
+            width: 560.0f64,
+            height: 780.0f64,
+            min_width: 480.0f64,
+            min_height: 560.0f64,
+            bar: screen::Bar::Blended,
+            zoomable: true,
+        ),
+    );
+    app.window(
+        "quick_ask",
+        quick_ask::boxed,
+        chrome: screen::Chrome::new(
+            title: "Quick Ask",
+            width: quick_ask::PANEL_W,
+            height: quick_ask::PANEL_H,
+            min_width: quick_ask::PANEL_W,
+            min_height: quick_ask::PANEL_H,
+            max_width: quick_ask::PANEL_W,
+            max_height: quick_ask::PANEL_H,
+            bar: screen::Bar::Custom,
+            maximizable: false,
+            minimizable: false,
+            floating: true,
+            panel: true,
+        ),
+    );
+    app.agent_mcp();
+
+    let rc: i32 = match app.run("home") {
+        status::Status::Ok => 0 as i32,
+        _other => 1 as i32,
+    };
+    engine::shutdown();
+    return rc;
+}
+
+#[test]
+fn parse_deep_link_routes_chat_new_and_browser() {
+    match parse_deep_link("desk420://chat/abc-123") {
+        DeepLinkAction::OpenChat(sid) => { assert sid.equals("abc-123"); }
+        _ => { assert false; }
+    }
+    match parse_deep_link("desk420://new?prompt=Hello%20Grok&cwd=%2Ftmp%2Fproj") {
+        DeepLinkAction::NewChat(cwd, p) => {
+            assert cwd.equals("/tmp/proj");
+            assert p.equals("Hello Grok");
+        }
+        _ => { assert false; }
+    }
+    match parse_deep_link("desk420://browser?url=http%3A%2F%2Flocalhost%3A3000") {
+        DeepLinkAction::OpenBrowser(u) => { assert u.equals("http://localhost:3000"); }
+        _ => { assert false; }
+    }
+    match parse_deep_link("https://example.com/chat/1") {
+        DeepLinkAction::None => {}
+        _ => { assert false; }
+    }
+}

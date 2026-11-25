@@ -1,0 +1,969 @@
+// src/ui/sidebar.cplus — the left column of the main window.
+//
+// "New run", optional NEEDS YOU approval cards, optional Pinned Conversations,
+// then Projects grouped by folder: a small folder header with each project's
+// conversations indented beneath it, and on the far right of every row its
+// last-message relative time plus a live spinner whenever Grok is generating.
+// The footer shows weekly plan usage and Settings.
+
+import "events/events" as events;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/list" as m_list;
+import "facet/text_field" as text_field;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../engine/runtime" as engine;
+import "../store/account" as account;
+import "../store/sessions" as sessions;
+import "./panels" as panels;
+import "./pickers" as pickers;
+import "./style" as style;
+
+const HEADER_H: f64 = 34.0f64;
+const FOLDER_H: f64 = 32.0f64;
+const CARD_H: f64 = 84.0f64;
+const ROW_H: f64 = 38.0f64;
+
+enum ItemKind {
+    SectionHeader,
+    ProjectsHeader,
+    NeedsCard,
+    Folder,
+    Row,
+}
+
+struct SideItem {
+    kind: ItemKind,
+    header: text::Text,
+    folder_key: text::Text,
+    accent: bool,
+    indented: bool,
+    row: sessions::SidebarRow,
+}
+
+fn _blank_row() -> sessions::SidebarRow {
+    return sessions::SidebarRow {
+        session_id: text::from_str(""),
+        cwd: text::from_str(""),
+        title: text::from_str(""),
+        folder_name: text::from_str(""),
+        updated_at: text::from_str(""),
+        task_state: sessions::TaskState::Idle,
+        pinned: false,
+    };
+}
+
+fn _tag_of(folder_name: str, cwd: str) -> text::Text {
+    if folder_name.is_empty() || folder_name == "Chat" || cwd.contains(".desk420/") {
+        return text::from_str("");
+    }
+    return text::from_str(folder_name);
+}
+
+struct _FolderGroup {
+    key: text::Text,
+    name: text::Text,
+    latest_epoch: i64,
+    has_running: bool,
+}
+
+fn _group_epoch(iso: str) -> i64 {
+    return match sessions::parse_iso_epoch(iso) {
+        option::Option::Some(ts) => ts,
+        option::Option::None => 0 as i64,
+    };
+}
+
+fn _sort_groups_newest_first(take src: vec::Vec[_FolderGroup]) -> vec::Vec[_FolderGroup] {
+    var rem: vec::Vec[_FolderGroup] = src;
+    var out: vec::Vec[_FolderGroup] = vec::new::[_FolderGroup]();
+    while rem.count() > (0 as usize) {
+        var best_i: usize = 0 as usize;
+        var best_run: bool = false;
+        var best_ts: i64 = -2 as i64;
+        var i: usize = 0 as usize;
+        while i < rem.count() {
+            if let option::Option::Some(gp) = rem.at_ptr(i) {
+                let run: bool = (*gp).has_running;
+                let ts: i64 = (*gp).latest_epoch;
+                let better: bool = if i == (0 as usize) {
+                    true
+                } else if run != best_run {
+                    run
+                } else {
+                    ts > best_ts
+                };
+                if better {
+                    best_i = i;
+                    best_run = run;
+                    best_ts = ts;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        if let option::Option::Some(g) = rem.remove(at: best_i) {
+            let _ = out.append(g);
+        }
+    }
+    return out;
+}
+
+struct Sidebar {
+    items: vec::Vec[SideItem],
+    collapsed_folders: vec::Vec[text::Text],
+    hovered: i64, // -1 = none
+    account_pop_open: bool,
+    sessions_sub: events::SignalSubscription[sessions::SessionsChange],
+    status_sub: events::SignalSubscription[engine::EngineStateEvent],
+    account_sub: events::SignalSubscription[account::AccountChange],
+}
+
+impl Sidebar {
+    fn new() -> Sidebar {
+        return Sidebar {
+            items: vec::new::[SideItem](),
+            collapsed_folders: vec::new::[text::Text](),
+            hovered: -1 as i64,
+            account_pop_open: false,
+            sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
+            status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+            account_sub: events::SignalSubscription[account::AccountChange]::none(),
+        };
+    }
+
+    // ---- model ----------------------------------------------------------------
+
+    fn _is_collapsed(this, folder_key: str) -> bool {
+        var i: usize = 0 as usize;
+        while i < this.collapsed_folders.count() {
+            if let option::Option::Some(p) = this.collapsed_folders.at_ptr(i) {
+                if (*p).equals(folder_key) { return true; }
+            }
+            i = i +% (1 as usize);
+        }
+        return false;
+    }
+
+    fn _toggle_collapsed(ref this, folder_key: str) {
+        var i: usize = 0 as usize;
+        while i < this.collapsed_folders.count() {
+            if let option::Option::Some(p) = this.collapsed_folders.at_ptr(i) {
+                if (*p).equals(folder_key) {
+                    let _ = this.collapsed_folders.remove(at: i);
+                    return;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        let _ = this.collapsed_folders.append(text::from_str(folder_key));
+    }
+
+    fn _push_header(ref this, title: str, accent: bool) {
+        let _ = this.items.append(SideItem {
+            kind: ItemKind::SectionHeader,
+            header: text::from_str(title),
+            folder_key: text::from_str(""),
+            accent: accent,
+            indented: false,
+            row: _blank_row(),
+        });
+    }
+
+    fn _push_projects_header(ref this) {
+        let _ = this.items.append(SideItem {
+            kind: ItemKind::ProjectsHeader,
+            header: text::from_str("Projects"),
+            folder_key: text::from_str(""),
+            accent: false,
+            indented: false,
+            row: _blank_row(),
+        });
+    }
+
+    fn _push_folder(ref this, folder_key: str, folder_name: str) {
+        let _ = this.items.append(SideItem {
+            kind: ItemKind::Folder,
+            header: text::from_str(folder_name),
+            folder_key: text::from_str(folder_key),
+            accent: false,
+            indented: false,
+            row: _blank_row(),
+        });
+    }
+
+    fn _push_row(ref this, rp: *sessions::SidebarRow, kind: ItemKind, indented: bool) {
+        let _ = this.items.append(SideItem {
+            kind: kind,
+            header: text::from_str(""),
+            folder_key: text::from_str(""),
+            accent: false,
+            indented: indented,
+            row: (*rp).clone(),
+        });
+    }
+
+    fn _has_group(groups: vec::Vec[_FolderGroup], key: str) -> bool {
+        var i: usize = 0 as usize;
+        while i < groups.count() {
+            if let option::Option::Some(gp) = groups.at_ptr(i) {
+                if (*gp).key.equals(key) { return true; }
+            }
+            i = i +% (1 as usize);
+        }
+        return false;
+    }
+
+    fn _sync(ref this) {
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        this.items.remove_all();
+
+        // 1. Needs-you approval cards stay surfaced at the very top.
+        var needs_count: usize = 0 as usize;
+        var pinned_count: usize = 0 as usize;
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if (*rp).task_state == sessions::TaskState::NeedsYou {
+                    needs_count = needs_count +% (1 as usize);
+                } else if (*rp).pinned {
+                    pinned_count = pinned_count +% (1 as usize);
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        if needs_count > (0 as usize) {
+            this._push_header("NEEDS YOU · ${needs_count}", true);
+            var ni: usize = 0 as usize;
+            while ni < rows.count() {
+                if let option::Option::Some(rp) = rows.at_ptr(ni) {
+                    if (*rp).task_state == sessions::TaskState::NeedsYou {
+                        this._push_row(rp, ItemKind::NeedsCard, false);
+                    }
+                }
+                ni = ni +% (1 as usize);
+            }
+        }
+
+        // 2. Pinned Conversations (unindented, matching the reference).
+        if pinned_count > (0 as usize) {
+            this._push_header("Pinned Conversations", false);
+            var pi: usize = 0 as usize;
+            while pi < rows.count() {
+                if let option::Option::Some(rp) = rows.at_ptr(pi) {
+                    if (*rp).task_state != sessions::TaskState::NeedsYou && (*rp).pinned {
+                        this._push_row(rp, ItemKind::Row, false);
+                    }
+                }
+                pi = pi +% (1 as usize);
+            }
+        }
+
+        // 3. Projects + General grouped by folder, sorted newest → oldest by latest activity.
+        var raw_groups: vec::Vec[_FolderGroup] = vec::new::[_FolderGroup]();
+        var gi: usize = 0 as usize;
+        while gi < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(gi) {
+                if (*rp).task_state != sessions::TaskState::NeedsYou && !(*rp).pinned {
+                    let is_gen: bool = (*rp).is_general();
+                    let fk: text::Text = if is_gen { text::from_str("__general__") } else { (*rp).cwd.clone() };
+                    let fnm: text::Text = if is_gen { text::from_str("General") } else { (*rp).folder_name.clone() };
+                    let ep: i64 = _group_epoch((*rp).updated_at.view());
+                    let is_run: bool = (*rp).task_state == sessions::TaskState::Running;
+                    var found: bool = false;
+                    var j: usize = 0 as usize;
+                    while j < raw_groups.count() {
+                        if let option::Option::Some(gp) = raw_groups.at_ptr(j) {
+                            if (*gp).key.equals(fk.view()) {
+                                if ep > (*gp).latest_epoch { (*gp).latest_epoch = ep; }
+                                if is_run { (*gp).has_running = true; }
+                                found = true;
+                                break;
+                            }
+                        }
+                        j = j +% (1 as usize);
+                    }
+                    if !found {
+                        let _ = raw_groups.append(_FolderGroup {
+                            key: fk,
+                            name: fnm,
+                            latest_epoch: ep,
+                            has_running: is_run,
+                        });
+                    }
+                }
+            }
+            gi = gi +% (1 as usize);
+        }
+
+        // Include empty project folders added by hand when not filtering by search.
+        if sessions::search_query().is_empty() {
+            let all_folders: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+            var fi: usize = 0 as usize;
+            while fi < all_folders.count() {
+                if let option::Option::Some(fp) = all_folders.at_ptr(fi) {
+                    if !Sidebar::_has_group(raw_groups, (*fp).path.view()) {
+                        let _ = raw_groups.append(_FolderGroup {
+                            key: (*fp).path.clone(),
+                            name: (*fp).name.clone(),
+                            latest_epoch: -1 as i64,
+                            has_running: false,
+                        });
+                    }
+                }
+                fi = fi +% (1 as usize);
+            }
+        }
+
+        let groups: vec::Vec[_FolderGroup] = _sort_groups_newest_first(raw_groups);
+
+        if groups.count() > (0 as usize) {
+            this._push_projects_header();
+        }
+
+        var k: usize = 0 as usize;
+        while k < groups.count() {
+            if let option::Option::Some(gp) = groups.at_ptr(k) {
+                let gkey: text::Text = (*gp).key.clone();
+                let gname: text::Text = (*gp).name.clone();
+                let is_gen_group: bool = gkey.equals("__general__");
+                this._push_folder(gkey.view(), gname.view());
+                if !this._is_collapsed(gkey.view()) {
+                    var ri: usize = 0 as usize;
+                    while ri < rows.count() {
+                        if let option::Option::Some(rp) = rows.at_ptr(ri) {
+                            if (*rp).task_state != sessions::TaskState::NeedsYou && !(*rp).pinned {
+                                let matches: bool = if is_gen_group {
+                                    (*rp).is_general()
+                                } else {
+                                    !(*rp).is_general() && (*rp).cwd.equals(gkey.view())
+                                };
+                                if matches {
+                                    this._push_row(rp, ItemKind::Row, true);
+                                }
+                            }
+                        }
+                        ri = ri +% (1 as usize);
+                    }
+                }
+            }
+            k = k +% (1 as usize);
+        }
+
+        if this.hovered >= (this.items.count() as i64) { this.hovered = -1 as i64; }
+        if let option::Option::Some(l) = m_list::find("side:list") {
+            let _l: m_list::List = l.set_count(this.items.count());
+        }
+    }
+
+    fn _sync_account(ref this) {
+        let plan: text::Text = account::plan_and_period();
+        let pct: text::Text = account::usage_percent_label();
+        let reset: text::Text = account::usage_reset_short();
+        style::set_label("side:plan", plan.view());
+        style::set_label("side:pct", pct.view());
+        style::set_label("side:reset", reset.view());
+        style::set_bar("side:bar", account::usage_fraction());
+        let name: text::Text = account::user_name();
+        let email: text::Text = account::user_email();
+        let tier: text::Text = account::plan_label();
+        let reset_full: text::Text = account::usage_reset_pretty();
+        let prepaid: text::Text = account::prepaid_label();
+        style::set_label("side:acc_name", name.view());
+        style::set_label("side:acc_email", email.view());
+        style::set_label("side:acc_plan", tier.view());
+        style::set_label("side:acc_reset", reset_full.view());
+        style::set_label("side:acc_prepaid", prepaid.view());
+        style::show("side:account_pop", this.account_pop_open);
+    }
+
+    // ---- recycled list data source ------------------------------------------
+
+    fn row_height(ref this, index: usize) -> f64 {
+        guard let option::Option::Some(it) = this.items.at_ptr(index) else { return ROW_H; };
+        return match (*it).kind {
+            ItemKind::SectionHeader => HEADER_H,
+            ItemKind::ProjectsHeader => HEADER_H,
+            ItemKind::NeedsCard => CARD_H,
+            ItemKind::Folder => FOLDER_H,
+            ItemKind::Row => ROW_H,
+        };
+    }
+
+    fn build_row(ref this, index: usize) -> core::Node {
+        guard let option::Option::Some(it) = this.items.at_ptr(index) else {
+            return @ui { column {} };
+        };
+        let active_sid: text::Text = engine::active_session_id();
+        let is_active: bool = !active_sid.is_empty() && (*it).row.session_id.equals(active_sid.view());
+        let is_hovered: bool = (index as i64) == this.hovered;
+        let row_key: text::Text = "side:row:${index}";
+        let tag_txt: text::Text = _tag_of((*it).row.folder_name.view(), (*it).row.cwd.view());
+        let title: text::Text = (*it).row.title.clone();
+        let time_txt: text::Text = sessions::relative_time((*it).row.updated_at.view());
+
+        return match (*it).kind {
+            ItemKind::SectionHeader => {
+                let hdr: text::Text = (*it).header.clone();
+                let accent: bool = (*it).accent;
+                if accent {
+                    @ui {
+                        column {
+                            style::caption(hdr.view(), key: row_key.view(), accent: true)
+                        }
+                        .height(HEADER_H)
+                            .justify(flex::Justify::End)
+                            .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                            .padding_edge(flex::Edge::Bottom, 6.0f64)
+                            .set_input_transparent(true)
+                    }
+                } else {
+                    @ui {
+                        column {
+                            label(hdr.view(), key: row_key.view(),
+                            font_size: 12.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::muted(),
+                            max_lines: 1 as i64)
+                        }
+                        .height(HEADER_H)
+                            .justify(flex::Justify::End)
+                            .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                            .padding_edge(flex::Edge::Bottom, 6.0f64)
+                            .set_input_transparent(true)
+                    }
+                }
+            }
+            ItemKind::ProjectsHeader => @ui {
+                hstack {
+                    label("Projects", key: row_key.view(),
+                    font_size: 12.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::muted(),
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                    icon_button(key: "side:search_btn",
+                    bordered: false,
+                    symbol: icons::search,
+                    color: style::muted(),
+                    on_clicked: this.on_search_open)
+                        .width(24.0f64)
+                        .height(24.0f64)
+                        .shrink(0.0f64)
+                        .set_tooltip("Search conversations (⌘K)")
+                    text_button("+ Add", key: "side:add_project",
+                    font_size: 11.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    bordered: false,
+                    corner_radius: vocab::Corners::all(6.0f64),
+                    on_click: this.on_add_project)
+                        .height(22.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 7.0f64)
+                        .set_background_color(style::chip())
+                        .set_tooltip("Add project folder (⌘O)")
+                        .shrink(0.0f64)
+                }
+                .height(HEADER_H)
+                    .align(flex::Align::End)
+                    .gap(2.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                    .padding_edge(flex::Edge::Bottom, 4.0f64)
+            },
+            ItemKind::Folder => {
+                let fname: text::Text = (*it).header.clone();
+                let fkey: text::Text = (*it).folder_key.clone();
+                let is_general: bool = fkey.equals("__general__");
+                let icon_id: u32 = if is_general { icons::chat_bubble_outline } else { icons::folder };
+                let hover_bg: vocab::Color = if is_hovered { vocab::Color::ink(0.04f64) } else { vocab::Color::clear() };
+                @ui {
+                    column {
+                        hstack {
+                            symbol(icon_id, size: 15.0f64, color: style::muted())
+                                .shrink(0.0f64)
+                            label(fname.view(), key: row_key.view(),
+                            font_size: 13.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::muted(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                        }
+                        .height(28.0f64)
+                            .align(flex::Align::Center)
+                            .gap(8.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                            .set_background_color(hover_bg)
+                            .set_corner_radius(vocab::Corners::all(8.0f64))
+                            .set_input_transparent(true)
+                    }
+                    .height(FOLDER_H)
+                        .justify(flex::Justify::End)
+                        .padding_edge(flex::Edge::Top, 4.0f64)
+                        .gesture(on_hover: this.on_hover, on_unhover: this.on_unhover)
+                }
+            }
+            ItemKind::NeedsCard => {
+                let body: core::Node = @ui {
+                    column {
+                        hstack {
+                            style::dot(10.0f64, style::lime())
+                            label(title.view(), key: row_key.view(),
+                            font_size: 14.5f64,
+                            font_weight: vocab::FontWeight::Semibold,
+                            text_color: style::ink(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                        }
+                        .align(flex::Align::Center)
+                            .gap(8.0f64)
+                        hstack {
+                            label("Approve command",
+                            font_size: 13.0f64,
+                            text_color: style::muted(),
+                            max_lines: 1 as i64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                            style::tag(tag_txt.view())
+                        }
+                        .align(flex::Align::Center)
+                            .gap(8.0f64)
+                            .padding_edge(flex::Edge::Left, 2.0f64)
+                    }
+                    .gap(8.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                        .padding_edge(flex::Edge::Vertical, 12.0f64)
+                        .set_input_transparent(true)
+                };
+                let fill: vocab::Color = if is_active || is_hovered { style::chip() } else { style::card() };
+                @ui {
+                    column {
+                        style::card_box("", body, radius: 12.0f64, accent: is_active, fill: fill)
+                            .set_input_transparent(true)
+                    }
+                    .padding_edge(flex::Edge::Bottom, 10.0f64)
+                        .gesture(on_hover: this.on_hover, on_unhover: this.on_unhover)
+                }
+            }
+            ItemKind::Row => {
+                let st: sessions::TaskState = (*it).row.task_state;
+                let is_generating: bool = st == sessions::TaskState::Running;
+                let is_failed: bool = st == sessions::TaskState::Failed;
+                let is_unread: bool = st == sessions::TaskState::Unread;
+                let show_dot: bool = is_failed || is_unread;
+                let dot_col: vocab::Color = if is_failed { style::danger() } else { style::lime() };
+                let bg: vocab::Color = if is_active {
+                    style::chip()
+                } else if is_hovered {
+                    vocab::Color::ink(0.05f64)
+                } else {
+                    vocab::Color::clear()
+                };
+                let rim: vocab::Color = if is_active {
+                    style::hairline()
+                } else {
+                    vocab::Color::clear()
+                };
+                let weight: vocab::FontWeight = if is_active || is_unread {
+                    vocab::FontWeight::Medium
+                } else {
+                    vocab::FontWeight::Regular
+                };
+                let left_pad: f64 = if (*it).indented { 24.0f64 } else { 10.0f64 };
+                let has_time: bool = !time_txt.is_empty();
+                let inner: core::Node = @ui {
+                    hstack {
+                        if show_dot {
+                            style::dot(6.0f64, dot_col)
+                        }
+                        label(title.view(), key: row_key.view(),
+                        font_size: 14.0f64,
+                        font_weight: weight,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .min_width(0.0f64)
+                        if is_generating {
+                            spinner(style::lime(), running: true)
+                                .width(14.0f64)
+                                .height(14.0f64)
+                                .shrink(0.0f64)
+                        }
+                        if has_time {
+                            label(time_txt.view(),
+                            font_size: 12.5f64,
+                            text_color: style::muted(),
+                            max_lines: 1 as i64)
+                                .shrink(0.0f64)
+                        }
+                    }
+                    .height(34.0f64)
+                        .align(flex::Align::Center)
+                        .gap(8.0f64)
+                        .padding_edge(flex::Edge::Left, left_pad)
+                        .padding_edge(flex::Edge::Right, 10.0f64)
+                        .set_input_transparent(true)
+                };
+                @ui {
+                    column {
+                        bordered(stroke: vocab::Brush::solid(rim), stroke_width: 1.0f64, stroke_shape: vocab::Shape::rounded(10.0f64)) {
+                            inner
+                        }
+                        .height(34.0f64)
+                            .set_background_color(bg)
+                            .set_corner_radius(vocab::Corners::all(10.0f64))
+                            .set_input_transparent(true)
+                    }
+                    .height(ROW_H)
+                        .justify(flex::Justify::Center)
+                        .padding_edge(flex::Edge::Vertical, 2.0f64)
+                        .gesture(on_hover: this.on_hover, on_unhover: this.on_unhover)
+                }
+            }
+        };
+    }
+
+    // ---- handlers -------------------------------------------------------------
+
+    fn on_hover(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return false; };
+        let next: i64 = at as i64;
+        if next == this.hovered { return false; }
+        let prev: i64 = this.hovered;
+        this.hovered = next;
+        if let option::Option::Some(l) = m_list::find("side:list") {
+            if prev >= (0 as i64) && (prev as usize) < this.items.count() {
+                let _a: m_list::List = l.invalidate_row(at: prev as usize);
+            }
+            let _b: m_list::List = l.invalidate_row(at: at);
+        }
+        return false;
+    }
+
+    fn on_unhover(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return false; };
+        if (at as i64) != this.hovered { return false; }
+        this.hovered = -1 as i64;
+        if let option::Option::Some(l) = m_list::find("side:list") {
+            if at < this.items.count() {
+                let _l: m_list::List = l.invalidate_row(at: at);
+            }
+        }
+        return false;
+    }
+
+    fn on_row_tapped(ref this, sender: *u8) {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return; };
+        guard let option::Option::Some(it) = this.items.at_ptr(at) else { return; };
+        match (*it).kind {
+            ItemKind::SectionHeader => { return; }
+            ItemKind::ProjectsHeader => { return; }
+            ItemKind::Folder => {
+                let fk: text::Text = (*it).folder_key.clone();
+                this._toggle_collapsed(fk.view());
+                this._sync();
+                return;
+            }
+            _ => {}
+        }
+        let sid: text::Text = (*it).row.session_id.clone();
+        let cwd: text::Text = (*it).row.cwd.clone();
+        let title: text::Text = (*it).row.title.clone();
+        engine::load_session(sid.view(), cwd.view(), title: title.view());
+    }
+
+    fn on_add_project(ref this, _sender: *u8) {
+        pickers::choose_and_open_project();
+    }
+
+    // "New run" goes back to the Home composer; the session is made when the
+    // first prompt is sent.
+    fn on_new_run(ref this, _sender: *u8) {
+        let proj: text::Text = sessions::selected_project();
+        engine::new_chat(cwd: proj.view());
+    }
+
+    fn on_settings(ref this, _sender: *u8) {
+        let _ = runtime::app().open_window("settings");
+    }
+
+    fn on_toggle_account_pop(ref this, _sender: *u8) -> bool {
+        this.account_pop_open = !this.account_pop_open;
+        if this.account_pop_open {
+            engine::refresh_account();
+        }
+        this._sync_account();
+        return true;
+    }
+
+    fn on_acc_close(ref this, _sender: *u8) -> bool {
+        this.account_pop_open = false;
+        this._sync_account();
+        return true;
+    }
+
+    fn on_acc_refresh(ref this, _sender: *u8) {
+        engine::refresh_account();
+    }
+
+    fn on_acc_signout(ref this, _sender: *u8) {
+        this.account_pop_open = false;
+        this._sync_account();
+        engine::sign_out();
+    }
+
+    fn _close_search(ref this) {
+        style::show("side:search_bar", false);
+        if let option::Option::Some(tf) = text_field::find("side:search_field") {
+            let _tf: text_field::TextField = tf.set_text("");
+        }
+        engine::search_sessions("");
+    }
+
+    fn on_search_open(ref this, _sender: *u8) {
+        open_search();
+    }
+
+    fn on_search_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(tf) = text_field::find("side:search_field") else { return; };
+        let q: text::Text = text::from_str(tf.text());
+        engine::search_sessions(q.view().trim());
+    }
+
+    fn on_search_submit(ref this, _sender: *u8) {
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if !(*rp).session_id.is_empty() {
+                    engine::load_session((*rp).session_id.view(), (*rp).cwd.view(), title: (*rp).title.view());
+                    return;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    fn on_search_key(ref this, event: *u8) -> bool {
+        if gestures::key_named(event) == gestures::key_escape() {
+            this._close_search();
+            return true;
+        }
+        return false;
+    }
+
+    fn on_search_close(ref this, _sender: *u8) -> bool {
+        this._close_search();
+        return true;
+    }
+
+    fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) { this._sync(); }
+    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) { this._sync(); }
+    fn on_account_changed(ref this, _ev: account::AccountChange) { this._sync_account(); }
+}
+
+impl Sidebar: component::Component {
+    fn build(ref this) -> core::Node {
+        return @ui {
+            column(key: "side:pane") {
+                style::primary_button("+  New run", "side:new",
+                on_click: this.on_new_run,
+                height: 40.0f64, font_size: 15.0f64)
+                    .margin_edge(flex::Edge::Bottom, 6.0f64)
+
+                hstack(key: "side:search_bar") {
+                    symbol(icons::search, size: 15.0f64, color: style::muted())
+                        .shrink(0.0f64)
+                        .set_input_transparent(true)
+                    text_field("", key: "side:search_field",
+                    font_size: 13.0f64,
+                    text_color: style::ink(),
+                    placeholder: "Search chats…",
+                    placeholder_color: style::faint(),
+                    bordered: false,
+                    on_text_changed: this.on_search_changed,
+                    on_submit: this.on_search_submit)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                        .height(24.0f64)
+                        .gesture(on_key: this.on_search_key)
+                    style::circle_icon(icons::close, "side:search_clear",
+                    title: "Close search",
+                    size: 22.0f64, icon_size: 14.0f64,
+                    color: style::muted(),
+                    on_click: this.on_search_close)
+                }
+                .height(32.0f64)
+                    .shrink(0.0f64)
+                    .align(flex::Align::Center)
+                    .gap(6.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                    .set_background_color(style::chip())
+                    .set_corner_radius(vocab::Corners::all(8.0f64))
+
+                list(key: "side:list", on_item_tapped: this.on_row_tapped)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+
+                style::rule()
+                bordered(key: "side:account_pop",
+                stroke: vocab::Brush::solid(style::hairline()),
+                stroke_width: 1.0f64,
+                stroke_shape: vocab::Shape::rounded(12.0f64)) {
+                    column {
+                        hstack {
+                            column {
+                                label("", key: "side:acc_name",
+                                font_size: 13.0f64,
+                                font_weight: vocab::FontWeight::Semibold,
+                                text_color: style::ink(),
+                                line_break: vocab::LineBreak::TailTruncation,
+                                max_lines: 1 as i64)
+                                label("", key: "side:acc_email",
+                                font_size: 11.5f64,
+                                text_color: style::muted(),
+                                line_break: vocab::LineBreak::TailTruncation,
+                                max_lines: 1 as i64)
+                            }
+                            .grow(1.0f64)
+                                .shrink(1.0f64)
+                                .min_width(0.0f64)
+                                .gap(1.0f64)
+                            style::circle_icon(icons::close, "side:acc_close",
+                            title: "Close",
+                            size: 22.0f64, icon_size: 14.0f64,
+                            color: style::muted(),
+                            on_click: this.on_acc_close)
+                        }
+                        .align(flex::Align::Start)
+                            .gap(6.0f64)
+
+                        hstack {
+                            label("", key: "side:acc_plan",
+                            font_size: 11.5f64,
+                            font_weight: vocab::FontWeight::Semibold,
+                            text_color: style::lime_text())
+                            spacer().grow(1.0f64)
+                            label("", key: "side:acc_prepaid",
+                            font_size: 11.5f64,
+                            text_color: style::muted())
+                        }
+                        .align(flex::Align::Center)
+
+                        label("", key: "side:acc_reset",
+                        font_size: 11.5f64,
+                        text_color: style::muted(),
+                        max_lines: 1 as i64)
+
+                        hstack {
+                            text_button("Refresh", key: "side:acc_refresh",
+                            font_size: 11.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::ink(),
+                            bordered: false,
+                            corner_radius: vocab::Corners::all(6.0f64),
+                            on_click: this.on_acc_refresh)
+                                .padding_edge(flex::Edge::Horizontal, 9.0f64)
+                                .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                .set_background_color(style::chip())
+                            spacer().grow(1.0f64)
+                            text_button("Sign out", key: "side:acc_signout",
+                            font_size: 11.5f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::danger(),
+                            bordered: false,
+                            on_click: this.on_acc_signout)
+                        }
+                        .align(flex::Align::Center)
+                            .padding_edge(flex::Edge::Top, 4.0f64)
+                    }
+                    .gap(6.0f64)
+                        .padding(11.0f64)
+                }
+                .shrink(0.0f64)
+                    .set_background_color(style::well())
+                    .set_corner_radius(vocab::Corners::all(12.0f64))
+
+                column(key: "side:footer") {
+                    column(key: "side:footer_trigger") {
+                        hstack {
+                            label("", key: "side:plan", font_size: 13.5f64, text_color: style::muted(),
+                            line_break: vocab::LineBreak::TailTruncation, max_lines: 1 as i64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                                .set_input_transparent(true)
+                            label("", key: "side:pct", font_size: 13.5f64,
+                            font_weight: vocab::FontWeight::Medium, text_color: style::ink())
+                                .set_input_transparent(true)
+                        }
+                        .align(flex::Align::Center)
+                        style::usage_bar("side:bar")
+                    }
+                    .gap(8.0f64)
+                        .gesture(on_click: this.on_toggle_account_pop)
+                    hstack {
+                        label("", key: "side:reset", font_size: 13.5f64, text_color: style::muted(),
+                        max_lines: 1 as i64)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                        style::link_button("Settings", "side:settings", on_click: this.on_settings)
+                    }
+                    .align(flex::Align::Center)
+                }
+                .gap(10.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 6.0f64)
+                    .padding_edge(flex::Edge::Top, 14.0f64)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                .padding_edge(flex::Edge::Top, 16.0f64)
+                .padding_edge(flex::Edge::Bottom, 14.0f64)
+                .gap(8.0f64)
+                .set_background_color(style::canvas())
+        };
+    }
+}
+
+impl Sidebar: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.sessions_sub = sessions::watch(this.on_sessions_changed);
+        this.status_sub = engine::watch_status(this.on_status_changed);
+        this.account_sub = account::watch(this.on_account_changed);
+        if let option::Option::Some(l) = m_list::find("side:list") {
+            let _l: m_list::List = l
+                .set_uneven_rows(true)
+                .set_selection_mode(vocab::SelectionMode::None)
+                .set_separator(vocab::Separator::None)
+                .set_row(this.build_row)
+                .set_row_height_of(this.row_height)
+                .set_count(0 as usize);
+        }
+        style::show("side:search_bar", false);
+        this._sync();
+        this._sync_account();
+    }
+}
+
+fn open_search() {
+    panels::show_sidebar();
+    style::show("side:search_bar", true);
+    if let option::Option::Some(tf) = text_field::find("side:search_field") {
+        let _tf: text_field::TextField = tf.focus();
+    }
+}

@@ -1,0 +1,141 @@
+// src/ui/about_screen.cplus — About Desk420 window (Desk420 -> About Desk420).
+
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/icons" as icons;
+import "facet/label" as label;
+import "facet/screen" as screen;
+import "facet/symbol" as symbol;
+import "facet/text_button" as text_button;
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "facet/window" as window;
+import "facet/window_chrome" as window_chrome;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+import "../engine/runtime" as engine;
+import "./style" as style;
+
+const APP_VERSION: str = "0.1.0";
+
+struct AboutScreen {}
+
+impl AboutScreen {
+    fn new() -> AboutScreen {
+        return AboutScreen {};
+    }
+
+    fn on_close(ref this, _sender: *u8) {
+        if let option::Option::Some(w) = runtime::app().find_window("about") {
+            let _c: bool = w.close();
+        }
+    }
+}
+
+impl AboutScreen: component::Component {
+    fn build(ref this) -> core::Node {
+        let cli_v: text::Text = engine::cli_version();
+        let cli_line: text::Text = if cli_v.is_empty() {
+            text::from_str("Grok CLI · Not connected")
+        } else {
+            "Grok CLI ${cli_v.view()} (ACP)"
+        };
+        var root: core::Node = @ui {
+            column(key: "about:root") {
+                zstack {
+                    row {}
+                    .width_percent(100.0f64)
+                        .height(38.0f64)
+                        .window_drag()
+                    row {
+                        window_buttons(key: "about:window-buttons")
+                            .set_input_transparent(false)
+                    }
+                    .height(38.0f64)
+                        .align(flex::Align::Center)
+                        .padding_edge(flex::Edge::Left, 14.0f64)
+                        .position_edge(flex::Edge::Left, 0.0f64)
+                        .position_edge(flex::Edge::Top, 0.0f64)
+                }
+                .height(38.0f64)
+                    .shrink(0.0f64)
+
+                column {
+                    bordered(stroke: vocab::Brush::solid(style::hairline()),
+                    stroke_width: 1.0f64,
+                    stroke_shape: vocab::Shape::rounded(18.0f64)) {
+                        column {
+                            symbol(icons::bolt, size: 36.0f64, color: style::lime())
+                        }
+                        .width(68.0f64)
+                            .height(68.0f64)
+                            .justify(flex::Justify::Center)
+                            .align(flex::Align::Center)
+                    }
+                    .set_background_color(style::brand_badge())
+                        .set_corner_radius(vocab::Corners::all(18.0f64))
+
+                    label("Desk420", key: "about:name",
+                    font_size: 22.0f64,
+                    font_weight: vocab::FontWeight::Bold,
+                    text_color: style::ink())
+                        .margin_edge(flex::Edge::Top, 10.0f64)
+
+                    label("Version ${APP_VERSION}", key: "about:version",
+                    font_size: 13.0f64,
+                    text_color: style::muted())
+
+                    label("Native desktop client for Grok", key: "about:tagline",
+                    font_size: 13.5f64,
+                    text_color: style::ink())
+                        .margin_edge(flex::Edge::Top, 8.0f64)
+
+                    label(cli_line.view(), key: "about:cli",
+                    font_family: ftheme::MONOSPACE,
+                    font_size: 11.5f64,
+                    text_color: style::muted())
+                        .margin_edge(flex::Edge::Top, 4.0f64)
+
+                    label("Written in C+ on facet", key: "about:stack",
+                    font_size: 11.5f64,
+                    text_color: style::faint())
+                        .margin_edge(flex::Edge::Top, 2.0f64)
+
+                    text_button("OK", key: "about:ok",
+                    font_size: 12.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    bordered: false,
+                    corner_radius: vocab::Corners::all(7.0f64),
+                    on_click: this.on_close)
+                        .padding_edge(flex::Edge::Horizontal, 18.0f64)
+                        .padding_edge(flex::Edge::Vertical, 5.0f64)
+                        .set_background_color(style::chip())
+                        .margin_edge(flex::Edge::Top, 16.0f64)
+                }
+                .grow(1.0f64)
+                    .align(flex::Align::Center)
+                    .justify(flex::Justify::Center)
+                    .gap(3.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 24.0f64)
+                    .padding_edge(flex::Edge::Bottom, 22.0f64)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .set_background_color(style::canvas())
+        };
+        root.set_safe_area(vocab::SafeArea::None);
+        return root;
+    }
+}
+
+impl AboutScreen: component::Lifecycle {}
+impl AboutScreen: screen::Screen {}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[AboutScreen](AboutScreen::new());
+}

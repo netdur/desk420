@@ -1,0 +1,14 @@
+/target
+/vendor
+/cpc
+/issues/
+.DS_Store
+*.dmg
+*.log
+*.swp
+.env
+.env.*
+.vscode/
+.idea/
+__pycache__/
+*.pyc

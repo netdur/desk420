@@ -1,0 +1,388 @@
+// src/markdown/parser.cplus — lightweight streaming markdown parser.
+//
+// Splits agent markdown into display blocks (Paragraph, Heading, ListItem,
+// CodeBlock) on the fly, including unclosed fenced code blocks while
+// streaming, and parses inline spans (**bold**, *italic*, `code`, [text](url)).
+// Pure C+ with no UI imports so it unit-tests directly.
+
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+enum BlockKind {
+    Paragraph,
+    Heading,
+    ListItem,
+    CodeBlock,
+}
+
+struct MdBlock {
+    kind: BlockKind,
+    level: i32,         // heading level (1..3), 0 otherwise
+    lang: text::Text,   // fence language for CodeBlock
+    body: text::Text,   // text content
+}
+
+enum InlineKind {
+    Plain,
+    Bold,
+    Italic,
+    Code,
+    Link,
+}
+
+struct InlineSpan {
+    kind: InlineKind,
+    text: text::Text,
+    url: text::Text,
+}
+
+// ───────────────────────────── block parser ─────────────────────────────
+
+fn _push_paragraph(ref out: vec::Vec[MdBlock], take body: text::Text) {
+    if body.is_empty() { return; }
+    let _ = out.append(MdBlock {
+        kind: BlockKind::Paragraph,
+        level: 0 as i32,
+        lang: text::from_str(""),
+        body: body,
+    });
+}
+
+fn _is_ordered_list(s: str) -> bool {
+    let n: usize = s.count();
+    if n < (3 as usize) { return false; }
+    var i: usize = 0 as usize;
+    while i < n && i < (4 as usize) {
+        if let option::Option::Some(b) = s.byte_at(i) {
+            if b >= (48 as u8) && b <= (57 as u8) {
+                i = i +% (1 as usize);
+                continue;
+            }
+        }
+        break;
+    }
+    if i == (0 as usize) || i +% (1 as usize) >= n { return false; }
+    let dot: bool = match s.byte_at(i) {
+        option::Option::Some(b) => b == (46 as u8),
+        option::Option::None => false,
+    };
+    let sp: bool = match s.byte_at(i +% (1 as usize)) {
+        option::Option::Some(b) => b == (32 as u8),
+        option::Option::None => false,
+    };
+    return dot && sp;
+}
+
+fn parse_blocks(src: str) -> vec::Vec[MdBlock] {
+    var out: vec::Vec[MdBlock] = vec::new::[MdBlock]();
+    if src.is_empty() { return out; }
+
+    let lines: vec::Vec[str] = src.split(separator: "\n");
+    var para: text::Text = text::new();
+    var in_fence: bool = false;
+    var fence_lang: text::Text = text::new();
+    var fence_body: text::Text = text::new();
+
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if let option::Option::Some(raw_line) = lines.at(i) {
+            // Strip trailing \r if present.
+            var line: str = raw_line;
+            if line.has_suffix("\r") {
+                if let option::Option::Some(sl) = line.slice(from: 0 as usize, to: line.count() -% (1 as usize)) {
+                    line = sl;
+                }
+            }
+            let trimmed: str = line.trim_start();
+
+            if in_fence {
+                if trimmed.has_prefix("```") {
+                    let _ = out.append(MdBlock {
+                        kind: BlockKind::CodeBlock,
+                        level: 0 as i32,
+                        lang: fence_lang.clone(),
+                        body: fence_body.clone(),
+                    });
+                    in_fence = false;
+                    fence_lang = text::new();
+                    fence_body = text::new();
+                } else {
+                    if !fence_body.is_empty() {
+                        let _ = fence_body.append("\n");
+                    }
+                    let _ = fence_body.append(line);
+                }
+            } else if trimmed.has_prefix("```") {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                in_fence = true;
+                if trimmed.count() > (3 as usize) {
+                    if let option::Option::Some(lang_s) = trimmed.slice(from: 3 as usize, to: trimmed.count()) {
+                        fence_lang = text::from_str(lang_s.trim());
+                    }
+                } else {
+                    fence_lang = text::new();
+                }
+                fence_body = text::new();
+            } else if trimmed.is_empty() {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+            } else if trimmed.has_prefix("### ") {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                if let option::Option::Some(h) = trimmed.slice(from: 4 as usize, to: trimmed.count()) {
+                    let _ = out.append(MdBlock {
+                        kind: BlockKind::Heading,
+                        level: 3 as i32,
+                        lang: text::from_str(""),
+                        body: text::from_str(h),
+                    });
+                }
+            } else if trimmed.has_prefix("## ") {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                if let option::Option::Some(h) = trimmed.slice(from: 3 as usize, to: trimmed.count()) {
+                    let _ = out.append(MdBlock {
+                        kind: BlockKind::Heading,
+                        level: 2 as i32,
+                        lang: text::from_str(""),
+                        body: text::from_str(h),
+                    });
+                }
+            } else if trimmed.has_prefix("# ") {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                if let option::Option::Some(h) = trimmed.slice(from: 2 as usize, to: trimmed.count()) {
+                    let _ = out.append(MdBlock {
+                        kind: BlockKind::Heading,
+                        level: 1 as i32,
+                        lang: text::from_str(""),
+                        body: text::from_str(h),
+                    });
+                }
+            } else if trimmed.has_prefix("- ") || trimmed.has_prefix("* ") {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                if let option::Option::Some(item) = trimmed.slice(from: 2 as usize, to: trimmed.count()) {
+                    let _ = out.append(MdBlock {
+                        kind: BlockKind::ListItem,
+                        level: 0 as i32,
+                        lang: text::from_str(""),
+                        body: text::from_str(item),
+                    });
+                }
+            } else if _is_ordered_list(trimmed) {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                let _ = out.append(MdBlock {
+                    kind: BlockKind::ListItem,
+                    level: 1 as i32,
+                    lang: text::from_str(""),
+                    body: text::from_str(trimmed),
+                });
+            } else {
+                if !para.is_empty() {
+                    let _ = para.append("\n");
+                }
+                let _ = para.append(line);
+            }
+        }
+        i = i +% (1 as usize);
+    }
+
+    // Flush open fence while streaming (never wait for closing ```).
+    if in_fence {
+        let _ = out.append(MdBlock {
+            kind: BlockKind::CodeBlock,
+            level: 0 as i32,
+            lang: fence_lang,
+            body: fence_body,
+        });
+    } else {
+        _push_paragraph(out, para);
+    }
+
+    return out;
+}
+
+// ───────────────────────────── inline span parser ─────────────────────────────
+
+fn _push_plain(ref out: vec::Vec[InlineSpan], take buf: text::Text) {
+    if buf.is_empty() { return; }
+    let _ = out.append(InlineSpan {
+        kind: InlineKind::Plain,
+        text: buf,
+        url: text::from_str(""),
+    });
+}
+
+fn _byte_is(s: str, idx: usize, target: u8) -> bool {
+    return match s.byte_at(idx) {
+        option::Option::Some(b) => b == target,
+        option::Option::None => false,
+    };
+}
+
+fn _find_byte(s: str, len: usize, start: usize, target: u8) -> option::Option[usize] {
+    var i: usize = start;
+    while i < len {
+        if _byte_is(s, i, target) { return option::Option[usize]::Some(i); }
+        i = i +% (1 as usize);
+    }
+    return option::Option[usize]::None;
+}
+
+fn _find_double_star(s: str, len: usize, start: usize) -> option::Option[usize] {
+    var i: usize = start;
+    while i +% (1 as usize) < len {
+        if _byte_is(s, i, 42 as u8) && _byte_is(s, i +% (1 as usize), 42 as u8) {
+            return option::Option[usize]::Some(i);
+        }
+        i = i +% (1 as usize);
+    }
+    return option::Option[usize]::None;
+}
+
+fn parse_inline(src: str) -> vec::Vec[InlineSpan] {
+    var out: vec::Vec[InlineSpan] = vec::new::[InlineSpan]();
+    let len: usize = src.count();
+    if len == (0 as usize) { return out; }
+
+    var plain: text::Text = text::new();
+    var i: usize = 0 as usize;
+
+    while i < len {
+        let b: u8 = match src.byte_at(i) {
+            option::Option::Some(v) => v,
+            option::Option::None => { break; }
+        };
+
+        // Inline code: `...`
+        if b == (96 as u8) {
+            if let option::Option::Some(end_i) = _find_byte(src, len, i +% (1 as usize), 96 as u8) {
+                if end_i > i +% (1 as usize) {
+                    _push_plain(out, plain.clone());
+                    plain = text::new();
+                    if let option::Option::Some(inner) = src.slice(from: i +% (1 as usize), to: end_i) {
+                        let _ = out.append(InlineSpan {
+                            kind: InlineKind::Code,
+                            text: text::from_str(inner),
+                            url: text::from_str(""),
+                        });
+                    }
+                    i = end_i +% (1 as usize);
+                    continue;
+                }
+            }
+        }
+
+        // Bold: **...**
+        if b == (42 as u8) && _byte_is(src, i +% (1 as usize), 42 as u8) {
+            if let option::Option::Some(end_i) = _find_double_star(src, len, i +% (2 as usize)) {
+                if end_i > i +% (2 as usize) {
+                    _push_plain(out, plain.clone());
+                    plain = text::new();
+                    if let option::Option::Some(inner) = src.slice(from: i +% (2 as usize), to: end_i) {
+                        let _ = out.append(InlineSpan {
+                            kind: InlineKind::Bold,
+                            text: text::from_str(inner),
+                            url: text::from_str(""),
+                        });
+                    }
+                    i = end_i +% (2 as usize);
+                    continue;
+                }
+            }
+        }
+
+        // Italic: *...*
+        if b == (42 as u8) {
+            if let option::Option::Some(end_i) = _find_byte(src, len, i +% (1 as usize), 42 as u8) {
+                if end_i > i +% (1 as usize) {
+                    _push_plain(out, plain.clone());
+                    plain = text::new();
+                    if let option::Option::Some(inner) = src.slice(from: i +% (1 as usize), to: end_i) {
+                        let _ = out.append(InlineSpan {
+                            kind: InlineKind::Italic,
+                            text: text::from_str(inner),
+                            url: text::from_str(""),
+                        });
+                    }
+                    i = end_i +% (1 as usize);
+                    continue;
+                }
+            }
+        }
+
+        // Link: [label](url)
+        if b == (91 as u8) {
+            if let option::Option::Some(close_br) = _find_byte(src, len, i +% (1 as usize), 93 as u8) {
+                if close_br +% (2 as usize) < len && _byte_is(src, close_br +% (1 as usize), 40 as u8) {
+                    if let option::Option::Some(close_par) = _find_byte(src, len, close_br +% (2 as usize), 41 as u8) {
+                        _push_plain(out, plain.clone());
+                        plain = text::new();
+                        var lbl: str = "";
+                        var url: str = "";
+                        if let option::Option::Some(ls) = src.slice(from: i +% (1 as usize), to: close_br) { lbl = ls; }
+                        if let option::Option::Some(us) = src.slice(from: close_br +% (2 as usize), to: close_par) { url = us; }
+                        let _ = out.append(InlineSpan {
+                            kind: InlineKind::Link,
+                            text: text::from_str(lbl),
+                            url: text::from_str(url),
+                        });
+                        i = close_par +% (1 as usize);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Append single byte slice to plain buffer.
+        if let option::Option::Some(ch) = src.slice(from: i, to: i +% (1 as usize)) {
+            let _ = plain.append(ch);
+        }
+        i = i +% (1 as usize);
+    }
+
+    _push_plain(out, plain);
+    return out;
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn parses_headings_lists_paragraphs_and_streaming_code_fence() {
+    let md: str = "# Title\n\nHello world.\n\n- first\n- second\n\n```rust\nfn main() {}\n```\n\n```py\nprint(1)";
+    let blocks: vec::Vec[MdBlock] = parse_blocks(md);
+    assert blocks.count() == (6 as usize);
+
+    guard let option::Option::Some(b0) = blocks.at_ptr(0 as usize) else { assert false; return; };
+    assert (*b0).kind == BlockKind::Heading && (*b0).level == (1 as i32) && (*b0).body.equals("Title");
+
+    guard let option::Option::Some(b1) = blocks.at_ptr(1 as usize) else { assert false; return; };
+    assert (*b1).kind == BlockKind::Paragraph && (*b1).body.equals("Hello world.");
+
+    guard let option::Option::Some(b2) = blocks.at_ptr(2 as usize) else { assert false; return; };
+    assert (*b2).kind == BlockKind::ListItem && (*b2).body.equals("first");
+
+    guard let option::Option::Some(b4) = blocks.at_ptr(4 as usize) else { assert false; return; };
+    assert (*b4).kind == BlockKind::CodeBlock && (*b4).lang.equals("rust") && (*b4).body.equals("fn main() {}");
+
+    // Unclosed fence while streaming renders immediately as a CodeBlock.
+    guard let option::Option::Some(b5) = blocks.at_ptr(5 as usize) else { assert false; return; };
+    assert (*b5).kind == BlockKind::CodeBlock && (*b5).lang.equals("py") && (*b5).body.equals("print(1)");
+}
+
+#[test]
+fn parses_inline_bold_italic_code_and_link() {
+    let spans: vec::Vec[InlineSpan] = parse_inline("Say **hi** and *bye* with `x` at [Grok](https://grok.com)!");
+    assert spans.count() == (9 as usize);
+
+    guard let option::Option::Some(s1) = spans.at_ptr(1 as usize) else { assert false; return; };
+    assert (*s1).text.equals("hi");
+    guard let option::Option::Some(s5) = spans.at_ptr(5 as usize) else { assert false; return; };
+    assert (*s5).text.equals("x");
+    guard let option::Option::Some(s7) = spans.at_ptr(7 as usize) else { assert false; return; };
+    assert (*s7).text.equals("Grok") && (*s7).url.equals("https://grok.com");
+}

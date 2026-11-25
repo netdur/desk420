@@ -1,0 +1,286 @@
+// src/acp/wire.cplus — JSON-RPC 2.0 envelopes for ACP.
+//
+// ACP speaks newline-delimited JSON-RPC 2.0 on stdin/stdout (no Content-Length).
+// Line framing is handled by `stdlib/line_reader`; this module owns envelope
+// decoding and encoding. Three incoming message kinds exist on the wire:
+//   - Response:     has `id`, no `method` (`result` or `error`)
+//   - Notification: has `method`, no `id`
+//   - Request:      has both `id` and `method` (agent-to-client, e.g. permission)
+
+import "json/json" as json;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+enum JsonRpcId {
+    Num(i64),
+    Str(text::Text),
+}
+
+impl JsonRpcId {
+    fn clone(this) -> JsonRpcId {
+        return match this {
+            JsonRpcId::Num(n) => JsonRpcId::Num(n),
+            JsonRpcId::Str(s) => JsonRpcId::Str(s.clone()),
+        };
+    }
+
+    fn to_json(this) -> json::Value {
+        return match this {
+            JsonRpcId::Num(n) => json::Value::number(n as f64),
+            JsonRpcId::Str(s) => json::Value::text(s.view()),
+        };
+    }
+
+    fn as_num(this) -> option::Option[i64] {
+        return match this {
+            JsonRpcId::Num(n) => option::Option[i64]::Some(n),
+            JsonRpcId::Str(_s) => option::Option[i64]::None,
+        };
+    }
+
+    fn equals_num(this, n: i64) -> bool {
+        return match this {
+            JsonRpcId::Num(v) => v == n,
+            JsonRpcId::Str(_s) => false,
+        };
+    }
+
+    fn equals(this, other: JsonRpcId) -> bool {
+        return match this {
+            JsonRpcId::Num(a) => match other {
+                JsonRpcId::Num(b) => a == b,
+                JsonRpcId::Str(_b) => false,
+            },
+            JsonRpcId::Str(a) => match other {
+                JsonRpcId::Num(_b) => false,
+                JsonRpcId::Str(b) => a.equals(b.view()),
+            },
+        };
+    }
+}
+
+struct RpcError {
+    code: i64,
+    message: text::Text,
+}
+
+impl RpcError: Clone {}
+
+struct RpcResponse {
+    id: JsonRpcId,
+    result: option::Option[json::Value],
+    error: option::Option[RpcError],
+}
+
+struct RpcNotification {
+    method: text::Text,
+    params: json::Value,
+}
+
+struct RpcRequest {
+    id: JsonRpcId,
+    method: text::Text,
+    params: json::Value,
+}
+
+enum Envelope {
+    Response(RpcResponse),
+    Notification(RpcNotification),
+    Request(RpcRequest),
+    Invalid(text::Text),
+}
+
+fn _parse_id(v: json::Value) -> option::Option[JsonRpcId] {
+    if let option::Option::Some(n) = v.as_number() {
+        return option::Option[JsonRpcId]::Some(JsonRpcId::Num(n as i64));
+    }
+    if let option::Option::Some(s) = v.as_text() {
+        return option::Option[JsonRpcId]::Some(JsonRpcId::Str(s));
+    }
+    return option::Option[JsonRpcId]::None;
+}
+
+fn _parse_error(v: json::Value) -> RpcError {
+    return RpcError {
+        code: v.field_number("code", -32000.0f64) as i64,
+        message: v.field_str("message", "unknown error"),
+    };
+}
+
+fn decode_line(line: str) -> Envelope {
+    let trimmed: str = line.trim();
+    if trimmed.is_empty() {
+        return Envelope::Invalid(text::from_str("empty line"));
+    }
+    guard let result::Result::Ok(root) = json::Value::parse(source: trimmed) else {
+        return Envelope::Invalid(text::from_str("invalid json"));
+    };
+    if !root.is_object() {
+        return Envelope::Invalid(text::from_str("json-rpc message must be an object"));
+    }
+
+    let maybe_id: option::Option[JsonRpcId] = match root.value(for_key: "id") {
+        option::Option::Some(id_v) => _parse_id(id_v),
+        option::Option::None => option::Option[JsonRpcId]::None,
+    };
+
+    let maybe_method: option::Option[text::Text] = match root.value(for_key: "method") {
+        option::Option::Some(mv) => mv.as_text(),
+        option::Option::None => option::Option[text::Text]::None,
+    };
+
+    match maybe_method {
+        option::Option::Some(method) => {
+            let params: json::Value = match root.value(for_key: "params") {
+                option::Option::Some(p) => p,
+                option::Option::None => json::Value::null(),
+            };
+            match maybe_id {
+                option::Option::Some(id) => {
+                    return Envelope::Request(RpcRequest {
+                        id: id,
+                        method: method,
+                        params: params,
+                    });
+                }
+                option::Option::None => {
+                    return Envelope::Notification(RpcNotification {
+                        method: method,
+                        params: params,
+                    });
+                }
+            }
+        }
+        option::Option::None => {
+            guard let option::Option::Some(id) = maybe_id else {
+                return Envelope::Invalid(text::from_str("json-rpc message has neither method nor id"));
+            };
+            let res: option::Option[json::Value] = root.value(for_key: "result");
+            let err: option::Option[RpcError] = match root.value(for_key: "error") {
+                option::Option::Some(ev) => if ev.is_null() {
+                    option::Option[RpcError]::None
+                } else {
+                    option::Option[RpcError]::Some(_parse_error(ev))
+                },
+                option::Option::None => option::Option[RpcError]::None,
+            };
+            return Envelope::Response(RpcResponse {
+                id: id,
+                result: res,
+                error: err,
+            });
+        }
+    }
+}
+
+fn _finish_line(take obj: json::Value) -> text::Text {
+    var s: text::Text = obj.to_text();
+    let _ = s.append("\n");
+    return s;
+}
+
+fn encode_request(id: i64, method: str, take params: json::Value) -> text::Text {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("jsonrpc", json::Value::text("2.0")));
+    let _ = m.append(json::Member::new("id", json::Value::number(id as f64)));
+    let _ = m.append(json::Member::new("method", json::Value::text(method)));
+    if !params.is_null() {
+        let _ = m.append(json::Member::new("params", params));
+    }
+    return _finish_line(json::Value::object(m));
+}
+
+fn encode_notification(method: str, take params: json::Value) -> text::Text {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("jsonrpc", json::Value::text("2.0")));
+    let _ = m.append(json::Member::new("method", json::Value::text(method)));
+    if !params.is_null() {
+        let _ = m.append(json::Member::new("params", params));
+    }
+    return _finish_line(json::Value::object(m));
+}
+
+fn encode_response(id: JsonRpcId, take result_val: json::Value) -> text::Text {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("jsonrpc", json::Value::text("2.0")));
+    let _ = m.append(json::Member::new("id", id.to_json()));
+    let _ = m.append(json::Member::new("result", result_val));
+    return _finish_line(json::Value::object(m));
+}
+
+fn encode_error(id: JsonRpcId, code: i64, message: str) -> text::Text {
+    var em: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = em.append(json::Member::new("code", json::Value::number(code as f64)));
+    let _ = em.append(json::Member::new("message", json::Value::text(message)));
+
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = m.append(json::Member::new("jsonrpc", json::Value::text("2.0")));
+    let _ = m.append(json::Member::new("id", id.to_json()));
+    let _ = m.append(json::Member::new("error", json::Value::object(em)));
+    return _finish_line(json::Value::object(m));
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn envelope_roundtrips_all_three_kinds() {
+    // 1. Request (also covers agent-to-client request decoding)
+    var pm: vec::Vec[json::Member] = vec::new::[json::Member]();
+    let _ = pm.append(json::Member::new("x", json::Value::number(42.0)));
+    let req_line: text::Text = encode_request(7 as i64, "session/request_permission", json::Value::object(pm));
+    match decode_line(req_line.view()) {
+        Envelope::Request(r) => {
+            assert r.id.equals_num(7 as i64);
+            assert r.method.equals("session/request_permission");
+            guard let option::Option::Some(xv) = r.params.value(for_key: "x") else { assert false; return; };
+            guard let option::Option::Some(n) = xv.as_number() else { assert false; return; };
+            assert (n as i64) == (42 as i64);
+        }
+        _other => { assert false; }
+    }
+
+    // 2. Notification
+    let notif_line: text::Text = encode_notification("session/cancel", json::Value::null());
+    match decode_line(notif_line.view()) {
+        Envelope::Notification(n) => {
+            assert n.method.equals("session/cancel");
+        }
+        _other => { assert false; }
+    }
+
+    // 3. Response with result
+    let resp_line: text::Text = encode_response(JsonRpcId::Num(3 as i64), json::Value::text("ok"));
+    match decode_line(resp_line.view()) {
+        Envelope::Response(r) => {
+            assert r.id.equals_num(3 as i64);
+            var got_ok: bool = false;
+            if let option::Option::Some(rv) = r.result {
+                if let option::Option::Some(t) = rv.as_text() {
+                    got_ok = t.equals("ok");
+                }
+            }
+            assert got_ok;
+            match r.error {
+                option::Option::None => { assert true; }
+                option::Option::Some(_e) => { assert false; }
+            }
+        }
+        _other => { assert false; }
+    }
+
+    // 4. Response with error and string id
+    let err_line: text::Text = encode_error(JsonRpcId::Str(text::from_str("abc")), -32000 as i64, "Authentication required");
+    match decode_line(err_line.view()) {
+        Envelope::Response(r) => {
+            assert r.id.equals(JsonRpcId::Str(text::from_str("abc")));
+            var got_err: bool = false;
+            if let option::Option::Some(e) = r.error {
+                got_err = e.code == (-32000 as i64) && e.message.equals("Authentication required");
+            }
+            assert got_err;
+        }
+        _other => { assert false; }
+    }
+}

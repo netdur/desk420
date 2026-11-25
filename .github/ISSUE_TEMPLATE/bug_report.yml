@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a crash, visual defect, or unexpected behavior in Desk420
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly and concisely.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Desk420
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, architecture (Apple Silicon / Intel), and `grok --version`.
+      placeholder: "macOS 15.x (Apple Silicon), grok 1.0.92"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Screenshots or logs
+      description: Attach screenshots or relevant console output (please redact any personal paths or tokens).

@@ -1,0 +1,545 @@
+// src/acp/client.cplus — ACP JSON-RPC client over a child process's stdio pipes.
+//
+// Owns the child process, a dedicated stdout reader thread, a stderr drainer
+// thread, and a lock-free request/response routing pipeline:
+//   - Before writing a request to stdin, the caller pushes `PendingEntry`
+//     into `reg_tx` (happens-before the child can ever reply).
+//   - The reader thread drains `reg_rx` whenever a Response arrives, matches
+//     by `id`, and delivers to the caller's response channel.
+//   - Incoming notifications (`session/update`, `_x.ai/*`) and agent-to-client
+//     requests (`session/request_permission`) are pushed to `events_tx` so the
+//     reader thread never touches UI or main-thread store state directly.
+
+import "json/json" as json;
+import "stdlib/channel" as channel;
+import "stdlib/line_reader" as line_reader;
+import "stdlib/option" as option;
+import "stdlib/process" as process;
+import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+import "./types" as types;
+import "./wire" as wire;
+
+// ───────────────────────────── events & pending ─────────────────────────────
+
+struct UnknownRequestInfo {
+    id: wire::JsonRpcId,
+}
+
+enum ClientEvent {
+    SessionUpdate(types::SessionUpdateEnvelope),
+    PermissionRequest(types::PermissionRequest),
+    QueueChanged(types::QueueState),
+    McpServersUpdated(vec::Vec[types::McpServerInfo]),
+    ExtensionNotification(text::Text),
+    UnknownAgentRequest(UnknownRequestInfo),
+    Disconnected,
+}
+
+enum WaitOutcome {
+    Response(wire::RpcResponse),
+    TimedOut,
+    Disconnected,
+}
+
+struct PendingEntry {
+    id: i64,
+    tx: channel::Channel[wire::RpcResponse],
+}
+
+struct PendingResponse {
+    _rx: channel::Channel[wire::RpcResponse],
+}
+
+impl PendingResponse {
+    fn wait(take this) -> option::Option[wire::RpcResponse] {
+        return match this._rx.receive() {
+            channel::ReceiveResult::Value(resp) => option::Option[wire::RpcResponse]::Some(resp),
+            channel::ReceiveResult::Closed => option::Option[wire::RpcResponse]::None,
+            channel::ReceiveResult::Cancelled => option::Option[wire::RpcResponse]::None,
+        };
+    }
+
+    fn try_wait(this) -> option::Option[WaitOutcome] {
+        return match this._rx.try_receive() {
+            channel::TryReceiveResult::Value(resp) => option::Option[WaitOutcome]::Some(WaitOutcome::Response(resp)),
+            channel::TryReceiveResult::Closed => option::Option[WaitOutcome]::Some(WaitOutcome::Disconnected),
+            channel::TryReceiveResult::Empty => option::Option[WaitOutcome]::None,
+        };
+    }
+
+    fn wait_timeout(take this, timeout_ms: i64) -> WaitOutcome {
+        var elapsed: i64 = 0 as i64;
+        let step_ms: i64 = 5 as i64;
+        loop {
+            match this._rx.try_receive() {
+                channel::TryReceiveResult::Value(resp) => {
+                    return WaitOutcome::Response(resp);
+                }
+                channel::TryReceiveResult::Closed => { return WaitOutcome::Disconnected; }
+                channel::TryReceiveResult::Empty => {}
+            }
+            if elapsed >= timeout_ms {
+                return WaitOutcome::TimedOut;
+            }
+            time::sleep(5 as u64).wait();
+            elapsed = elapsed +% step_ms;
+        }
+    }
+}
+
+// ───────────────────────────── background threads ─────────────────────────────
+
+struct _ReaderArgs {
+    lines: line_reader::LineReader,
+    reg_rx: channel::Channel[PendingEntry],
+    events_tx: channel::Channel[ClientEvent],
+}
+
+impl _ReaderArgs: Send {}
+
+struct _StderrArgs {
+    lines: line_reader::LineReader,
+}
+
+impl _StderrArgs: Send {}
+
+fn _drain_registrations(reg_rx: channel::Channel[PendingEntry], ref pending: vec::Vec[PendingEntry]) {
+    loop {
+        match reg_rx.try_receive() {
+            channel::TryReceiveResult::Value(entry) => {
+                let _ = pending.append(entry);
+            }
+            channel::TryReceiveResult::Empty => { break; }
+            channel::TryReceiveResult::Closed => { break; }
+        }
+    }
+}
+
+fn _deliver_response(ref pending: vec::Vec[PendingEntry], take resp: wire::RpcResponse) {
+    guard let option::Option::Some(target_id) = resp.id.as_num() else { return; };
+    var found_i: option::Option[usize] = option::Option[usize]::None;
+    var i: usize = 0 as usize;
+    while i < pending.count() {
+        if let option::Option::Some(ep) = pending.at_ptr(i) {
+            if (*ep).id == target_id {
+                found_i = option::Option[usize]::Some(i);
+                break;
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    if let option::Option::Some(idx) = found_i {
+        if let option::Option::Some(entry) = pending.swap_remove(at: idx) {
+            let _ = entry.tx.send(resp);
+        }
+    }
+}
+
+fn _reader_main(take args: _ReaderArgs) -> i32 {
+    var a: _ReaderArgs = args;
+    let reg_rx: channel::Channel[PendingEntry] = a.reg_rx.clone();
+    let events_tx: channel::Channel[ClientEvent] = a.events_tx.clone();
+
+    var pending: vec::Vec[PendingEntry] = vec::new::[PendingEntry]();
+
+    loop {
+        guard let option::Option::Some(raw) = a.lines.read_line() else { break; };
+        let trimmed: str = raw.trim();
+        if trimmed.is_empty() { continue; }
+        // Fast-path skip multi-hundred-KB inline base64 image chunks that
+        // carry no text content, avoiding multi-MB JSON AST allocations.
+        if trimmed.count() > (131072 as usize) {
+            let prefix: str = match trimmed.slice(from: 0 as usize, to: 512 as usize) {
+                option::Option::Some(s) => s,
+                option::Option::None => trimmed,
+            };
+            if prefix.contains("\"user_message_chunk\"") && prefix.contains("\"type\":\"image\"") {
+                continue;
+            }
+        }
+        match wire::decode_line(trimmed) {
+            wire::Envelope::Response(resp) => {
+                _drain_registrations(reg_rx, pending);
+                _deliver_response(pending, resp);
+            }
+            wire::Envelope::Notification(notif) => {
+                if notif.method.equals("session/update") {
+                    if let option::Option::Some(env) = types::decode_session_update(notif.params) {
+                        let _ = events_tx.send(ClientEvent::SessionUpdate(env));
+                    }
+                } else if notif.method.equals("_x.ai/queue/changed") {
+                    let qs: types::QueueState = types::decode_queue_changed(notif.params);
+                    let _ = events_tx.send(ClientEvent::QueueChanged(qs));
+                } else if notif.method.equals("_x.ai/mcp/servers_updated") {
+                    let list: vec::Vec[types::McpServerInfo] = types::decode_mcp_servers_updated(notif.params);
+                    let _ = events_tx.send(ClientEvent::McpServersUpdated(list));
+                } else {
+                    let _ = events_tx.send(ClientEvent::ExtensionNotification(notif.method.clone()));
+                }
+            }
+            wire::Envelope::Request(req) => {
+                if req.method.equals("session/request_permission") {
+                    if let option::Option::Some(pr) = types::decode_permission_request(req.id, req.params) {
+                        let _ = events_tx.send(ClientEvent::PermissionRequest(pr));
+                    }
+                } else {
+                    let _ = events_tx.send(ClientEvent::UnknownAgentRequest(UnknownRequestInfo {
+                        id: req.id.clone(),
+                    }));
+                }
+            }
+            wire::Envelope::Invalid(_err) => {}
+        }
+    }
+
+    // Wake every pending caller so nothing blocks forever on child exit/crash.
+    _drain_registrations(reg_rx, pending);
+    var i: usize = 0 as usize;
+    while i < pending.count() {
+        if let option::Option::Some(ep) = pending.at_ptr(i) {
+            (*ep).tx.close();
+        }
+        i = i +% (1 as usize);
+    }
+
+    let _ = events_tx.send(ClientEvent::Disconnected);
+    events_tx.close();
+    return 0 as i32;
+}
+
+fn _stderr_drain_main(take args: _StderrArgs) -> i32 {
+    var a: _StderrArgs = args;
+    loop {
+        match a.lines.read_line() {
+            option::Option::Some(_l) => {}
+            option::Option::None => { break; }
+        }
+    }
+    return 0 as i32;
+}
+
+// ───────────────────────────── AcpClient ─────────────────────────────
+
+struct AcpClient {
+    _child: process::Child,
+    _next_id: i64,
+    _reg_tx: channel::Channel[PendingEntry],
+    _events_rx: channel::Channel[ClientEvent],
+    _threads: vec::Vec[thread::JoinHandle[i32]],
+    _stopped: bool,
+}
+
+impl AcpClient {
+    fn spawn(argv: vec::Vec[text::Text], cwd: str = "") -> option::Option[AcpClient] {
+        guard let option::Option::Some(ch) = process::spawn(argv, cwd: cwd) else {
+            return option::Option[AcpClient]::None;
+        };
+        var child: process::Child = ch;
+        guard let option::Option::Some(reg_ch) = channel::new::[PendingEntry]() else {
+            return option::Option[AcpClient]::None;
+        };
+        guard let option::Option::Some(ev_ch) = channel::new::[ClientEvent]() else {
+            return option::Option[AcpClient]::None;
+        };
+
+        let out_lines: line_reader::LineReader = child.take_stdout_lines();
+        let err_lines: line_reader::LineReader = child.take_stderr_lines(capacity: 4096 as usize);
+
+        let reader_args: _ReaderArgs = _ReaderArgs {
+            lines: out_lines,
+            reg_rx: reg_ch.clone(),
+            events_tx: ev_ch.clone(),
+        };
+        let stderr_args: _StderrArgs = _StderrArgs { lines: err_lines };
+        var threads: vec::Vec[thread::JoinHandle[i32]] = vec::new::[thread::JoinHandle[i32]]();
+        let _ = threads.append(thread::spawn_with::[_ReaderArgs, i32](reader_args, _reader_main));
+        let _ = threads.append(thread::spawn_with::[_StderrArgs, i32](stderr_args, _stderr_drain_main));
+
+        return option::Option[AcpClient]::Some(AcpClient {
+            _child: child,
+            _next_id: 1 as i64,
+            _reg_tx: reg_ch,
+            _events_rx: ev_ch,
+            _threads: threads,
+            _stopped: false,
+        });
+    }
+
+    fn pid(this) -> i32 {
+        return this._child.pid();
+    }
+
+    fn send_request(ref this, method: str, take params: json::Value) -> option::Option[PendingResponse] {
+        if this._stopped {
+            return option::Option[PendingResponse]::None;
+        }
+        guard let option::Option::Some(resp_ch) = channel::new::[wire::RpcResponse]() else {
+            return option::Option[PendingResponse]::None;
+        };
+        let id: i64 = this._next_id;
+        this._next_id = this._next_id +% (1 as i64);
+
+        let _ = this._reg_tx.send(PendingEntry { id: id, tx: resp_ch.clone() });
+        let line: text::Text = wire::encode_request(id, method, params);
+        let written: isize = this._child.write_stdin(line.view());
+        if written < (0 as isize) {
+            resp_ch.close();
+            return option::Option[PendingResponse]::None;
+        }
+        return option::Option[PendingResponse]::Some(PendingResponse {
+            _rx: resp_ch,
+        });
+    }
+
+    fn send_notification(ref this, method: str, take params: json::Value) -> bool {
+        if this._stopped { return false; }
+        let line: text::Text = wire::encode_notification(method, params);
+        return this._child.write_stdin(line.view()) >= (0 as isize);
+    }
+
+    fn send_response(ref this, id: wire::JsonRpcId, take result_val: json::Value) -> bool {
+        if this._stopped { return false; }
+        let line: text::Text = wire::encode_response(id, result_val);
+        return this._child.write_stdin(line.view()) >= (0 as isize);
+    }
+
+    fn send_error(ref this, id: wire::JsonRpcId, code: i64, message: str) -> bool {
+        if this._stopped { return false; }
+        let line: text::Text = wire::encode_error(id, code, message);
+        return this._child.write_stdin(line.view()) >= (0 as isize);
+    }
+
+    fn try_poll_event(this) -> channel::TryReceiveResult[ClientEvent] {
+        return this._events_rx.try_receive();
+    }
+
+    // Close stdin, ask the child to exit cleanly, reap it, and join background
+    // reader threads. Guarantees no child survives.
+    fn shutdown(ref this) -> i32 {
+        if this._stopped { return 0 as i32; }
+        this._stopped = true;
+        this._child.close_stdin();
+
+        var reaped_code: i32 = -1 as i32;
+        if this._child.pid() > (0 as i32) {
+            let _ = this._child.terminate();
+            reaped_code = this._child.wait();
+        }
+
+        this._reg_tx.close();
+
+        // Join reader and stderr drainer threads.
+        while let option::Option::Some(h) = this._threads.remove_last() {
+            let _ = h.join();
+        }
+        return reaped_code;
+    }
+
+    fn drop(ref this) {
+        if !this._stopped {
+            let _ = this.shutdown();
+        }
+    }
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+fn _pid_is_alive(pid: i32) -> bool {
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("/bin/kill"));
+    let _ = argv.append(text::from_str("-0"));
+    let _ = argv.append("${pid}");
+    return process::capture(argv).code == (0 as i32);
+}
+
+fn _fake_argv(mode_flag: str, arg1: str = "", arg2: str = "") -> vec::Vec[text::Text] {
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("python3"));
+    let _ = argv.append(text::from_str("fixtures/acp/fake_agent.py"));
+    if mode_flag != "" {
+        let _ = argv.append(text::from_str(mode_flag));
+    }
+    if arg1 != "" {
+        let _ = argv.append(text::from_str(arg1));
+    }
+    if arg2 != "" {
+        let _ = argv.append(text::from_str(arg2));
+    }
+    return argv;
+}
+
+fn _collect_agent_chunk(ev: ClientEvent, sid: str, ref out: text::Text) {
+    match ev {
+        ClientEvent::SessionUpdate(env) => {
+            if env.session_id.equals(sid) {
+                match env.update {
+                    types::SessionUpdate::AgentMessageChunk(t) => { let _ = out.append(t.view()); }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn client_cancel_stops_streaming_turn_and_reaps_child() {
+    let argv: vec::Vec[text::Text] = _fake_argv("--mode=cancel");
+    guard let option::Option::Some(c) = AcpClient::spawn(argv) else { assert false; return; };
+    var client: AcpClient = c;
+    let child_pid: i32 = client.pid();
+    assert child_pid > (0 as i32);
+
+    // 1. initialize
+    guard let option::Option::Some(p_init) = client.send_request("initialize", types::params_initialize()) else {
+        assert false;
+        return;
+    };
+    match p_init.wait_timeout(5000 as i64) {
+        WaitOutcome::Response(r) => {
+            var caps_ok: bool = false;
+            if let option::Option::Some(rv) = r.result {
+                if let option::Option::Some(ac) = rv.value(for_key: "agentCapabilities") {
+                    caps_ok = ac.is_object();
+                }
+            }
+            assert caps_ok;
+        }
+        _other => { assert false; }
+    }
+
+    // 2. session/new
+    guard let option::Option::Some(p_new) = client.send_request("session/new", types::params_session_new("/tmp")) else {
+        assert false;
+        return;
+    };
+    guard let option::Option::Some(r_new) = p_new.wait() else { assert false; return; };
+    var sid: text::Text = text::from_str("");
+    if let option::Option::Some(rv_new) = r_new.result {
+        if let option::Option::Some(sn) = types::decode_session_new(rv_new) {
+            sid = sn.session_id.clone();
+        }
+    }
+    assert !sid.is_empty();
+
+    // 3. Start prompt, wait for at least one chunk, then send session/cancel.
+    var agent_txt: text::Text = text::new();
+    guard let option::Option::Some(p_prompt) = client.send_request("session/prompt", types::params_session_prompt_text(sid.view(), "stream forever")) else {
+        assert false;
+        return;
+    };
+
+    // Wait for first streamed chunk.
+    match client._events_rx.receive() {
+        channel::ReceiveResult::Value(ev) => {
+            _collect_agent_chunk(ev, sid.view(), agent_txt);
+        }
+        _ => { assert false; }
+    }
+
+    assert client.send_notification("session/cancel", types::params_session_cancel(sid.view()));
+
+    guard let option::Option::Some(r_prompt) = p_prompt.wait() else { assert false; return; };
+    var was_cancelled: bool = false;
+    if let option::Option::Some(rv_prompt) = r_prompt.result {
+        let pr: types::PromptResult = types::decode_prompt_result(rv_prompt);
+        was_cancelled = pr.stop_reason.is_cancelled();
+    }
+    assert was_cancelled;
+
+    loop {
+        match client.try_poll_event() {
+            channel::TryReceiveResult::Value(ev) => { _collect_agent_chunk(ev, sid.view(), agent_txt); }
+            channel::TryReceiveResult::Empty => { break; }
+            channel::TryReceiveResult::Closed => { break; }
+        }
+    }
+    assert agent_txt.contains("chunk-0");
+
+    // 4. Shutdown and verify child process does not survive.
+    let _ = client.shutdown();
+    assert !_pid_is_alive(child_pid);
+}
+
+#[test]
+fn client_handles_two_concurrent_sessions_without_mixing() {
+    let argv: vec::Vec[text::Text] = _fake_argv("--mode=concurrent");
+    guard let option::Option::Some(c) = AcpClient::spawn(argv) else { assert false; return; };
+    var client: AcpClient = c;
+
+    guard let option::Option::Some(p_init) = client.send_request("initialize", types::params_initialize()) else {
+        assert false;
+        return;
+    };
+    match p_init.wait_timeout(5000 as i64) {
+        WaitOutcome::Response(_r) => {}
+        _other => { assert false; return; }
+    }
+
+    // Create two distinct sessions.
+    guard let option::Option::Some(pn1) = client.send_request("session/new", types::params_session_new("/tmp")) else { assert false; return; };
+    guard let option::Option::Some(rn1) = pn1.wait() else { assert false; return; };
+    var sid1: text::Text = text::from_str("");
+    if let option::Option::Some(rv1) = rn1.result {
+        if let option::Option::Some(sn1) = types::decode_session_new(rv1) {
+            sid1 = sn1.session_id.clone();
+        }
+    }
+    assert !sid1.is_empty();
+
+    guard let option::Option::Some(pn2) = client.send_request("session/new", types::params_session_new("/tmp")) else { assert false; return; };
+    guard let option::Option::Some(rn2) = pn2.wait() else { assert false; return; };
+    var sid2: text::Text = text::from_str("");
+    if let option::Option::Some(rv2) = rn2.result {
+        if let option::Option::Some(sn2) = types::decode_session_new(rv2) {
+            sid2 = sn2.session_id.clone();
+        }
+    }
+    assert !sid2.is_empty();
+
+    // Launch both turns concurrently!
+    guard let option::Option::Some(pp1) = client.send_request("session/prompt", types::params_session_prompt_text(sid1.view(), "ALPHA")) else { assert false; return; };
+    guard let option::Option::Some(pp2) = client.send_request("session/prompt", types::params_session_prompt_text(sid2.view(), "BETA")) else { assert false; return; };
+
+    guard let option::Option::Some(_rp1) = pp1.wait() else { assert false; return; };
+    guard let option::Option::Some(_rp2) = pp2.wait() else { assert false; return; };
+
+    var txt1: text::Text = text::new();
+    var txt2: text::Text = text::new();
+    loop {
+        match client.try_poll_event() {
+            channel::TryReceiveResult::Value(ev) => {
+                match ev {
+                    ClientEvent::SessionUpdate(env) => {
+                        match env.update {
+                            types::SessionUpdate::AgentMessageChunk(t) => {
+                                if env.session_id.equals(sid1.view()) {
+                                    let _ = txt1.append(t.view());
+                                } else if env.session_id.equals(sid2.view()) {
+                                    let _ = txt2.append(t.view());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            channel::TryReceiveResult::Empty => { break; }
+            channel::TryReceiveResult::Closed => { break; }
+        }
+    }
+
+    assert txt1.contains("ALPHA:0;");
+    assert txt1.contains("ALPHA:4;");
+    assert !txt1.contains("BETA");
+    assert txt2.contains("BETA:0;");
+    assert txt2.contains("BETA:4;");
+    assert !txt2.contains("ALPHA");
+
+    let _ = client.shutdown();
+}

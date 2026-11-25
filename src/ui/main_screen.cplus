@@ -1,0 +1,606 @@
+// src/ui/main_screen.cplus — the main window: title bar, sidebar, and
+// either Home (no run open) or the open run.
+//
+// The title bar carries:
+// - Left: traffic lights, sidebar toggle, and either "Desk420" (on Home /
+//   onboarding) or the active conversation title + status (left-aligned) and
+//   an inline rename bar when renaming.
+// - Right: "N runs need you" pill (when > 0), conversation quick actions
+//   (Pin, Rewind, Compact, New in project, and the `⋯` Grok actions menu) when
+//   a chat is open, CLI version on Home, and the inspector toggle.
+
+import "events/events" as events;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/label" as m_label;
+import "facet/mount" as mount;
+import "facet/popup" as m_popup;
+import "facet/screen" as screen;
+import "facet/services" as services;
+import "facet/split" as m_split;
+import "facet/symbol" as m_symbol;
+import "facet/text_area" as m_text_area;
+import "facet/text_field" as m_text_field;
+import "facet/vocabulary" as vocab;
+import "facet/window_chrome" as window_chrome;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../engine/runtime" as engine;
+import "../store/sessions" as sessions;
+import "./chat_screen" as chat_screen;
+import "./home_view" as home_view;
+import "./panels" as panels;
+import "./sidebar" as sidebar;
+import "./style" as style;
+
+// Indices inside `bar:more_menu` (empty strings render as native separators).
+const ACT_RENAME: i64 = 0 as i64;
+const ACT_RELOAD: i64 = 1 as i64;
+// 2 = separator
+const ACT_COMPACT: i64 = 3 as i64;
+const ACT_CONTEXT: i64 = 4 as i64;
+const ACT_SESSION_INFO: i64 = 5 as i64;
+// 6 = separator
+const ACT_REVIEW: i64 = 7 as i64;
+const ACT_DEEP_RESEARCH: i64 = 8 as i64;
+const ACT_GOAL: i64 = 9 as i64;
+const ACT_WORKFLOW: i64 = 10 as i64;
+const ACT_LOOP: i64 = 11 as i64;
+// 12 = separator
+const ACT_REFRESH: i64 = 13 as i64;
+const ACT_FEEDBACK: i64 = 14 as i64;
+// 15 = separator
+const ACT_DELETE: i64 = 16 as i64;
+
+fn _more_menu_items() -> vocab::TextList {
+    var items: vocab::TextList = vocab::TextList::new();
+    let _ = items.add("Rename conversation…");
+    let _ = items.add("Reload conversation");
+    let _ = items.add("");
+    let _ = items.add("Compact context  (/compact)");
+    let _ = items.add("Context usage  (/context)");
+    let _ = items.add("Session info  (/session-info)");
+    let _ = items.add("");
+    let _ = items.add("Review code  (/review)");
+    let _ = items.add("Deep Research…  (/deep-research)");
+    let _ = items.add("Autonomous Goal…  (/goal)");
+    let _ = items.add("Workflow…  (/workflow)");
+    let _ = items.add("Recurring Loop…  (/loop)");
+    let _ = items.add("");
+    let _ = items.add("Refresh chats & usage");
+    let _ = items.add("Send Grok feedback…  (/feedback)");
+    let _ = items.add("");
+    let _ = items.add("Delete conversation");
+    return items;
+}
+
+struct MainScreen {
+    status_sub: events::SignalSubscription[engine::EngineStateEvent],
+    sessions_sub: events::SignalSubscription[sessions::SessionsChange],
+    rename_sub: events::Subscription,
+    renaming: bool,
+    pending_prefill: text::Text,
+}
+
+const EV_RENAME_ACTIVE: str = "desk420.rename_active";
+
+impl MainScreen {
+    fn new() -> MainScreen {
+        return MainScreen {
+            status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+            sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
+            rename_sub: events::Subscription::none(),
+            renaming: false,
+            pending_prefill: text::from_str(""),
+        };
+    }
+
+    fn _apply_prefill(ref this) {
+        if this.pending_prefill.is_empty() { return; }
+        let txt: text::Text = this.pending_prefill.clone();
+        this.pending_prefill = text::from_str("");
+        if let option::Option::Some(ta) = m_text_area::find("chat:composer") {
+            let was_focused: bool = ta.is_focused();
+            let _ta: m_text_area::TextArea = ta
+                .set_text(txt.view())
+                .set_cursor_position(txt.count() as i64);
+            if !was_focused {
+                let _f: m_text_area::TextArea = ta.focus();
+            }
+        }
+    }
+
+    fn _prefill(ref this, prefix: str) {
+        this.pending_prefill = text::from_str(prefix);
+        services::run_on_main(this._apply_prefill);
+    }
+
+    fn _sync_pin_button(this) {
+        let sid: text::Text = engine::active_session_id();
+        let pinned: bool = !sid.is_empty() && sessions::is_pinned(sid.view());
+        if let option::Option::Some(sym) = m_symbol::find("bar:pin:sym") {
+            let col: vocab::Color = if pinned { style::lime_text() } else { style::muted() };
+            let fill: f64 = if pinned { 1.0f64 } else { 0.0f64 };
+            let _s: m_symbol::Symbol = sym.set_color(col).set_fill(fill);
+        }
+        if let option::Option::Some(n) = mount::find("bar:pin") {
+            core::set_tooltip(n, if pinned { "Unpin conversation" } else { "Pin conversation" });
+        }
+    }
+
+    fn _sync_bar(this) {
+        let needs: usize = sessions::needs_you_count();
+        let pill: text::Text = if needs == (1 as usize) {
+            text::from_str("1 run needs you")
+        } else {
+            "${needs} runs need you"
+        };
+        style::set_label("bar:needs_label", pill.view());
+        style::show("bar:needs", needs > (0 as usize));
+        let ver: text::Text = engine::cli_version();
+        let cli: text::Text = if ver.is_empty() { text::from_str("Grok CLI") } else { "Grok CLI ${ver.view()}" };
+        style::set_label("bar:cli", cli.view());
+        this._sync_pin_button();
+    }
+
+    // Which centre is up: sign-in when Grok is unreachable, else Home when no
+    // run is open, else the run.
+    fn _sync_mode(ref this) {
+        let kind: engine::StatusKind = engine::status_kind();
+        let onboard: bool = match kind {
+            engine::StatusKind::MissingBinary => true,
+            engine::StatusKind::InstallingCli => true,
+            engine::StatusKind::NeedsAuth => true,
+            engine::StatusKind::Authenticating => true,
+            engine::StatusKind::Failed => true,
+            _ => false,
+        };
+        let has_run: bool = !engine::active_session_id().is_empty();
+        let in_chat: bool = !onboard && has_run;
+        if !in_chat {
+            this.renaming = false;
+        }
+        style::show("home:split", !onboard && !has_run);
+        style::show("conv:split", in_chat);
+        style::show("bar:app", !in_chat);
+        style::show("bar:conv", in_chat && !this.renaming);
+        style::show("bar:rename_box", in_chat && this.renaming);
+        style::show("bar:actions", in_chat);
+        style::show("bar:cli", !in_chat);
+        style::show("onboard:pane", onboard);
+        if !onboard { return; }
+
+        let detail: text::Text = engine::status_detail();
+        var title: str = "Could not connect to Grok";
+        var body: text::Text = detail.clone();
+        var show_install: bool = false;
+        var show_signin: bool = false;
+        match kind {
+            engine::StatusKind::MissingBinary => {
+                title = "Grok CLI is not installed";
+                if detail.is_empty() || detail.equals("Grok CLI not found") {
+                    body = text::from_str("Desk420 uses the official Grok CLI with your SuperGrok subscription.\nClick Install below, or run: curl -fsSL https://x.ai/cli/install.sh | bash");
+                } else {
+                    body = detail.clone();
+                }
+                show_install = true;
+            }
+            engine::StatusKind::InstallingCli => {
+                title = "Installing Grok CLI…";
+                body = text::from_str("Downloading and installing the Grok CLI. This takes a few seconds.");
+            }
+            engine::StatusKind::NeedsAuth => {
+                title = "Sign in to Grok";
+                body = text::from_str("Connect your SuperGrok account to start a run.");
+                show_signin = true;
+            }
+            engine::StatusKind::Authenticating => {
+                title = "Signing in…";
+                body = text::from_str("Finish signing in inside your browser, then return here.");
+            }
+            _ => {}
+        }
+        style::set_label("onboard:title", title);
+        style::set_label("onboard:body", body.view());
+        style::show("onboard:install", show_install);
+        style::show("onboard:signin", show_signin);
+    }
+
+    fn _begin_rename(ref this) {
+        let sid: text::Text = engine::active_session_id();
+        if sid.is_empty() { return; }
+        this.renaming = true;
+        style::show("bar:conv", false);
+        style::show("bar:rename_box", true);
+        var cur: text::Text = text::from_str("");
+        if let option::Option::Some(lbl) = m_label::find("conv:title") {
+            cur = text::from_str(lbl.text());
+        }
+        if let option::Option::Some(tf) = m_text_field::find("bar:rename_field") {
+            let _tf: m_text_field::TextField = tf.set_text(cur.view()).focus();
+        }
+    }
+
+    fn on_rename_event(ref this, _name: str) {
+        this._begin_rename();
+    }
+
+    fn on_rename_save(ref this, _sender: *u8) {
+        let sid: text::Text = engine::active_session_id();
+        if !sid.is_empty() {
+            if let option::Option::Some(tf) = m_text_field::find("bar:rename_field") {
+                let raw: text::Text = text::from_str(tf.text());
+                let trimmed: str = raw.view().trim();
+                if !trimmed.is_empty() {
+                    engine::rename_session(sid.view(), trimmed);
+                    style::set_label("conv:title", trimmed);
+                }
+            }
+        }
+        this.renaming = false;
+        this._sync_mode();
+    }
+
+    fn on_rename_cancel(ref this, _sender: *u8) {
+        this.renaming = false;
+        this._sync_mode();
+    }
+
+    // ---- title-bar action handlers ------------------------------------------
+
+    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
+        this._sync_mode();
+        this._sync_bar();
+    }
+
+    fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) {
+        this._sync_bar();
+    }
+
+    fn on_toggle_sidebar(ref this, _sender: *u8) -> bool { panels::toggle_sidebar(); return true; }
+    fn on_toggle_panel(ref this, _sender: *u8) -> bool { panels::toggle_panel(); return true; }
+
+    fn on_pin_active(ref this, _sender: *u8) -> bool {
+        let sid: text::Text = engine::active_session_id();
+        if sid.is_empty() { return true; }
+        sessions::toggle_pin(sid.view());
+        this._sync_pin_button();
+        return true;
+    }
+
+    fn on_rewind_active(ref this, _sender: *u8) -> bool {
+        if engine::active_session_id().is_empty() { return true; }
+        engine::rewind_last();
+        return true;
+    }
+
+    fn on_compact_active(ref this, _sender: *u8) -> bool {
+        if engine::active_session_id().is_empty() { return true; }
+        engine::send_prompt("/compact");
+        return true;
+    }
+
+    fn on_new_in_project(ref this, _sender: *u8) -> bool {
+        let cwd: text::Text = engine::active_cwd();
+        if !cwd.is_empty() {
+            sessions::set_selected_project(cwd.view());
+            engine::new_chat(cwd: cwd.view());
+        } else {
+            engine::new_chat();
+        }
+        return true;
+    }
+
+    fn on_more_action(ref this, _sender: *u8) {
+        guard let option::Option::Some(p) = m_popup::find("bar:more_menu") else { return; };
+        let idx: i64 = p.selected_index();
+        // Reset selection immediately so the menu stays clean and any item can
+        // be triggered repeatedly without a stale checkmark.
+        let _p: m_popup::Popup = p.set_selected_index(-1 as i64);
+        if idx < (0 as i64) { return; }
+
+        let sid: text::Text = engine::active_session_id();
+        let cwd: text::Text = engine::active_cwd();
+
+        if idx == ACT_RENAME {
+            this._begin_rename();
+        } else if idx == ACT_RELOAD {
+            if !sid.is_empty() { engine::reload_session(sid.view(), cwd.view()); }
+        } else if idx == ACT_COMPACT {
+            if !sid.is_empty() { engine::send_prompt("/compact"); }
+        } else if idx == ACT_CONTEXT {
+            if !sid.is_empty() { engine::send_prompt("/context"); }
+        } else if idx == ACT_SESSION_INFO {
+            if !sid.is_empty() { engine::send_prompt("/session-info"); }
+        } else if idx == ACT_REVIEW {
+            if !sid.is_empty() { engine::send_prompt("/review"); }
+        } else if idx == ACT_DEEP_RESEARCH {
+            this._prefill("/deep-research ");
+        } else if idx == ACT_GOAL {
+            this._prefill("/goal ");
+        } else if idx == ACT_WORKFLOW {
+            this._prefill("/workflow ");
+        } else if idx == ACT_LOOP {
+            this._prefill("/loop ");
+        } else if idx == ACT_REFRESH {
+            engine::refresh_sessions();
+            engine::refresh_account();
+        } else if idx == ACT_FEEDBACK {
+            this._prefill("/feedback ");
+        } else if idx == ACT_DELETE {
+            if !sid.is_empty() { engine::delete_session(sid.view(), cwd.view()); }
+        }
+    }
+
+    // A borderless MaterialSymbolsOutlined title-bar button (28x28 hit area,
+    // optically sized 17.5pt glyph).
+    fn _bar_circle(ref this, sym: u32, title: str, key: str,
+    on_click: fn(*u8, *u8) -> bool, on_click_ctx: *u8 = 0 as *u8) -> core::Node {
+        return style::circle_icon(sym, key, title: title,
+        size: 28.0f64, icon_size: 17.5f64,
+        on_click: on_click, on_click_ctx: on_click_ctx);
+    }
+
+    // The `⋯` Extra Grok Actions menu button: matching borderless Material
+    // glyph with a near-transparent native NSPopUpButton overlaid.
+    fn _bar_more_menu(ref this) -> core::Node {
+        return @ui {
+            container(key: "bar:more") {
+                hstack {
+                    symbol(icons::more_horiz, size: 18.0f64, color: style::muted())
+                }
+                .width(28.0f64)
+                    .height(28.0f64)
+                    .align(flex::Align::Center)
+                    .justify(flex::Justify::Center)
+                    .set_input_transparent(true)
+                popup("Grok actions", key: "bar:more_menu",
+                font_size: 13.0f64,
+                on_selected_index_changed: this.on_more_action,
+                items: _more_menu_items())
+                    .absolute()
+                    .position_edge(flex::Edge::All, 0.0f64)
+                    .set_opacity(0.02f64)
+                    .set_accessibility_label("More Grok actions")
+                    .set_tooltip("More Grok actions")
+            }
+            .width(28.0f64)
+                .height(28.0f64)
+                .shrink(0.0f64)
+        };
+    }
+
+    fn on_signin(ref this, _sender: *u8) { engine::sign_in(); }
+    fn on_install_cli(ref this, _sender: *u8) { engine::install_grok_cli(); }
+    fn on_retry(ref this, _sender: *u8) { engine::retry(); }
+}
+
+impl MainScreen: component::Component {
+    fn build(ref this) -> core::Node {
+        var root: core::Node = @ui {
+            column {
+                // ── Title bar ──
+                hstack(key: "bar:title") {
+                    window_buttons(key: "bar:window-buttons")
+                    this._bar_circle(icons::dock_to_left, "Toggle Sidebar", "bar:toggle_sidebar", this.on_toggle_sidebar)
+                        .margin_edge(flex::Edge::Left, 10.0f64)
+                    label("Desk420", key: "bar:app",
+                    font_size: 17.0f64,
+                    font_weight: vocab::FontWeight::Bold,
+                    text_color: style::ink())
+                        .margin_edge(flex::Edge::Left, 10.0f64)
+                        .shrink(0.0f64)
+
+                    // Left-aligned active conversation title + status
+                    hstack(key: "bar:conv") {
+                        label("", key: "conv:title",
+                        font_size: 14.5f64,
+                        font_weight: vocab::FontWeight::Semibold,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64)
+                            .shrink(1.0f64)
+                            .min_width(0.0f64)
+                            .set_input_transparent(true)
+                        label("", key: "conv:status",
+                        font_size: 12.5f64,
+                        text_color: style::muted(),
+                        max_lines: 1 as i64)
+                            .shrink(0.0f64)
+                            .set_input_transparent(true)
+                    }
+                    .align(flex::Align::Center)
+                        .gap(8.0f64)
+                        .margin_edge(flex::Edge::Left, 10.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                        .max_width(560.0f64)
+                        .set_input_transparent(true)
+
+                    // Inline rename bar in the title bar
+                    hstack(key: "bar:rename_box") {
+                        text_field("", key: "bar:rename_field",
+                        placeholder: "Conversation title",
+                        on_submit: this.on_rename_save)
+                            .width(260.0f64)
+                            .height(26.0f64)
+                            .shrink(1.0f64)
+                        text_button("Save", key: "bar:rename_save",
+                        font_size: 12.5f64,
+                        font_weight: vocab::FontWeight::Semibold,
+                        text_color: style::lime_text(),
+                        bordered: false,
+                        on_click: this.on_rename_save)
+                        text_button("Cancel", key: "bar:rename_cancel",
+                        font_size: 12.5f64,
+                        text_color: style::muted(),
+                        bordered: false,
+                        on_click: this.on_rename_cancel)
+                    }
+                    .align(flex::Align::Center)
+                        .gap(6.0f64)
+                        .margin_edge(flex::Edge::Left, 10.0f64)
+                        .shrink(1.0f64)
+
+                    spacer().grow(1.0f64)
+
+                    hstack(key: "bar:needs") {
+                        style::dot(7.0f64, style::lime())
+                        label("", key: "bar:needs_label",
+                        font_size: 13.5f64,
+                        font_weight: vocab::FontWeight::Semibold,
+                        text_color: style::lime_text())
+                    }
+                    .align(flex::Align::Center)
+                        .gap(7.0f64)
+                        .height(28.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                        .set_background_color(style::lime_wash())
+                        .set_corner_radius(vocab::Corners::all(14.0f64))
+
+                    // Right-aligned common chat actions + Grok menu
+                    hstack(key: "bar:actions") {
+                        this._bar_circle(icons::keep, "Pin conversation", "bar:pin", this.on_pin_active)
+                        this._bar_circle(icons::undo, "Rewind last turn", "bar:rewind", this.on_rewind_active)
+                        this._bar_circle(icons::collapse_content, "Compact conversation (/compact)", "bar:compact", this.on_compact_active)
+                        this._bar_circle(icons::edit_square, "New chat in this project", "bar:new_in_project", this.on_new_in_project)
+                        this._bar_more_menu()
+                    }
+                    .align(flex::Align::Center)
+                        .gap(4.0f64)
+                        .shrink(0.0f64)
+
+                    style::tag("Grok CLI", key: "bar:cli")
+                        .margin_edge(flex::Edge::Left, 6.0f64)
+                    this._bar_circle(icons::dock_to_right, "Toggle Inspector", "bar:toggle_panel", this.on_toggle_panel)
+                        .margin_edge(flex::Edge::Left, 2.0f64)
+                }
+                .height(46.0f64)
+                    .shrink(0.0f64)
+                    .align(flex::Align::Center)
+                    .gap(8.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                    .window_drag()
+                style::rule()
+
+                // ── Sidebar | centre ──
+                split(key: "main:split",
+                position: panels::SIDEBAR_W,
+                min_leading: panels::SIDEBAR_MIN,
+                max_leading: panels::SIDEBAR_MAX,
+                min_trailing: 760.0f64,
+                divider_color: style::hairline(),
+                divider_thickness: 1.0f64,
+                role_leading: m_split::PaneRole::Content,
+                role_trailing: m_split::PaneRole::Content) {
+                    component::child(sidebar::Sidebar::new())
+                    container(key: "main:centre") {
+                        component::child(home_view::HomeView::new())
+                        component::child(chat_screen::ChatScreen::new())
+                        column(key: "onboard:pane") {
+                            label("Sign in to Grok", key: "onboard:title",
+                            font_size: 28.0f64,
+                            font_weight: vocab::FontWeight::Bold,
+                            text_color: style::ink())
+                            label("", key: "onboard:body",
+                            font_size: 15.0f64,
+                            text_color: style::muted(),
+                            text_align: vocab::TextAlign::Center,
+                            line_break: vocab::LineBreak::WordWrap,
+                            selectable: true)
+                            hstack {
+                                style::primary_button("Sign in with Grok", "onboard:signin", on_click: this.on_signin)
+                                style::primary_button("Install Grok CLI", "onboard:install", on_click: this.on_install_cli)
+                                style::outline_button("Retry", "onboard:retry", on_click: this.on_retry)
+                            }
+                            .gap(10.0f64)
+                        }
+                        .grow(1.0f64)
+                            .shrink(1.0f64)
+                            .padding(40.0f64)
+                            .gap(16.0f64)
+                            .align(flex::Align::Center)
+                            .justify(flex::Justify::Center)
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .gap(0.0f64)
+                .set_background_color(style::canvas())
+        };
+        root.set_safe_area(vocab::SafeArea::None);
+        return root;
+    }
+}
+
+impl MainScreen: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why == component::Attach::Active {
+            engine::set_app_active(true);
+            engine::refresh_sessions();
+            return;
+        }
+        if why != component::Attach::Mount { return; }
+        this.status_sub = engine::watch_status(this.on_status_changed);
+        this.sessions_sub = sessions::watch(this.on_sessions_changed);
+        this.rename_sub = events::on(EV_RENAME_ACTIVE, this.on_rename_event);
+        if let option::Option::Some(p) = m_popup::find("bar:more_menu") {
+            let _p: m_popup::Popup = p.set_selected_index(-1 as i64);
+        }
+        this._sync_mode();
+        this._sync_bar();
+        engine::start();
+    }
+
+    fn on_detach(ref this, why: component::Detach) {
+        match why {
+            component::Detach::Inactive => { engine::set_app_active(false); }
+            component::Detach::Background => { engine::set_app_active(false); }
+            _ => {}
+        }
+    }
+}
+
+impl MainScreen: screen::Screen {}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[MainScreen](MainScreen::new());
+}
+
+fn begin_rename_active() {
+    events::emit(EV_RENAME_ACTIVE);
+}
+
+#[test]
+fn more_menu_indices_match_items() {
+    let items: vocab::TextList = _more_menu_items();
+    assert items.count() == (17 as usize);
+    assert items.at(ACT_RENAME as usize) == "Rename conversation…";
+    assert items.at(ACT_RELOAD as usize) == "Reload conversation";
+    assert items.at(2 as usize) == "";
+    assert items.at(ACT_COMPACT as usize) == "Compact context  (/compact)";
+    assert items.at(ACT_CONTEXT as usize) == "Context usage  (/context)";
+    assert items.at(ACT_SESSION_INFO as usize) == "Session info  (/session-info)";
+    assert items.at(6 as usize) == "";
+    assert items.at(ACT_REVIEW as usize) == "Review code  (/review)";
+    assert items.at(ACT_DEEP_RESEARCH as usize) == "Deep Research…  (/deep-research)";
+    assert items.at(ACT_GOAL as usize) == "Autonomous Goal…  (/goal)";
+    assert items.at(ACT_WORKFLOW as usize) == "Workflow…  (/workflow)";
+    assert items.at(ACT_LOOP as usize) == "Recurring Loop…  (/loop)";
+    assert items.at(12 as usize) == "";
+    assert items.at(ACT_REFRESH as usize) == "Refresh chats & usage";
+    assert items.at(ACT_FEEDBACK as usize) == "Send Grok feedback…  (/feedback)";
+    assert items.at(15 as usize) == "";
+    assert items.at(ACT_DELETE as usize) == "Delete conversation";
+}

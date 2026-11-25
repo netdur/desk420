@@ -1,0 +1,215 @@
+// src/ui/plan_bar.cplus — collapsible plan checklist pinned above the chat composer.
+//
+// Displays the active session's latest ACP `plan` entries as a compact summary
+// bar ("Plan · 3 of 7 done") that expands on click to show individual tasks
+// with MaterialSymbolsOutlined status icons.
+
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/label" as m_label;
+import "facet/mount" as mount;
+import "facet/symbol" as m_symbol;
+import "facet/vocabulary" as vocab;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "../store/conversation" as conversation;
+import "./style" as style;
+
+const MAX_PLAN_ROWS: usize = 8 as usize;
+
+fn format_plan_summary(entries: vec::Vec[types::PlanEntry]) -> text::Text {
+    let total: usize = entries.count();
+    if total == (0 as usize) { return text::from_str(""); }
+    var done: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < total {
+        if let option::Option::Some(ep) = entries.at_ptr(i) {
+            if (*ep).status == types::PlanStatus::Completed { done = done +% (1 as usize); }
+        }
+        i = i +% (1 as usize);
+    }
+    return "Plan · ${done} of ${total} done";
+}
+
+struct PlanBar {
+    stage_key: text::Text,
+    expanded: bool,
+    has_entries: bool,
+}
+
+impl PlanBar {
+    fn new(stage_key: str = "") -> PlanBar {
+        return PlanBar {
+            stage_key: text::from_str(stage_key),
+            expanded: false,
+            has_entries: false,
+        };
+    }
+
+    fn _build_row(this, i: usize) -> core::Node {
+        let rk: text::Text = "chat:plan_row:${i}";
+        let ik: text::Text = "chat:plan_row:${i}:sym";
+        let tk: text::Text = "chat:plan_row:${i}:text";
+        return @ui {
+            hstack(key: rk.view()) {
+                symbol(icons::radio_button_unchecked, key: ik.view(),
+                size: 14.5f64, color: style::faint())
+                    .shrink(0.0f64)
+                    .set_input_transparent(true)
+                label("", key: tk.view(),
+                font_size: 12.5f64,
+                text_color: style::ink(),
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .min_width(0.0f64)
+                    .set_input_transparent(true)
+            }
+            .align(flex::Align::Center)
+                .gap(7.0f64)
+        };
+    }
+
+    fn build(ref this) -> core::Node {
+        let inner: core::Node = @ui {
+            column {
+                hstack(key: "chat:plan_header") {
+                    symbol(icons::checklist, size: 15.5f64, color: style::lime_text())
+                        .shrink(0.0f64)
+                        .set_input_transparent(true)
+                    label("", key: "chat:plan_summary",
+                    font_size: 12.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                        .set_input_transparent(true)
+                    symbol(icons::expand_more, key: "chat:plan_toggle:sym",
+                    size: 16.0f64, color: style::muted())
+                        .shrink(0.0f64)
+                        .set_input_transparent(true)
+                }
+                .align(flex::Align::Center)
+                    .gap(7.0f64)
+                    .gesture(on_click: this.on_toggle)
+
+                column(key: "chat:plan_list") {
+                    for i in 0..MAX_PLAN_ROWS {
+                        this._build_row(i)
+                    }
+                }
+                .gap(5.0f64)
+            }
+            .gap(8.0f64)
+                .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                .padding_edge(flex::Edge::Vertical, 9.0f64)
+        };
+        return style::card_box("chat:plan_bar", inner, radius: 12.0f64, fill: style::floating_card());
+    }
+
+    fn on_toggle(ref this, _sender: *u8) -> bool {
+        this.expanded = !this.expanded;
+        this._sync_visibility();
+        return true;
+    }
+
+    fn _sync_visibility(ref this) {
+        style::show("chat:plan_bar", this.has_entries);
+        style::show("chat:plan_list", this.has_entries && this.expanded);
+        if let option::Option::Some(sym) = m_symbol::find("chat:plan_toggle:sym") {
+            let icon: u32 = if this.expanded { icons::expand_less } else { icons::expand_more };
+            let _s: m_symbol::Symbol = sym.set_icon(icon);
+        }
+        if !this.stage_key.is_empty() {
+            if let option::Option::Some(dock) = mount::find(this.stage_key.view()) {
+                core::relayout(dock);
+            }
+        }
+    }
+
+    fn sync_for_session(ref this, session_id: str) {
+        if session_id.is_empty() {
+            this.has_entries = false;
+            this._sync_visibility();
+            return;
+        }
+        let entries: vec::Vec[types::PlanEntry] = conversation::plan_entries(session_id);
+        let total: usize = entries.count();
+        this.has_entries = total > (0 as usize);
+        if !this.has_entries {
+            this._sync_visibility();
+            return;
+        }
+        let summary: text::Text = format_plan_summary(entries);
+        style::set_label("chat:plan_summary", summary.view());
+
+        var ri: usize = 0 as usize;
+        while ri < MAX_PLAN_ROWS {
+            let rk: text::Text = "chat:plan_row:${ri}";
+            let show_r: bool = ri < total;
+            style::show(rk.view(), show_r);
+            if show_r {
+                if let option::Option::Some(ep) = entries.at_ptr(ri) {
+                    let ik: text::Text = "chat:plan_row:${ri}:sym";
+                    let tk: text::Text = "chat:plan_row:${ri}:text";
+                    let is_done: bool = (*ep).status == types::PlanStatus::Completed;
+                    let is_active: bool = (*ep).status == types::PlanStatus::InProgress;
+                    let ico: u32 = if is_done {
+                        icons::check_circle
+                    } else if is_active {
+                        icons::radio_button_checked
+                    } else {
+                        icons::radio_button_unchecked
+                    };
+                    let icol: vocab::Color = if is_done {
+                        style::lime_text()
+                    } else if is_active {
+                        style::ink()
+                    } else {
+                        style::faint()
+                    };
+                    let tcol: vocab::Color = if is_done { style::muted() } else { style::ink() };
+                    if let option::Option::Some(s) = m_symbol::find(ik.view()) {
+                        let _s: m_symbol::Symbol = s.set_icon(ico).set_color(icol);
+                    }
+                    if let option::Option::Some(l) = m_label::find(tk.view()) {
+                        let _l: m_label::Label = l.set_text((*ep).content.view()).set_text_color(tcol);
+                    }
+                }
+            }
+            ri = ri +% (1 as usize);
+        }
+        this._sync_visibility();
+    }
+}
+
+#[test]
+fn plan_summary_counts_completed_entries() {
+    var entries: vec::Vec[types::PlanEntry] = vec::new::[types::PlanEntry]();
+    let _ = entries.append(types::PlanEntry {
+        content: text::from_str("Step 1"),
+        priority: text::from_str("high"),
+        status: types::PlanStatus::Completed,
+    });
+    let _ = entries.append(types::PlanEntry {
+        content: text::from_str("Step 2"),
+        priority: text::from_str("medium"),
+        status: types::PlanStatus::InProgress,
+    });
+    let _ = entries.append(types::PlanEntry {
+        content: text::from_str("Step 3"),
+        priority: text::from_str("low"),
+        status: types::PlanStatus::Pending,
+    });
+    assert format_plan_summary(entries).equals("Plan · 1 of 3 done");
+}

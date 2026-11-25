@@ -1,0 +1,732 @@
+// src/ui/composer_popup.cplus — keyboard- and mouse-driven `/` command and `@`
+// mention autocomplete popup shared by both Chat and Home composers.
+//
+// - Works at index 0 OR mid-sentence (`here a command /`, `here is at @src`).
+// - `/` pulls live `available_commands` from the active Grok session (with
+//   rich Grok CLI built-ins as fallback on Home or before updates arrive).
+// - `@` searches files & folders in the active project (bounded cached scan)
+//   plus recent conversations.
+// - Supports Up/Down navigation, Enter/Tab to insert, Escape to dismiss, and
+//   click-to-pick, with a focus guard so writing into an already-focused
+//   TextArea never triggers AppKit's textDidEndEditing overwrite.
+
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/mount" as mount;
+import "facet/services" as services;
+import "facet/symbol" as m_symbol;
+import "facet/text_area" as m_text_area;
+import "facet/vocabulary" as vocab;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+
+import "../engine/runtime" as engine;
+import "../store/conversation" as conversation;
+import "../store/file_tree" as file_tree;
+import "../store/sessions" as sessions;
+import "./style" as style;
+
+const MAX_ROWS: usize = 8 as usize;
+const MAX_INDEXED_FILES: usize = 300 as usize;
+const MAX_SCAN_DEPTH: usize = 4 as usize;
+
+enum TriggerKind {
+    None,
+    Slash,
+    Mention,
+}
+
+struct Trigger {
+    kind: TriggerKind,
+    start: usize,
+    query: text::Text,
+}
+
+struct PopupItem {
+    icon: u32,
+    title: text::Text,
+    subtitle: text::Text,
+    insert_text: text::Text,
+}
+
+struct _IndexedFile {
+    name: text::Text,
+    rel_path: text::Text,
+    parent_dir: text::Text,
+    is_dir: bool,
+}
+
+fn _is_ws(b: u8) -> bool {
+    return b == (32 as u8) || b == (10 as u8) || b == (13 as u8) || b == (9 as u8);
+}
+
+// Detect a trailing `/query` or `@query` token starting at index 0 or right
+// after whitespace (e.g. `here a command /`, `check @src/app`).
+fn detect_trigger(src: str) -> Trigger {
+    let n: usize = src.count();
+    if n == (0 as usize) {
+        return Trigger { kind: TriggerKind::None, start: 0 as usize, query: text::from_str("") };
+    }
+    var i: usize = n;
+    while i > (0 as usize) {
+        let prev: usize = i -% (1 as usize);
+        let b: u8 = match src.byte_at(prev) {
+            option::Option::Some(v) => v,
+            option::Option::None => 0 as u8,
+        };
+        if _is_ws(b) { break; }
+        i = prev;
+    }
+    if i >= n {
+        return Trigger { kind: TriggerKind::None, start: 0 as usize, query: text::from_str("") };
+    }
+    let first: u8 = match src.byte_at(i) {
+        option::Option::Some(v) => v,
+        option::Option::None => 0 as u8,
+    };
+    let kind: TriggerKind = if first == (47 as u8) { // '/'
+    TriggerKind::Slash
+    } else if first == (64 as u8) { // '@'
+    TriggerKind::Mention
+    } else {
+        TriggerKind::None
+    };
+    let is_none: bool = match kind { TriggerKind::None => true, _ => false };
+    if is_none {
+        return Trigger { kind: TriggerKind::None, start: 0 as usize, query: text::from_str("") };
+    }
+    let q_raw: str = match src.slice(from: i +% (1 as usize), to: n) {
+        option::Option::Some(s) => s,
+        option::Option::None => "",
+    };
+    return Trigger {
+        kind: kind,
+        start: i,
+        query: text::from_str(q_raw).lowercased(),
+    };
+}
+
+fn apply_completion(src: str, trigger_start: usize, insert_text: str) -> text::Text {
+    let head: str = if trigger_start > (0 as usize) && trigger_start <= src.count() {
+        match src.slice(from: 0 as usize, to: trigger_start) {
+            option::Option::Some(s) => s,
+            option::Option::None => "",
+        }
+    } else {
+        ""
+    };
+    return "${head}${insert_text}";
+}
+
+fn _icon_for_command(name: str) -> u32 {
+    if name == "compact" { return icons::collapse_content; }
+    if name == "goal" { return icons::flag; }
+    if name == "deep-research" { return icons::science; }
+    if name == "review" { return icons::rate_review; }
+    if name == "workflow" { return icons::account_tree; }
+    if name == "loop" { return icons::schedule; }
+    if name == "context" { return icons::data_usage; }
+    if name == "session-info" { return icons::info; }
+    if name == "always-approve" { return icons::verified_user; }
+    if name == "feedback" { return icons::feedback; }
+    if name == "flush" || name == "clear" { return icons::cleaning_services; }
+    if name.has_prefix("resume-") { return icons::history; }
+    return icons::bolt;
+}
+
+fn _default_desc(name: str) -> str {
+    if name == "compact" { return "Compress conversation history to save context window."; }
+    if name == "goal" { return "Set, manage, or check an autonomous goal."; }
+    if name == "deep-research" { return "Research with parallel agents and write a cited report."; }
+    if name == "review" { return "Review your working tree, branch, or pull request."; }
+    if name == "workflow" { return "Launch a saved workflow or manage active runs."; }
+    if name == "loop" { return "Run a prompt on a recurring interval."; }
+    if name == "context" { return "Show context window usage and session stats."; }
+    if name == "session-info" { return "Show session details (model, turns, context usage)."; }
+    if name == "always-approve" { return "Toggle always-approve mode (skip permission prompts)."; }
+    if name == "feedback" { return "Send feedback about the current session."; }
+    return "";
+}
+
+fn _scan_files_rec(abs_dir: str, rel_prefix: str, depth: usize, ref out: vec::Vec[_IndexedFile]) {
+    if depth > MAX_SCAN_DEPTH || out.count() >= MAX_INDEXED_FILES { return; }
+    guard let option::Option::Some(entries) = fs::read_dir(abs_dir) else { return; };
+    var dirs_abs: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var dirs_rel: vec::Vec[text::Text] = vec::new::[text::Text]();
+
+    var i: usize = 0 as usize;
+    while i < entries.count() && out.count() < MAX_INDEXED_FILES {
+        if let option::Option::Some(ep) = entries.at_ptr(i) {
+            let nm: str = (*ep).view();
+            if !file_tree::should_skip(nm) {
+                let full: text::Text = path::join(abs_dir, nm);
+                let rel: text::Text = if rel_prefix == "" {
+                    text::from_str(nm)
+                } else {
+                    "${rel_prefix}/${nm}"
+                };
+                let is_dir: bool = fs::is_dir(full.view());
+                let _ = out.append(_IndexedFile {
+                    name: text::from_str(nm),
+                    rel_path: rel.clone(),
+                    parent_dir: text::from_str(rel_prefix),
+                    is_dir: is_dir,
+                });
+                if is_dir && depth < MAX_SCAN_DEPTH {
+                    let _ = dirs_abs.append(full);
+                    let _ = dirs_rel.append(rel);
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+
+    var d: usize = 0 as usize;
+    while d < dirs_abs.count() && out.count() < MAX_INDEXED_FILES {
+        if let option::Option::Some(ap) = dirs_abs.at_ptr(d) {
+            if let option::Option::Some(rp) = dirs_rel.at_ptr(d) {
+                _scan_files_rec((*ap).view(), (*rp).view(), depth +% (1 as usize), out);
+            }
+        }
+        d = d +% (1 as usize);
+    }
+}
+
+fn _parse_row_index(prefix: str, key: str) -> option::Option[usize] {
+    let head: text::Text = "${prefix}:pop:row:";
+    if !key.has_prefix(head.view()) { return option::Option[usize]::None; }
+    guard let option::Option::Some(rest) = key.slice(from: head.count(), to: key.count()) else {
+        return option::Option[usize]::None;
+    };
+    guard let option::Option::Some(n) = rest.to_i64() else { return option::Option[usize]::None; };
+    if n < (0 as i64) { return option::Option[usize]::None; }
+    return option::Option[usize]::Some(n as usize);
+}
+
+struct _ScanFilesJob {
+    cwd: text::Text,
+    files: vec::Vec[_IndexedFile],
+}
+
+impl _ScanFilesJob: services::Job {
+    fn run(ref this) {
+        this.files.remove_all();
+        let d: str = this.cwd.view();
+        if d == "" || d.contains(".desk420/") || !fs::is_dir(d) { return; }
+        _scan_files_rec(d, "", 0 as usize, this.files);
+    }
+
+    fn apply(ref this) {}
+}
+
+struct ComposerPopup {
+    prefix: text::Text,
+    composer_key: text::Text,
+    stage_key: text::Text,
+    items: vec::Vec[PopupItem],
+    selected: usize,
+    visible: bool,
+    trigger_start: usize,
+    dismissed_text: text::Text,
+    cached_cwd: text::Text,
+    scanned: bool,
+    want_cwd: text::Text,
+    last_composer_text: text::Text,
+    cached_files: vec::Vec[_IndexedFile],
+    scan_job: _ScanFilesJob,
+    pending_text: text::Text,
+    has_pending_text: bool,
+}
+
+impl ComposerPopup {
+    fn new(prefix: str, composer_key: str, stage_key: str = "") -> ComposerPopup {
+        return ComposerPopup {
+            prefix: text::from_str(prefix),
+            composer_key: text::from_str(composer_key),
+            stage_key: text::from_str(stage_key),
+            items: vec::new::[PopupItem](),
+            selected: 0 as usize,
+            visible: false,
+            trigger_start: 0 as usize,
+            dismissed_text: text::from_str(""),
+            cached_cwd: text::from_str(""),
+            scanned: false,
+            want_cwd: text::from_str(""),
+            last_composer_text: text::from_str(""),
+            cached_files: vec::new::[_IndexedFile](),
+            scan_job: _ScanFilesJob {
+                cwd: text::from_str(""),
+                files: vec::new::[_IndexedFile](),
+            },
+            pending_text: text::from_str(""),
+            has_pending_text: false,
+        };
+    }
+
+    fn is_open(this) -> bool { return this.visible && this.items.count() > (0 as usize); }
+
+    fn _kick_file_scan(ref this, cwd: str) {
+        if cwd == "" || cwd.contains(".desk420/") {
+            this.cached_cwd = text::from_str("");
+            this.scanned = false;
+            this.cached_files.remove_all();
+            return;
+        }
+        if this.scanned && this.cached_cwd.equals(cwd) {
+            return;
+        }
+        this.want_cwd = text::from_str(cwd);
+        this.scan_job.cwd = text::from_str(cwd);
+        let _ = services::run_job(this.scan_job, then: this.on_scan_done);
+    }
+
+    fn on_scan_done(ref this) {
+        this.cached_cwd = this.scan_job.cwd.clone();
+        this.scanned = true;
+        this.cached_files.remove_all();
+        for f in this.scan_job.files.drain() {
+            let _ = this.cached_files.append(f);
+        }
+        if !this.want_cwd.is_empty() && !this.want_cwd.equals(this.cached_cwd.view()) {
+            let next: text::Text = this.want_cwd.clone();
+            this._kick_file_scan(next.view());
+            return;
+        }
+        if !this.last_composer_text.is_empty() {
+            let txt: text::Text = this.last_composer_text.clone();
+            let cwd: text::Text = this.cached_cwd.clone();
+            let trig: Trigger = detect_trigger(txt.view());
+            if trig.kind == TriggerKind::Mention {
+                this.trigger_start = trig.start;
+                this._collect_mention_items(trig.query.view(), cwd.view());
+                if this.items.count() > (0 as usize) {
+                    if this.selected >= this.items.count() { this.selected = 0 as usize; }
+                    this.visible = true;
+                    this._sync_ui(true);
+                }
+            }
+        }
+    }
+
+    fn _collect_slash_items(ref this, query_lower: str) {
+        this.items.remove_all();
+
+        let sid: text::Text = engine::active_session_id();
+        if !sid.is_empty() {
+            let cmds: vec::Vec[types::AvailableCommand] = conversation::available_commands(sid.view());
+            var i: usize = 0 as usize;
+            while i < cmds.count() && this.items.count() < MAX_ROWS {
+                if let option::Option::Some(cp) = cmds.at_ptr(i) {
+                    let nm: str = (*cp).name.view();
+                    if !nm.has_prefix("replaced-") {
+                        let nm_low: text::Text = (*cp).name.lowercased();
+                        let desc_low: text::Text = (*cp).description.lowercased();
+                        if query_lower == "" || nm_low.contains(query_lower) || desc_low.contains(query_lower) {
+                            let desc: text::Text = if !(*cp).description.is_empty() {
+                                (*cp).description.clone()
+                            } else {
+                                text::from_str(_default_desc(nm))
+                            };
+                            let _ = this.items.append(PopupItem {
+                                icon: _icon_for_command(nm),
+                                title: (*cp).name.clone(),
+                                subtitle: desc,
+                                insert_text: "/${nm} ",
+                            });
+                        }
+                    }
+                }
+                i = i +% (1 as usize);
+            }
+        }
+
+        if this.items.count() == (0 as usize) {
+            let builtins: [str; 10] = [
+                "compact", "goal", "deep-research", "review", "workflow",
+                "loop", "context", "session-info", "always-approve", "feedback",
+            ];
+            for bi in 0..10usize {
+                if this.items.count() >= MAX_ROWS { break; }
+                let nm: str = builtins[bi];
+                let desc: str = _default_desc(nm);
+                let desc_low: text::Text = text::from_str(desc).lowercased();
+                if query_lower == "" || nm.contains(query_lower) || desc_low.contains(query_lower) {
+                    let _ = this.items.append(PopupItem {
+                        icon: _icon_for_command(nm),
+                        title: text::from_str(nm),
+                        subtitle: text::from_str(desc),
+                        insert_text: "/${nm} ",
+                    });
+                }
+            }
+        }
+    }
+
+    fn _collect_mention_items(ref this, query_lower: str, cwd: str) {
+        this.items.remove_all();
+        this._kick_file_scan(cwd);
+
+        // 1. Project folders & files
+        var fi: usize = 0 as usize;
+        while fi < this.cached_files.count() && this.items.count() < MAX_ROWS {
+            if let option::Option::Some(fp) = this.cached_files.at_ptr(fi) {
+                let rel_low: text::Text = (*fp).rel_path.lowercased();
+                if query_lower == "" || rel_low.contains(query_lower) {
+                    let tok: text::Text = file_tree::format_prompt_ref((*fp).rel_path.view(), (*fp).is_dir);
+                    let sub: text::Text = if (*fp).parent_dir.is_empty() {
+                        if (*fp).is_dir { text::from_str("Folder") } else { text::from_str("Project root") }
+                    } else {
+                        (*fp).parent_dir.clone()
+                    };
+                    let _ = this.items.append(PopupItem {
+                        icon: if (*fp).is_dir { icons::folder } else { icons::description },
+                        title: (*fp).name.clone(),
+                        subtitle: sub,
+                        insert_text: "${tok.view()} ",
+                    });
+                }
+            }
+            fi = fi +% (1 as usize);
+        }
+
+        // 2. Recent conversations (if room remains)
+        if this.items.count() < MAX_ROWS {
+            let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+            var ri: usize = 0 as usize;
+            var added_convs: usize = 0 as usize;
+            while ri < rows.count() && this.items.count() < MAX_ROWS && added_convs < (3 as usize) {
+                if let option::Option::Some(rp) = rows.at_ptr(ri) {
+                    let t_low: text::Text = (*rp).title.lowercased();
+                    let f_low: text::Text = (*rp).folder_name.lowercased();
+                    if query_lower == "" || t_low.contains(query_lower) || f_low.contains(query_lower) {
+                        let title_s: str = (*rp).title.view();
+                        let sub_s: text::Text = if (*rp).folder_name.is_empty() {
+                            text::from_str("Conversation")
+                        } else {
+                            "Conversation · ${(*rp).folder_name.view()}"
+                        };
+                        let _ = this.items.append(PopupItem {
+                            icon: icons::chat_bubble,
+                            title: (*rp).title.clone(),
+                            subtitle: sub_s,
+                            insert_text: "@\"${title_s}\" ",
+                        });
+                        added_convs = added_convs +% (1 as usize);
+                    }
+                }
+                ri = ri +% (1 as usize);
+            }
+        }
+    }
+
+    fn _relayout_stage(this) {
+        if !this.stage_key.is_empty() {
+            if let option::Option::Some(st) = mount::find(this.stage_key.view()) {
+                core::relayout(st);
+            }
+        }
+    }
+
+    fn update(ref this, composer_text: str, cwd: str) {
+        this.last_composer_text = text::from_str(composer_text);
+        if !this.dismissed_text.is_empty() && this.dismissed_text.equals(composer_text) {
+            this.hide();
+            return;
+        }
+        this.dismissed_text = text::from_str("");
+
+        let trig: Trigger = detect_trigger(composer_text);
+        if trig.kind == TriggerKind::None {
+            this.hide();
+            return;
+        }
+
+        this.trigger_start = trig.start;
+        if trig.kind == TriggerKind::Slash {
+            this._collect_slash_items(trig.query.view());
+        } else {
+            this._collect_mention_items(trig.query.view(), cwd);
+        }
+
+        if this.items.count() == (0 as usize) {
+            this.hide();
+            return;
+        }
+        if this.selected >= this.items.count() {
+            this.selected = 0 as usize;
+        }
+        this.visible = true;
+        this._sync_ui(trig.kind == TriggerKind::Mention);
+    }
+
+    fn hide(ref this) {
+        this.visible = false;
+        this.items.remove_all();
+        this.selected = 0 as usize;
+        let pop_key: text::Text = "${this.prefix.view()}:popup";
+        style::show(pop_key.view(), false);
+        this._relayout_stage();
+    }
+
+    fn dismiss(ref this) {
+        if let option::Option::Some(ta) = m_text_area::find(this.composer_key.view()) {
+            this.dismissed_text = text::from_str(ta.text());
+        }
+        this.hide();
+    }
+
+    fn move_selection(ref this, delta: i32) {
+        let n: usize = this.items.count();
+        if !this.visible || n == (0 as usize) { return; }
+        let cur: i64 = this.selected as i64;
+        let count: i64 = n as i64;
+        var next: i64 = (cur + (delta as i64)) % count;
+        if next < (0 as i64) { next = next + count; }
+        this.selected = next as usize;
+        this._sync_highlight();
+    }
+
+    fn _apply_pending_text(ref this) {
+        if !this.has_pending_text { return; }
+        let next: text::Text = this.pending_text.clone();
+        this.pending_text = text::from_str("");
+        this.has_pending_text = false;
+        if let option::Option::Some(ta) = m_text_area::find(this.composer_key.view()) {
+            let was_focused: bool = ta.is_focused();
+            let _ta: m_text_area::TextArea = ta
+                .set_text(next.view())
+                .set_cursor_position(next.count() as i64);
+            if !was_focused {
+                let _f: m_text_area::TextArea = ta.focus();
+            }
+        }
+    }
+
+    fn pick_at(ref this, index: usize) -> bool {
+        if !this.visible || index >= this.items.count() { return false; }
+        guard let option::Option::Some(ip) = this.items.at_ptr(index) else { return false; };
+        let insert_s: text::Text = (*ip).insert_text.clone();
+        let start: usize = this.trigger_start;
+        var cur: text::Text = text::from_str("");
+        if let option::Option::Some(ta) = m_text_area::find(this.composer_key.view()) {
+            cur = text::from_str(ta.text());
+        }
+        let next: text::Text = apply_completion(cur.view(), start, insert_s.view());
+        this.hide();
+        this.pending_text = next;
+        this.has_pending_text = true;
+        services::run_on_main(this._apply_pending_text);
+        return true;
+    }
+
+    fn pick_from_sender(ref this, sender: *u8) -> bool {
+        let key: text::Text = component::key_of(sender);
+        guard let option::Option::Some(idx) = _parse_row_index(this.prefix.view(), key.view()) else {
+            return false;
+        };
+        return this.pick_at(idx);
+    }
+
+    // Handle Up/Down/Tab/Return/Escape while the popup is open.
+    // Returns true if the key event was consumed.
+    fn handle_key(ref this, event: *u8) -> bool {
+        if !this.is_open() { return false; }
+        let k: i64 = gestures::key_named(event);
+        if k == gestures::key_arrow_down() {
+            this.move_selection(1 as i32);
+            return true;
+        }
+        if k == gestures::key_arrow_up() {
+            this.move_selection(-1 as i32);
+            return true;
+        }
+        if k == gestures::key_escape() {
+            this.dismiss();
+            return true;
+        }
+        if k == gestures::key_tab() {
+            return this.pick_at(this.selected);
+        }
+        if k == gestures::key_return() {
+            let mods: u64 = gestures::key_modifiers(event);
+            if !gestures::has_modifier(mods, gestures::mod_shift()) {
+                return this.pick_at(this.selected);
+            }
+        }
+        return false;
+    }
+
+    // ---- retained UI builder & sync -----------------------------------------
+
+    fn _build_row(this, i: usize, on_pick: fn(*u8, *u8) -> bool, on_pick_ctx: *u8) -> core::Node {
+        let p: str = this.prefix.view();
+        let row_key: text::Text = "${p}:pop:row:${i}";
+        let ico_key: text::Text = "${p}:pop:ico:${i}";
+        let ttl_key: text::Text = "${p}:pop:ttl:${i}";
+        let sub_key: text::Text = "${p}:pop:sub:${i}";
+        return @ui {
+            hstack(key: row_key.view()) {
+                symbol(icons::bolt, key: ico_key.view(), size: 15.5f64, color: style::muted())
+                    .shrink(0.0f64)
+                    .set_input_transparent(true)
+                label("", key: ttl_key.view(),
+                font_size: 13.5f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::ink(),
+                max_lines: 1 as i64)
+                    .shrink(0.0f64)
+                    .set_input_transparent(true)
+                label("", key: sub_key.view(),
+                font_size: 13.0f64,
+                text_color: style::muted(),
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                    .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .min_width(0.0f64)
+                    .set_input_transparent(true)
+            }
+            .height(34.0f64)
+                .align(flex::Align::Center)
+                .gap(9.0f64)
+                .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                .set_corner_radius(vocab::Corners::all(8.0f64))
+                .gesture(on_click: on_pick, on_click_ctx: on_pick_ctx)
+        };
+    }
+
+    fn build(this, on_pick: fn(*u8, *u8) -> bool, on_pick_ctx: *u8 = 0 as *u8) -> core::Node {
+        let p: str = this.prefix.view();
+        let pop_key: text::Text = "${p}:popup";
+        let hdr_key: text::Text = "${p}:pop:hdr";
+        let max_i: i32 = MAX_ROWS as i32;
+        var card: core::Node = @ui {
+            bordered(key: pop_key.view(),
+            stroke: vocab::Brush::solid(style::hairline()),
+            stroke_width: 1.0f64,
+            stroke_shape: vocab::Shape::rounded(12.0f64)) {
+                column {
+                    label("", key: hdr_key.view(),
+                    font_size: 11.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::faint(),
+                    max_lines: 1 as i64)
+                        .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                        .padding_edge(flex::Edge::Top, 4.0f64)
+                        .padding_edge(flex::Edge::Bottom, 2.0f64)
+                    for i in 0..max_i {
+                        this._build_row(i as usize, on_pick, on_pick_ctx)
+                    }
+                }
+                .padding(5.0f64)
+                    .gap(1.0f64)
+            }
+            .align(flex::Align::Stretch)
+                .set_background_color(style::floating_card())
+                .set_corner_radius(vocab::Corners::all(12.0f64))
+        };
+        card.set_shadow(vocab::Shadow {
+            color: vocab::Color::rgba(0.0f64, 0.0f64, 0.0f64, 1.0f64),
+            offset: vocab::Point::of(0.0f64, 6.0f64),
+            radius: 18.0f64,
+            opacity: 0.34f64,
+        });
+        return card;
+    }
+
+    fn _sync_highlight(this) {
+        let p: str = this.prefix.view();
+        var i: usize = 0 as usize;
+        while i < this.items.count() && i < MAX_ROWS {
+            let row_key: text::Text = "${p}:pop:row:${i}";
+            let ico_key: text::Text = "${p}:pop:ico:${i}";
+            let sel: bool = i == this.selected;
+            if let option::Option::Some(rn) = mount::find(row_key.view()) {
+                core::set_background_color(rn, if sel { style::chip() } else { vocab::Color::clear() });
+            }
+            if let option::Option::Some(sym) = m_symbol::find(ico_key.view()) {
+                let _s: m_symbol::Symbol = sym.set_color(if sel { style::ink() } else { style::muted() });
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    fn _sync_ui(this, is_mention: bool) {
+        let p: str = this.prefix.view();
+        let pop_key: text::Text = "${p}:popup";
+        let hdr_key: text::Text = "${p}:pop:hdr";
+        let n: usize = this.items.count();
+
+        style::set_label(hdr_key.view(), if is_mention { "Files & Mentions" } else { "Actions" });
+        style::show(hdr_key.view(), is_mention);
+
+        var i: usize = 0 as usize;
+        while i < MAX_ROWS {
+            let row_key: text::Text = "${p}:pop:row:${i}";
+            if i < n {
+                if let option::Option::Some(ip) = this.items.at_ptr(i) {
+                    let ico_key: text::Text = "${p}:pop:ico:${i}";
+                    let ttl_key: text::Text = "${p}:pop:ttl:${i}";
+                    let sub_key: text::Text = "${p}:pop:sub:${i}";
+                    if let option::Option::Some(sym) = m_symbol::find(ico_key.view()) {
+                        let _s: m_symbol::Symbol = sym.set_icon((*ip).icon);
+                    }
+                    style::set_label(ttl_key.view(), (*ip).title.view());
+                    style::set_label(sub_key.view(), (*ip).subtitle.view());
+                }
+                style::show(row_key.view(), true);
+            } else {
+                style::show(row_key.view(), false);
+            }
+            i = i +% (1 as usize);
+        }
+
+        this._sync_highlight();
+        style::show(pop_key.view(), n > (0 as usize));
+        if let option::Option::Some(pn) = mount::find(pop_key.view()) {
+            core::relayout(pn);
+        }
+        this._relayout_stage();
+    }
+}
+
+#[test]
+fn trigger_detection_works_at_start_and_mid_sentence() {
+    let t0: Trigger = detect_trigger("");
+    assert match t0.kind { TriggerKind::None => true, _ => false };
+
+    let t1: Trigger = detect_trigger("/");
+    assert match t1.kind { TriggerKind::Slash => true, _ => false };
+    assert t1.start == (0 as usize) && t1.query.equals("");
+
+    let t2: Trigger = detect_trigger("here a command /comp");
+    assert match t2.kind { TriggerKind::Slash => true, _ => false };
+    assert t2.start == (15 as usize) && t2.query.equals("comp");
+
+    let t3: Trigger = detect_trigger("here is at @src/App");
+    assert match t3.kind { TriggerKind::Mention => true, _ => false };
+    assert t3.start == (11 as usize) && t3.query.equals("src/app");
+
+    // Trailing space closes the trigger
+    let t4: Trigger = detect_trigger("here is /compact ");
+    assert match t4.kind { TriggerKind::None => true, _ => false };
+
+    // Mid-word slash (like a URL) does not trigger
+    let t5: Trigger = detect_trigger("https://example.com");
+    assert match t5.kind { TriggerKind::None => true, _ => false };
+
+    let done1: text::Text = apply_completion("here a command /comp", t2.start, "/compact ");
+    assert done1.equals("here a command /compact ");
+
+    let done2: text::Text = apply_completion("here is at @src/App", t3.start, "@src/app.cplus ");
+    assert done2.equals("here is at @src/app.cplus ");
+}

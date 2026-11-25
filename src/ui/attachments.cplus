@@ -1,0 +1,554 @@
+// src/ui/attachments.cplus — files & images attached to the next prompt.
+//
+// Shared by both the Home composer and the Conversation composer:
+// - Image attachments render a 56x56 rounded thumbnail with a top-right remove (x) badge.
+// - Non-image files render a compact pill with a document icon, filename, and remove (x) button.
+// - Dragging files over the composer card highlights its border in lime and shows a
+//   "Drop files or images to attach" hint; dropping adds every file immediately.
+
+import "facet/bordered" as m_bordered;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/icons" as icons;
+import "facet/image" as m_image;
+import "facet/mount" as mount;
+import "facet/services" as services;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/base64" as base64;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "./style" as style;
+
+const MAX_SLOTS: usize = 8 as usize;
+
+fn is_image_ext(ext_lower: str) -> bool {
+    return ext_lower == "png" || ext_lower == "jpg" || ext_lower == "jpeg"
+        || ext_lower == "webp" || ext_lower == "gif" || ext_lower == "heic"
+        || ext_lower == "bmp" || ext_lower == "tiff" || ext_lower == "tif";
+}
+
+fn mime_for_image_ext(ext_lower: str) -> str {
+    if ext_lower == "png" { return "image/png"; }
+    if ext_lower == "webp" { return "image/webp"; }
+    if ext_lower == "gif" { return "image/gif"; }
+    if ext_lower == "heic" { return "image/heic"; }
+    if ext_lower == "bmp" { return "image/bmp"; }
+    if ext_lower == "tiff" || ext_lower == "tif" { return "image/tiff"; }
+    return "image/jpeg";
+}
+
+fn parse_slot_index(prefix: str, key: str) -> option::Option[usize] {
+    let head: text::Text = "${prefix}:att:";
+    if !key.has_prefix(head.view()) { return option::Option[usize]::None; }
+    guard let option::Option::Some(rest) = key.slice(from: head.count(), to: key.count()) else {
+        return option::Option[usize]::None;
+    };
+    guard let option::Option::Some(colon) = rest.find(":") else {
+        return option::Option[usize]::None;
+    };
+    guard let option::Option::Some(num_s) = rest.slice(from: 0 as usize, to: colon) else {
+        return option::Option[usize]::None;
+    };
+    guard let option::Option::Some(idx) = num_s.to_i64() else {
+        return option::Option[usize]::None;
+    };
+    if idx < (0 as i64) { return option::Option[usize]::None; }
+    return option::Option[usize]::Some(idx as usize);
+}
+
+fn _load_one_attachment(file_path: str) -> option::Option[types::Attachment] {
+    if file_path == "" || fs::is_dir(file_path) {
+        return option::Option[types::Attachment]::None;
+    }
+    let ext_raw: str = path::extension(file_path);
+    let ext: text::Text = text::from_str(ext_raw).lowercased();
+    if is_image_ext(ext.view()) {
+        let mime: str = mime_for_image_ext(ext.view());
+        if let result::Result::Ok(f) = fs::open_read(file_path) {
+            var file: fs::File = f;
+            if let result::Result::Ok(bytes) = file.read_to_end() {
+                if let option::Option::Some(bp) = bytes.at_ptr(0 as usize) {
+                    let b64: text::Text = base64::encode_bytes(bp, bytes.count());
+                    return option::Option[types::Attachment]::Some(types::Attachment {
+                        path: text::from_str(file_path),
+                        mime_type: text::from_str(mime),
+                        is_image: true,
+                        data_or_text: b64,
+                    });
+                }
+            }
+        }
+        return option::Option[types::Attachment]::None;
+    }
+    if let result::Result::Ok(txt) = fs::read_to_string(file_path) {
+        return option::Option[types::Attachment]::Some(types::Attachment {
+            path: text::from_str(file_path),
+            mime_type: text::from_str("text/plain"),
+            is_image: false,
+            data_or_text: txt,
+        });
+    }
+    return option::Option[types::Attachment]::None;
+}
+
+struct _LoadAttachmentsJob {
+    paths: vec::Vec[text::Text],
+    loaded: vec::Vec[types::Attachment],
+}
+
+impl _LoadAttachmentsJob: services::Job {
+    fn run(ref this) {
+        this.loaded.remove_all();
+        var i: usize = 0 as usize;
+        while i < this.paths.count() {
+            if let option::Option::Some(pp) = this.paths.at_ptr(i) {
+                if let option::Option::Some(att) = _load_one_attachment((*pp).view()) {
+                    let _ = this.loaded.append(att);
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+
+    fn apply(ref this) {}
+}
+
+struct Attachments {
+    items: vec::Vec[types::Attachment],
+    queued_paths: vec::Vec[text::Text],
+    load_job: _LoadAttachmentsJob,
+    prefix: text::Text,
+    stage_key: text::Text,
+    floating: bool,
+    drag_depth: i32,
+}
+
+impl Attachments {
+    fn new(prefix: str, stage_key: str = "", floating: bool = false) -> Attachments {
+        return Attachments {
+            items: vec::new::[types::Attachment](),
+            queued_paths: vec::new::[text::Text](),
+            load_job: _LoadAttachmentsJob {
+                paths: vec::new::[text::Text](),
+                loaded: vec::new::[types::Attachment](),
+            },
+            prefix: text::from_str(prefix),
+            stage_key: text::from_str(stage_key),
+            floating: floating,
+            drag_depth: 0 as i32,
+        };
+    }
+
+    fn count(this) -> usize { return this.items.count(); }
+
+    fn _has_path(this, file_path: str) -> bool {
+        var i: usize = 0 as usize;
+        while i < this.items.count() {
+            if let option::Option::Some(ap) = this.items.at_ptr(i) {
+                if (*ap).path.equals(file_path) { return true; }
+            }
+            i = i +% (1 as usize);
+        }
+        return false;
+    }
+
+    // Synchronous single-file helper (used by unit tests). UI handlers use
+    // `enqueue_path` / `choose` / `handle_drop` so disk reads and base64 run off main.
+    fn add_path(ref this, file_path: str) -> bool {
+        if file_path == "" || this._has_path(file_path) {
+            return false;
+        }
+        guard let option::Option::Some(att) = _load_one_attachment(file_path) else {
+            return false;
+        };
+        let _ = this.items.append(att);
+        this.sync();
+        return true;
+    }
+
+    fn _kick_load_job(ref this) {
+        if this.queued_paths.count() == (0 as usize) { return; }
+        var batch: vec::Vec[text::Text] = vec::new::[text::Text]();
+        for p in this.queued_paths.drain() {
+            if !this._has_path(p.view()) {
+                let _ = batch.append(p);
+            }
+        }
+        if batch.count() == (0 as usize) { return; }
+        this.load_job.paths = batch;
+        if !services::run_job(this.load_job, then: this.on_load_done) {
+            // Another flight is already active; re-queue these paths so on_load_done picks them up.
+            for p in this.load_job.paths.drain() {
+                let _ = this.queued_paths.append(p);
+            }
+        }
+    }
+
+    fn on_load_done(ref this) {
+        var added: bool = false;
+        for att in this.load_job.loaded.drain() {
+            if !this._has_path(att.path.view()) {
+                let _ = this.items.append(att);
+                added = true;
+            }
+        }
+        if added {
+            this.sync();
+        }
+        if this.queued_paths.count() > (0 as usize) {
+            this._kick_load_job();
+        }
+    }
+
+    // Ask for a file and load/encode it off the main thread.
+    fn choose(ref this) {
+        guard let option::Option::Some(file_path) = runtime::choose_file() else { return; };
+        let _ = this.queued_paths.append(file_path);
+        this._kick_load_job();
+    }
+
+    fn remove_at(ref this, index: usize) {
+        if index >= this.items.count() { return; }
+        let _ = this.items.remove(at: index);
+        this.sync();
+    }
+
+    fn remove_from_sender(ref this, sender: *u8) {
+        let key: text::Text = component::key_of(sender);
+        guard let option::Option::Some(idx) = parse_slot_index(this.prefix.view(), key.view()) else { return; };
+        this.remove_at(idx);
+    }
+
+    // Hand the files to a prompt and empty the composer's list.
+    fn take_all(ref this) -> vec::Vec[types::Attachment] {
+        var out: vec::Vec[types::Attachment] = vec::new::[types::Attachment]();
+        for item in this.items.drain() {
+            let _ = out.append(item);
+        }
+        this.sync();
+        return out;
+    }
+
+    // ---- drag-and-drop visual feedback & file ingestion ---------------------
+
+    fn set_drag_highlight(this, active: bool) {
+        let card_key: text::Text = "${this.prefix.view()}:composer_card";
+        let hint_key: text::Text = "${this.prefix.view()}:drop_hint";
+        if let option::Option::Some(b) = m_bordered::find(card_key.view()) {
+            let rim: vocab::Color = if active { style::lime() } else { style::hairline() };
+            let sw: f64 = if active { 2.0f64 } else { 1.0f64 };
+            let bg: vocab::Color = if active {
+                if this.floating { style::floating_lime_wash() } else { style::lime_wash() }
+            } else {
+                if this.floating { style::floating_card() } else { style::card() }
+            };
+            let _b: m_bordered::Bordered = b
+                .set_stroke(vocab::Brush::solid(rim))
+                .set_stroke_width(sw)
+                .set_background_color(bg);
+        }
+        style::show(hint_key.view(), active);
+    }
+
+    fn handle_drag_over(ref this, _sender: *u8) -> bool {
+        this.drag_depth = this.drag_depth + (1 as i32);
+        if this.drag_depth == (1 as i32) {
+            this.set_drag_highlight(true);
+        }
+        return true;
+    }
+
+    fn handle_drag_leave(ref this, _sender: *u8) -> bool {
+        if this.drag_depth > (0 as i32) {
+            this.drag_depth = this.drag_depth - (1 as i32);
+        }
+        if this.drag_depth == (0 as i32) {
+            this.set_drag_highlight(false);
+        }
+        return false;
+    }
+
+    fn handle_drop(ref this, sender: *u8) -> bool {
+        this.drag_depth = 0 as i32;
+        this.set_drag_highlight(false);
+        var paths: vec::Vec[text::Text] = component::dropped_files(sender);
+        let any: bool = paths.count() > (0 as usize);
+        for p in paths.drain() {
+            let _ = this.queued_paths.append(p);
+        }
+        if any {
+            this._kick_load_job();
+        }
+        return any;
+    }
+
+    // ---- retained UI builders -----------------------------------------------
+
+    fn _build_slot(this, i: usize, on_remove: fn(*u8, *u8) -> bool, on_remove_ctx: *u8) -> core::Node {
+        let p: str = this.prefix.view();
+        let slot_key: text::Text = "${p}:att:${i}";
+        let img_wrap_key: text::Text = "${p}:att:${i}:img_wrap";
+        let img_key: text::Text = "${p}:att:${i}:img";
+        let rm_img_key: text::Text = "${p}:att:${i}:rm_img";
+        let file_wrap_key: text::Text = "${p}:att:${i}:file_wrap";
+        let name_key: text::Text = "${p}:att:${i}:name";
+        let rm_file_key: text::Text = "${p}:att:${i}:rm_file";
+
+        return @ui {
+            hstack(key: slot_key.view()) {
+                // Image thumbnail tile (56x56 rounded preview + top-right x badge)
+                zstack(key: img_wrap_key.view()) {
+                    bordered(stroke: vocab::Brush::solid(style::hairline()),
+                    stroke_width: 1.0f64,
+                    stroke_shape: vocab::Shape::rounded(10.0f64)) {
+                        image("", key: img_key.view(), fit: vocab::ImageFit::AspectFill)
+                            .width(56.0f64)
+                            .height(56.0f64)
+                            .set_corner_radius(vocab::Corners::all(10.0f64))
+                    }
+                    .width(56.0f64)
+                        .height(56.0f64)
+                        .set_background_color(style::well())
+                        .set_corner_radius(vocab::Corners::all(10.0f64))
+
+                    hstack {
+                        spacer().grow(1.0f64)
+                        style::circle_icon(icons::close, rm_img_key.view(),
+                        title: "Remove attachment",
+                        size: 18.0f64, icon_size: 11.5f64,
+                        color: vocab::Color::rgba(1.0f64, 1.0f64, 1.0f64, 0.95f64),
+                        bg: vocab::Color::rgba(0.08f64, 0.08f64, 0.09f64, 0.85f64),
+                        border: vocab::Color::rgba(1.0f64, 1.0f64, 1.0f64, 0.22f64),
+                        border_width: 1.0f64,
+                        on_click: on_remove, on_click_ctx: on_remove_ctx)
+                    }
+                    .width(56.0f64)
+                        .padding(3.0f64)
+                        .align(flex::Align::Start)
+                }
+                .width(56.0f64)
+                    .height(56.0f64)
+                    .shrink(0.0f64)
+
+                // File chip pill (icon + filename + remove x button)
+                bordered(key: file_wrap_key.view(),
+                stroke: vocab::Brush::solid(style::hairline()),
+                stroke_width: 1.0f64,
+                stroke_shape: vocab::Shape::rounded(10.0f64)) {
+                    hstack {
+                        symbol(icons::description, size: 15.0f64, color: style::muted())
+                            .shrink(0.0f64)
+                        label("", key: name_key.view(),
+                        font_size: 12.5f64,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64)
+                            .shrink(1.0f64)
+                            .min_width(0.0f64)
+                        style::circle_icon(icons::close, rm_file_key.view(),
+                        title: "Remove attachment",
+                        size: 18.0f64, icon_size: 13.5f64,
+                        color: style::muted(),
+                        on_click: on_remove, on_click_ctx: on_remove_ctx)
+                    }
+                    .height(34.0f64)
+                        .align(flex::Align::Center)
+                        .gap(6.0f64)
+                        .padding_edge(flex::Edge::Left, 10.0f64)
+                        .padding_edge(flex::Edge::Right, 6.0f64)
+                }
+                .max_width(220.0f64)
+                    .shrink(0.0f64)
+                    .set_background_color(style::chip())
+                    .set_corner_radius(vocab::Corners::all(10.0f64))
+            }
+            .align(flex::Align::Center)
+                .shrink(0.0f64)
+        };
+    }
+
+    fn build_strip(this, on_remove: fn(*u8, *u8) -> bool, on_remove_ctx: *u8 = 0 as *u8) -> core::Node {
+        let p: str = this.prefix.view();
+        let bar_key: text::Text = "${p}:attach_bar";
+        let more_key: text::Text = "${p}:att:more";
+        let max_i: i32 = MAX_SLOTS as i32;
+        return @ui {
+            hstack(key: bar_key.view()) {
+                for i in 0..max_i {
+                    this._build_slot(i as usize, on_remove, on_remove_ctx)
+                }
+                label("", key: more_key.view(),
+                font_size: 12.0f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::muted())
+                    .padding_edge(flex::Edge::Horizontal, 6.0f64)
+            }
+            .wrap(flex::Wrap::Wrap)
+                .align(flex::Align::Center)
+                .gap(8.0f64)
+                .padding_edge(flex::Edge::Bottom, 4.0f64)
+        };
+    }
+
+    fn build_drop_hint(this) -> core::Node {
+        let hint_key: text::Text = "${this.prefix.view()}:drop_hint";
+        return @ui {
+            hstack(key: hint_key.view()) {
+                symbol(icons::add, size: 15.0f64, color: style::lime_text())
+                    .shrink(0.0f64)
+                label("Drop files or images to attach",
+                font_size: 13.0f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::lime_text())
+            }
+            .align(flex::Align::Center)
+                .gap(6.0f64)
+                .padding_edge(flex::Edge::Vertical, 2.0f64)
+                .set_input_transparent(true)
+        };
+    }
+
+    // Update live slot visibility, thumbnails, filenames, and bar visibility.
+    fn sync(this) {
+        let p: str = this.prefix.view();
+        let bar_key: text::Text = "${p}:attach_bar";
+        let hint_key: text::Text = "${p}:drop_hint";
+        let more_key: text::Text = "${p}:att:more";
+        let n: usize = this.items.count();
+
+        var i: usize = 0 as usize;
+        while i < MAX_SLOTS {
+            let slot_key: text::Text = "${p}:att:${i}";
+            if i < n {
+                if let option::Option::Some(ap) = this.items.at_ptr(i) {
+                    let img_wrap_key: text::Text = "${p}:att:${i}:img_wrap";
+                    let img_key: text::Text = "${p}:att:${i}:img";
+                    let file_wrap_key: text::Text = "${p}:att:${i}:file_wrap";
+                    let name_key: text::Text = "${p}:att:${i}:name";
+                    let is_img: bool = (*ap).is_image;
+                    style::show(img_wrap_key.view(), is_img);
+                    style::show(file_wrap_key.view(), !is_img);
+                    if is_img {
+                        if let option::Option::Some(im) = m_image::find(img_key.view()) {
+                            let _im: m_image::Image = im.set_source((*ap).path.view());
+                        }
+                    } else {
+                        let bn: str = path::file_name((*ap).path.view());
+                        style::set_label(name_key.view(), if bn == "" { (*ap).path.view() } else { bn });
+                    }
+                }
+                style::show(slot_key.view(), true);
+            } else {
+                style::show(slot_key.view(), false);
+            }
+            i = i +% (1 as usize);
+        }
+
+        if n > MAX_SLOTS {
+            let extra: usize = n -% MAX_SLOTS;
+            style::set_label(more_key.view(), "+${extra} more");
+            style::show(more_key.view(), true);
+        } else {
+            style::show(more_key.view(), false);
+        }
+
+        style::show(bar_key.view(), n > (0 as usize));
+        if this.drag_depth == (0 as i32) {
+            style::show(hint_key.view(), false);
+        }
+        if let option::Option::Some(bn) = mount::find(bar_key.view()) {
+            core::relayout(bn);
+        }
+        let card_key: text::Text = "${p}:composer_card";
+        if let option::Option::Some(cn) = mount::find(card_key.view()) {
+            core::relayout(cn);
+        }
+        if !this.stage_key.is_empty() {
+            if let option::Option::Some(st) = mount::find(this.stage_key.view()) {
+                core::relayout(st);
+            }
+        }
+    }
+}
+
+struct _TestRemoveOwner {
+    files: Attachments,
+    fired: i32,
+}
+
+impl _TestRemoveOwner {
+    fn on_rm(ref this, _sender: *u8) -> bool {
+        this.fired = this.fired + (1 as i32);
+        this.files.remove_at(0 as usize);
+        return true;
+    }
+
+    fn capture(ref this, on_remove: fn(*u8, *u8) -> bool, on_remove_ctx: *u8 = 0 as *u8) -> bool {
+        if on_remove_ctx.is_null() { return false; }
+        return on_remove(0 as *u8, on_remove_ctx);
+    }
+
+    fn run_test(ref this) -> bool {
+        return this.capture(on_remove: this.on_rm);
+    }
+}
+
+#[test]
+fn attachments_add_dedup_remove_and_detect_images() {
+    let img_path: str = "/tmp/desk420-att-test.png";
+    let txt_path: str = "/tmp/desk420-att-test.txt";
+    let _ = fs::write_string(img_path, "PNGDATA");
+    let _ = fs::write_string(txt_path, "hello world");
+
+    var att: Attachments = Attachments::new("test");
+    assert att.add_path(img_path);
+    assert !att.add_path(img_path); // dedup
+    assert att.add_path(txt_path);
+    assert att.count() == (2 as usize);
+
+    guard let option::Option::Some(a0) = att.items.at_ptr(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(a1) = att.items.at_ptr(1 as usize) else { assert false; return; };
+    assert (*a0).is_image && (*a0).mime_type.equals("image/png");
+    assert !(*a1).is_image && (*a1).data_or_text.equals("hello world");
+
+    // Slot key parsing for both image and file remove buttons
+    assert match parse_slot_index("home", "home:att:0:rm_img") {
+        option::Option::Some(v) => v == (0 as usize),
+        option::Option::None => false,
+    };
+    assert match parse_slot_index("home", "home:att:1:rm_file") {
+        option::Option::Some(v) => v == (1 as usize),
+        option::Option::None => false,
+    };
+    assert match parse_slot_index("chat", "chat:att:7:rm_img") {
+        option::Option::Some(v) => v == (7 as usize),
+        option::Option::None => false,
+    };
+    assert match parse_slot_index("home", "chat:att:0:rm_img") {
+        option::Option::Some(_) => false,
+        option::Option::None => true,
+    };
+
+    att.remove_at(0 as usize);
+    assert att.count() == (1 as usize);
+    guard let option::Option::Some(rem0) = att.items.at_ptr(0 as usize) else { assert false; return; };
+    assert (*rem0).path.equals(txt_path);
+
+    // Bound-method callback wiring removes from the owner's Attachments
+    var owner: _TestRemoveOwner = _TestRemoveOwner { files: att, fired: 0 as i32 };
+    assert owner.run_test();
+    assert owner.fired == (1 as i32);
+    assert owner.files.count() == (0 as usize);
+
+    let _ = fs::remove_file(img_path);
+    let _ = fs::remove_file(txt_path);
+}

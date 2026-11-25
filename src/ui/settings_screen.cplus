@@ -1,0 +1,670 @@
+// src/ui/settings_screen.cplus — Desk420 Settings window (Cmd-,).
+//
+// Two-tab Settings layout built with `facet/tabs`:
+// - Grok tab: Account & Usage card (profile, plan pill, usage bar, reset date,
+//   Refresh / Sign out), Permissions card (default approval mode), Agent Access,
+//   Grok Engine card (CLI path, version, connection transport), and MCP Servers.
+// - UI tab: Appearance card, Browser card, Composer & Transcript card, and
+//   Desktop & Notifications card.
+
+import "events/events" as events;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/icons" as icons;
+import "facet/popup" as m_popup;
+import "facet/screen" as screen;
+import "facet/text_button" as text_button;
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "facet/window_chrome" as window_chrome;
+import "flex_layout/flex_layout" as flex;
+import "notifications/notifications" as notifications;
+import "permissions/permissions" as permissions;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+import "../agent_consent" as agent_consent;
+import "../engine/runtime" as engine;
+import "../store/account" as account;
+import "../store/prefs" as prefs;
+import "./quick_ask" as quick_ask;
+import "./style" as style;
+
+// ───────────────────────────── section & row helpers ─────────────────────────────
+
+fn _section(title: str, key: str, take content: core::Node) -> core::Node {
+    return @ui {
+        column {
+            style::caption(title)
+                .padding_edge(flex::Edge::Left, 12.0f64)
+                .padding_edge(flex::Edge::Bottom, 6.0f64)
+            style::card_box(key, content, radius: 12.0f64, fill: style::floating_card())
+                .width_percent(100.0f64)
+        }
+        .align(flex::Align::Stretch)
+    };
+}
+
+fn _setting_copy(title: str, subtitle: str) -> core::Node {
+    return @ui {
+        column {
+            label(title,
+            font_size: 13.0f64,
+            font_weight: vocab::FontWeight::Medium,
+            text_color: style::ink())
+            label(subtitle,
+            font_size: 11.0f64,
+            text_color: style::faint(),
+            line_break: vocab::LineBreak::WordWrap)
+        }
+        .grow(1.0f64)
+            .shrink(1.0f64)
+            .gap(2.0f64)
+    };
+}
+
+fn _kv_row(title: str, value_key: str, initial: str, mono: bool = false) -> core::Node {
+    return @ui {
+        hstack {
+            label(title, font_size: 13.0f64, text_color: style::muted())
+                .shrink(0.0f64)
+            spacer().grow(1.0f64)
+            label(initial, key: value_key,
+            font_family: if mono { ftheme::MONOSPACE } else { "" },
+            font_size: if mono { 12.0f64 } else { 13.0f64 },
+            text_color: style::ink(),
+            line_break: vocab::LineBreak::TailTruncation,
+            max_lines: 1 as i64,
+            selectable: true)
+                .shrink(1.0f64)
+        }
+        .align(flex::Align::Center)
+            .gap(12.0f64)
+            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+            .padding_edge(flex::Edge::Vertical, 11.0f64)
+    };
+}
+
+// ───────────────────────────── component ─────────────────────────────
+
+struct SettingsScreen {
+    acc_sub: events::SignalSubscription[account::AccountChange],
+    status_sub: events::SignalSubscription[engine::EngineStateEvent],
+}
+
+impl SettingsScreen {
+    fn new() -> SettingsScreen {
+        return SettingsScreen {
+            acc_sub: events::SignalSubscription[account::AccountChange]::none(),
+            status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+        };
+    }
+
+    fn _popup_row(
+        ref this,
+        title: str,
+        subtitle: str,
+        key: str,
+        take items: vocab::TextList,
+        on_changed: fn(*u8, *u8),
+        on_changed_ctx: *u8 = 0 as *u8,
+    ) -> core::Node {
+        return @ui {
+            hstack {
+                _setting_copy(title, subtitle)
+                popup("", key: key,
+                font_size: 12.0f64,
+                text_color: style::ink(),
+                title_color: style::ink(),
+                items: items,
+                on_selected_index_changed: on_changed,
+                on_selected_index_changed_ctx: on_changed_ctx)
+                    .height(24.0f64)
+                    .shrink(0.0f64)
+            }
+            .align(flex::Align::Center)
+                .gap(14.0f64)
+                .padding(14.0f64)
+        };
+    }
+
+    fn _sync(ref this) {
+        // Account & usage
+        let uname: text::Text = account::user_name();
+        let uemail: text::Text = account::user_email();
+        let uplan: text::Text = account::plan_label();
+        let utitle: text::Text = account::usage_period_title();
+        let upct: text::Text = account::usage_percent_label();
+        let ureset: text::Text = account::usage_reset_pretty();
+        let uprepaid: text::Text = account::prepaid_label();
+        style::set_label("settings:user_name", uname.view());
+        style::set_label("settings:user_email", uemail.view());
+        style::set_label("settings:plan", uplan.view());
+        style::set_label("settings:usage_title", utitle.view());
+        style::set_label("settings:usage_pct", upct.view());
+        style::set_bar("settings:usage_bar", account::usage_fraction());
+        style::set_label("settings:usage_reset", ureset.view());
+        style::set_label("settings:prepaid", uprepaid.view());
+
+        // UI preferences
+        if let option::Option::Some(ap) = m_popup::find("settings:appearance") {
+            let _ap: m_popup::Popup = ap.set_selected_index(prefs::appearance().to_index());
+        }
+        if let option::Option::Some(bp) = m_popup::find("settings:browser") {
+            let _bp: m_popup::Popup = bp.set_selected_index(prefs::browser().to_index());
+        }
+        if let option::Option::Some(sk) = m_popup::find("settings:send_key") {
+            let _sk: m_popup::Popup = sk.set_selected_index(prefs::send_key().to_index());
+        }
+        if let option::Option::Some(tk) = m_popup::find("settings:thinking") {
+            let _tk: m_popup::Popup = tk.set_selected_index(if prefs::expand_thinking() { 1 as i64 } else { 0 as i64 });
+        }
+
+        // Permissions
+        if let option::Option::Some(mp) = m_popup::find("settings:mode") {
+            let _mp: m_popup::Popup = mp.set_selected_index(engine::approval_mode().to_index());
+        }
+        if let option::Option::Some(aa) = m_popup::find("settings:agent_access") {
+            let _aa: m_popup::Popup = aa.set_selected_index(prefs::agent_access().to_index());
+        }
+
+        // Grok Engine (cached on background worker thread; never blocks main thread)
+        let cli_path: text::Text = engine::cli_path();
+        let cli_ver: text::Text = engine::cli_version();
+        let mcp_sum: text::Text = engine::mcp_servers_summary();
+        style::set_label("settings:grok_path", cli_path.view());
+        style::set_label("settings:grok_version", cli_ver.view());
+        style::set_label("settings:mcp_list", mcp_sum.view());
+
+        // Notifications & Quick Ask
+        let ns: permissions::State = engine::notification_state();
+        let ns_txt: str = match ns {
+            permissions::State::Granted => "Allowed",
+            permissions::State::Limited => "Quiet delivery",
+            permissions::State::Unknown => "Not requested",
+            permissions::State::Denied => "Not enabled",
+            permissions::State::Blocked => "Blocked in System Settings",
+            permissions::State::Unsupported => "Requires Desk420.app bundle",
+        };
+        style::set_label("settings:notif_status", ns_txt);
+        let btn_txt: str = match ns {
+            permissions::State::Granted => "Send test",
+            permissions::State::Limited => "Send test",
+            permissions::State::Blocked => "Open Settings",
+            permissions::State::Unsupported => "Bundle only",
+            _ => "Enable",
+        };
+        if let option::Option::Some(nb) = text_button::find("settings:notif_btn") {
+            let _nb: text_button::TextButton = nb.set_title(btn_txt);
+        }
+        style::set_label("settings:hotkey_label", quick_ask::hotkey_label());
+    }
+
+    fn on_account_changed(ref this, _ev: account::AccountChange) {
+        this._sync();
+    }
+
+    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
+        this._sync();
+    }
+
+    fn on_mode_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(mp) = m_popup::find("settings:mode") else { return; };
+        engine::set_approval_mode(engine::ApprovalMode::from_index(mp.selected_index()));
+    }
+
+    fn on_agent_access_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(aa) = m_popup::find("settings:agent_access") else { return; };
+        let pick: prefs::AgentAccessPref = prefs::AgentAccessPref::from_index(aa.selected_index());
+        prefs::set_agent_access(pick);
+        agent_consent::revoke_all();
+    }
+
+    // System (the default), Light or Dark — saved, and applied at once.
+    fn on_appearance_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(ap) = m_popup::find("settings:appearance") else { return; };
+        let pick: prefs::AppearancePref = prefs::AppearancePref::from_index(ap.selected_index());
+        prefs::set_appearance(pick);
+        style::apply_appearance(pick);
+    }
+
+    // Default browser for Grok sign-in and external links — applied immediately.
+    fn on_browser_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(bp) = m_popup::find("settings:browser") else { return; };
+        let pick: prefs::BrowserPref = prefs::BrowserPref::from_index(bp.selected_index());
+        prefs::set_browser(pick);
+    }
+
+    fn on_send_key_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(sk) = m_popup::find("settings:send_key") else { return; };
+        prefs::set_send_key(prefs::SendKeyPref::from_index(sk.selected_index()));
+    }
+
+    fn on_thinking_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(tk) = m_popup::find("settings:thinking") else { return; };
+        prefs::set_expand_thinking(tk.selected_index() == (1 as i64));
+    }
+
+    fn on_refresh(ref this, _sender: *u8) {
+        engine::refresh_account();
+    }
+
+    fn on_signout(ref this, _sender: *u8) {
+        engine::sign_out();
+    }
+
+    fn on_notif_action(ref this, _sender: *u8) {
+        match engine::notification_state() {
+            permissions::State::Granted => {
+                let _ = engine::send_test_notification();
+            }
+            permissions::State::Limited => {
+                let _ = engine::send_test_notification();
+            }
+            permissions::State::Blocked => {
+                let _ = permissions::open_settings();
+            }
+            permissions::State::Unsupported => {}
+            _ => {
+                engine::request_notifications();
+            }
+        }
+        this._sync();
+    }
+
+    fn on_open_quick_ask(ref this, _sender: *u8) {
+        quick_ask::toggle();
+    }
+}
+
+impl SettingsScreen: component::Component {
+    fn build(ref this) -> core::Node {
+        var mode_items: vocab::TextList = vocab::TextList::new();
+        let _ = mode_items.add("Ask");
+        let _ = mode_items.add("Auto-approve");
+        let _ = mode_items.add("Custom");
+
+        var appearance_items: vocab::TextList = vocab::TextList::new();
+        let _ = appearance_items.add("System");
+        let _ = appearance_items.add("Light");
+        let _ = appearance_items.add("Dark");
+
+        var browser_items: vocab::TextList = vocab::TextList::new();
+        let _ = browser_items.add(prefs::BrowserPref::System.label());
+        let _ = browser_items.add(prefs::BrowserPref::Firefox.label());
+        let _ = browser_items.add(prefs::BrowserPref::Safari.label());
+        let _ = browser_items.add(prefs::BrowserPref::Chrome.label());
+        let _ = browser_items.add(prefs::BrowserPref::Arc.label());
+        let _ = browser_items.add(prefs::BrowserPref::Brave.label());
+        let _ = browser_items.add(prefs::BrowserPref::Edge.label());
+        let _ = browser_items.add(prefs::BrowserPref::Zen.label());
+
+        var send_key_items: vocab::TextList = vocab::TextList::new();
+        let _ = send_key_items.add("Return");
+        let _ = send_key_items.add("⌘Return");
+
+        var thinking_items: vocab::TextList = vocab::TextList::new();
+        let _ = thinking_items.add("Collapsed");
+        let _ = thinking_items.add("Expanded");
+
+        var access_items: vocab::TextList = vocab::TextList::new();
+        let _ = access_items.add("Allow (dev)");
+        let _ = access_items.add("Ask before connecting");
+        let _ = access_items.add("Disabled");
+
+        var root: core::Node = @ui {
+            column(key: "settings:root") {
+                // ── Draggable native macOS header bar ──
+                zstack(key: "settings:header") {
+                    row {
+                        label("Settings",
+                        font_size: 13.0f64,
+                        font_weight: vocab::FontWeight::Semibold,
+                        text_color: style::ink())
+                    }
+                    .width_percent(100.0f64)
+                        .height_percent(100.0f64)
+                        .justify(flex::Justify::Center)
+                        .align(flex::Align::Center)
+                        .window_drag()
+
+                    row {
+                        window_buttons(key: "settings:window-buttons")
+                            .set_input_transparent(false)
+                    }
+                    .height(48.0f64)
+                        .align(flex::Align::Center)
+                        .padding_edge(flex::Edge::Left, 16.0f64)
+                        .set_input_transparent(true)
+                }
+                .height(48.0f64)
+                    .shrink(0.0f64)
+                    .set_background_color(style::canvas())
+
+                // ── Native two-tab switcher: Grok | UI ──
+                tabs(key: "settings:tabs", selected_index: 0 as i64) {
+                    // ══════════════ GROK TAB ══════════════
+                    scroll(key: "settings:pane:grok", axis: vocab::ScrollAxis::Vertical) {
+                        column {
+                            _section("ACCOUNT", "settings:account_card", @ui {
+                                column {
+                                    // Profile row
+                                    hstack {
+                                        column {
+                                            symbol(icons::person,
+                                            size: 19.0f64,
+                                            fill: 1.0f64,
+                                            color: style::lime_text())
+                                        }
+                                        .width(38.0f64)
+                                            .height(38.0f64)
+                                            .shrink(0.0f64)
+                                            .justify(flex::Justify::Center)
+                                            .align(flex::Align::Center)
+                                            .set_background_color(style::lime_wash())
+                                            .set_corner_radius(vocab::Corners::all(19.0f64))
+
+                                        column {
+                                            label("Loading…", key: "settings:user_name",
+                                            font_size: 14.0f64,
+                                            font_weight: vocab::FontWeight::Semibold,
+                                            text_color: style::ink(),
+                                            line_break: vocab::LineBreak::TailTruncation,
+                                            max_lines: 1 as i64)
+                                            label("", key: "settings:user_email",
+                                            font_size: 12.0f64,
+                                            text_color: style::muted(),
+                                            line_break: vocab::LineBreak::TailTruncation,
+                                            max_lines: 1 as i64)
+                                        }
+                                        .grow(1.0f64)
+                                            .shrink(1.0f64)
+                                            .gap(2.0f64)
+
+                                        column {
+                                            label("Grok", key: "settings:plan",
+                                            font_size: 11.0f64,
+                                            font_weight: vocab::FontWeight::Semibold,
+                                            text_color: style::lime_text())
+                                        }
+                                        .shrink(0.0f64)
+                                            .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                            .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                            .set_background_color(style::lime_wash())
+                                            .set_corner_radius(vocab::Corners::all(11.0f64))
+                                    }
+                                    .align(flex::Align::Center)
+                                        .gap(12.0f64)
+                                        .padding(14.0f64)
+
+                                    style::rule()
+
+                                    // Usage bar & reset row
+                                    column {
+                                        hstack {
+                                            label("Usage", key: "settings:usage_title",
+                                            font_size: 13.0f64,
+                                            font_weight: vocab::FontWeight::Medium,
+                                            text_color: style::ink())
+                                            spacer().grow(1.0f64)
+                                            label("Loading…", key: "settings:usage_pct",
+                                            font_size: 13.0f64,
+                                            font_weight: vocab::FontWeight::Semibold,
+                                            text_color: style::ink())
+                                        }
+                                        .align(flex::Align::Center)
+
+                                        style::usage_bar("settings:usage_bar")
+
+                                        hstack {
+                                            label("", key: "settings:usage_reset",
+                                            font_size: 11.0f64,
+                                            text_color: style::faint())
+                                            spacer().grow(1.0f64)
+                                            label("", key: "settings:prepaid",
+                                            font_size: 11.0f64,
+                                            text_color: style::faint())
+                                        }
+                                        .align(flex::Align::Center)
+                                    }
+                                    .gap(8.0f64)
+                                        .padding(14.0f64)
+
+                                    style::rule()
+
+                                    // Account actions row
+                                    hstack {
+                                        text_button("Refresh", key: "settings:refresh",
+                                        font_size: 12.0f64,
+                                        font_weight: vocab::FontWeight::Medium,
+                                        text_color: style::ink(),
+                                        bordered: false,
+                                        corner_radius: vocab::Corners::all(7.0f64),
+                                        on_click: this.on_refresh)
+                                            .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                                            .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                            .set_background_color(style::chip())
+                                        spacer().grow(1.0f64)
+                                        text_button("Sign out", key: "settings:signout",
+                                        font_size: 12.0f64,
+                                        font_weight: vocab::FontWeight::Medium,
+                                        text_color: style::danger(),
+                                        bordered: false,
+                                        corner_radius: vocab::Corners::all(7.0f64),
+                                        on_click: this.on_signout)
+                                            .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                                            .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                            .set_background_color(style::danger_wash())
+                                    }
+                                    .align(flex::Align::Center)
+                                        .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                                        .padding_edge(flex::Edge::Vertical, 10.0f64)
+                                }
+                                .align(flex::Align::Stretch)
+                            })
+
+                            _section("PERMISSIONS", "settings:permissions_card", this._popup_row(
+                                "Default approval mode",
+                                "Choose whether Grok asks before running tools",
+                                "settings:mode",
+                                mode_items,
+                                this.on_mode_changed,
+                            ))
+
+                            _section("AGENT ACCESS", "settings:access_card", this._popup_row(
+                                "External MCP access",
+                                "Control whether external agents can inspect or drive Desk420",
+                                "settings:agent_access",
+                                access_items,
+                                this.on_agent_access_changed,
+                            ))
+
+                            _section("GROK ENGINE", "settings:engine_card", @ui {
+                                column {
+                                    _kv_row("CLI path", "settings:grok_path", "Detecting…", mono: true)
+                                    style::rule()
+                                    _kv_row("Version", "settings:grok_version", "—")
+                                    style::rule()
+                                    hstack {
+                                        label("Connection",
+                                        font_size: 13.0f64,
+                                        text_color: style::muted())
+                                            .shrink(0.0f64)
+                                        spacer().grow(1.0f64)
+                                        hstack {
+                                            style::dot(7.0f64, style::ok_green())
+                                            label("SuperGrok via Grok CLI (ACP)", key: "settings:transport",
+                                            font_size: 12.0f64,
+                                            text_color: style::muted())
+                                        }
+                                        .align(flex::Align::Center)
+                                            .gap(7.0f64)
+                                    }
+                                    .align(flex::Align::Center)
+                                        .gap(12.0f64)
+                                        .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                                        .padding_edge(flex::Edge::Vertical, 11.0f64)
+                                }
+                                .align(flex::Align::Stretch)
+                            })
+
+                            _section("MCP SERVERS", "settings:mcp_card", @ui {
+                                column {
+                                    label("desk420-browser · built-in", key: "settings:mcp_list",
+                                    font_family: ftheme::MONOSPACE,
+                                    font_size: 12.0f64,
+                                    line_height: 18.0f64,
+                                    text_color: style::muted(),
+                                    line_break: vocab::LineBreak::WordWrap,
+                                    selectable: true)
+                                }
+                                .padding(14.0f64)
+                                    .align(flex::Align::Stretch)
+                            })
+                        }
+                        .width_percent(100.0f64)
+                            .gap(18.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 20.0f64)
+                            .padding_edge(flex::Edge::Top, 18.0f64)
+                            .padding_edge(flex::Edge::Bottom, 24.0f64)
+                            .align(flex::Align::Stretch)
+                    }
+                    .set_tab_title("Grok")
+
+                    // ══════════════ UI TAB ══════════════
+                    scroll(key: "settings:pane:ui", axis: vocab::ScrollAxis::Vertical) {
+                        column {
+                            _section("APPEARANCE", "settings:appearance_card", this._popup_row(
+                                "Theme",
+                                "Follow the system, or always use light or dark",
+                                "settings:appearance",
+                                appearance_items,
+                                this.on_appearance_changed,
+                            ))
+
+                            _section("BROWSER", "settings:browser_card", this._popup_row(
+                                "Default browser",
+                                "Browser used for Grok sign-in and external links",
+                                "settings:browser",
+                                browser_items,
+                                this.on_browser_changed,
+                            ))
+
+                            _section("COMPOSER & TRANSCRIPT", "settings:composer_card", @ui {
+                                column {
+                                    this._popup_row(
+                                        "Send message with",
+                                        "Use Shift+Return (or Return in ⌘Return mode) for a new line",
+                                        "settings:send_key",
+                                        send_key_items,
+                                        this.on_send_key_changed,
+                                    )
+                                    style::rule()
+                                    this._popup_row(
+                                        "Thinking notes",
+                                        "Show Grok's reasoning snippets inline in the transcript",
+                                        "settings:thinking",
+                                        thinking_items,
+                                        this.on_thinking_changed,
+                                    )
+                                }
+                                .align(flex::Align::Stretch)
+                            })
+
+                            _section("DESKTOP & NOTIFICATIONS", "settings:desktop_card", @ui {
+                                column {
+                                    hstack {
+                                        _setting_copy(
+                                            "Notifications",
+                                            "Alert when Grok finishes a run or needs approval",
+                                        )
+                                        label("—", key: "settings:notif_status",
+                                        font_size: 11.5f64,
+                                        text_color: style::muted())
+                                            .shrink(0.0f64)
+                                        text_button("Enable", key: "settings:notif_btn",
+                                        font_size: 12.0f64,
+                                        font_weight: vocab::FontWeight::Medium,
+                                        text_color: style::ink(),
+                                        bordered: false,
+                                        corner_radius: vocab::Corners::all(6.0f64),
+                                        on_click: this.on_notif_action)
+                                            .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                            .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                            .set_background_color(style::chip())
+                                            .shrink(0.0f64)
+                                    }
+                                    .align(flex::Align::Center)
+                                        .gap(10.0f64)
+                                        .padding(14.0f64)
+
+                                    style::rule()
+
+                                    hstack {
+                                        _setting_copy(
+                                            "Quick Ask shortcut",
+                                            "Summon the floating prompt bar from any app",
+                                        )
+                                        label("⌥Space", key: "settings:hotkey_label",
+                                        font_family: ftheme::MONOSPACE,
+                                        font_size: 12.0f64,
+                                        text_color: style::lime_text())
+                                            .shrink(0.0f64)
+                                        text_button("Open", key: "settings:open_quick_ask",
+                                        font_size: 12.0f64,
+                                        font_weight: vocab::FontWeight::Medium,
+                                        text_color: style::ink(),
+                                        bordered: false,
+                                        corner_radius: vocab::Corners::all(6.0f64),
+                                        on_click: this.on_open_quick_ask)
+                                            .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                            .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                            .set_background_color(style::chip())
+                                            .shrink(0.0f64)
+                                    }
+                                    .align(flex::Align::Center)
+                                        .gap(10.0f64)
+                                        .padding(14.0f64)
+                                }
+                                .align(flex::Align::Stretch)
+                            })
+                        }
+                        .width_percent(100.0f64)
+                            .gap(18.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 20.0f64)
+                            .padding_edge(flex::Edge::Top, 18.0f64)
+                            .padding_edge(flex::Edge::Bottom, 24.0f64)
+                            .align(flex::Align::Stretch)
+                    }
+                    .set_tab_title("UI")
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .align(flex::Align::Stretch)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .align(flex::Align::Stretch)
+                .set_background_color(style::canvas())
+        };
+        root.set_safe_area(vocab::SafeArea::None);
+        return root;
+    }
+}
+
+impl SettingsScreen: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.acc_sub = account::watch(this.on_account_changed);
+        this.status_sub = engine::watch_status(this.on_status_changed);
+        this._sync();
+        engine::refresh_account();
+    }
+}
+
+impl SettingsScreen: screen::Screen {}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[SettingsScreen](SettingsScreen::new());
+}

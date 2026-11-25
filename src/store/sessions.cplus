@@ -1,0 +1,890 @@
+// src/store/sessions.cplus — sidebar sessions, projects, pins, archives, and search.
+//
+// Keeps Grok's own ~/.grok/sessions/ (via ACP session/list and session/search)
+// as the single source of truth for conversations. Only lightweight app-only
+// preferences (projects, pinned, archived) are persisted to ~/.desk420/state.json.
+
+import "events/events" as events;
+import "json/json" as json;
+import "stdlib/date" as date;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/result" as result;
+import "stdlib/string_set" as string_set;
+import "stdlib/text" as text;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+import "../acp/types" as types;
+import "../acp/wire" as wire;
+import "./conversation" as conversation;
+
+// ───────────────────────────── types ─────────────────────────────
+
+enum TaskState {
+    NeedsYou,
+    Running,
+    Failed,
+    Unread,
+    Idle,
+}
+
+impl TaskState {
+    fn badge(this) -> str {
+        return match this {
+            TaskState::NeedsYou => "● ",
+            TaskState::Running => "◌ ",
+            TaskState::Failed => "! ",
+            TaskState::Unread => "• ",
+            TaskState::Idle => "",
+        };
+    }
+}
+
+struct ProjectEntry {
+    path: text::Text,
+    name: text::Text,
+}
+
+impl ProjectEntry: Clone {}
+
+struct SidebarRow {
+    session_id: text::Text,
+    cwd: text::Text,
+    title: text::Text,
+    folder_name: text::Text,
+    updated_at: text::Text,
+    task_state: TaskState,
+    pinned: bool,
+}
+
+impl SidebarRow: Clone {}
+
+impl SidebarRow {
+    fn is_general(this) -> bool {
+        return this.folder_name.is_empty() || this.folder_name.equals("Chat") || this.cwd.contains(".desk420/");
+    }
+}
+
+// Parse an ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS...") into Unix epoch seconds.
+fn parse_iso_epoch(iso: str) -> option::Option[i64] {
+    guard let option::Option::Some(dt) = date::parse_iso8601(iso) else {
+        return option::Option[i64]::None;
+    };
+    return option::Option[i64]::Some(date::to_unix(dt));
+}
+
+fn format_relative_time(iso: str, now_secs: i64) -> text::Text {
+    guard let option::Option::Some(ts) = parse_iso_epoch(iso) else {
+        return text::from_str("");
+    };
+    let diff: i64 = now_secs - ts;
+    if diff < (60 as i64) { return text::from_str("now"); }
+    if diff < (3600 as i64) {
+        let mins: i64 = diff / (60 as i64);
+        return "${mins}m";
+    }
+    if diff < (86400 as i64) {
+        let hrs: i64 = diff / (3600 as i64);
+        return "${hrs}h";
+    }
+    let days: i64 = diff / (86400 as i64);
+    if days < (30 as i64) {
+        return "${days}d";
+    }
+    if days < (365 as i64) {
+        let mos: i64 = days / (30 as i64);
+        return "${mos}mo";
+    }
+    let yrs: i64 = days / (365 as i64);
+    return "${yrs}y";
+}
+
+fn relative_time(iso: str) -> text::Text {
+    return format_relative_time(iso, time::now());
+}
+
+// Format Unix epoch seconds into an ISO-8601 UTC string ("YYYY-MM-DDTHH:MM:SSZ").
+fn format_iso_epoch(secs: i64) -> text::Text {
+    return date::format_iso8601(date::from_unix(secs));
+}
+
+struct SessionsChange {
+    generation: u64,
+}
+
+// ───────────────────────────── helpers ─────────────────────────────
+
+fn _folder_label(cwd: str) -> text::Text {
+    if cwd == "" { return text::from_str("Chat"); }
+    if cwd.contains(".desk420/") || cwd.contains("desk420-scratch") {
+        return text::from_str("Chat");
+    }
+    let name: str = path::file_name(cwd);
+    if name == "" { return text::from_str(cwd); }
+    return text::from_str(name);
+}
+
+fn _display_title_from_snap(s: types::SessionSummary, snap: conversation::SessionSummarySnapshot) -> text::Text {
+    if snap.found {
+        if !snap.title.is_empty() {
+            return snap.title.clone();
+        }
+        if s.title.is_empty() && !snap.first_user_line.is_empty() {
+            return snap.first_user_line.clone();
+        }
+    }
+    if !s.title.is_empty() {
+        return s.title.clone();
+    }
+    return text::from_str("Untitled chat");
+}
+
+fn _task_state_from_snap(snap: conversation::SessionSummarySnapshot) -> TaskState {
+    if !snap.found { return TaskState::Idle; }
+    if snap.is_waiting_permission { return TaskState::NeedsYou; }
+    if snap.is_running { return TaskState::Running; }
+    if snap.has_error { return TaskState::Failed; }
+    if snap.unread { return TaskState::Unread; }
+    return TaskState::Idle;
+}
+
+fn _matches_search_hits(hits: vec::Vec[types::SearchHit], session_id: str) -> bool {
+    var i: usize = 0 as usize;
+    while i < hits.count() {
+        if let option::Option::Some(hp) = hits.at_ptr(i) {
+            if (*hp).session_id.equals(session_id) { return true; }
+        }
+        i = i +% (1 as usize);
+    }
+    return false;
+}
+
+enum _RowBucket {
+    NeedsYou,
+    Pinned,
+    Running,
+    Rest,
+}
+
+fn _bucket_of(r: SidebarRow) -> _RowBucket {
+    if r.task_state == TaskState::NeedsYou { return _RowBucket::NeedsYou; }
+    if r.pinned { return _RowBucket::Pinned; }
+    if r.task_state == TaskState::Running { return _RowBucket::Running; }
+    return _RowBucket::Rest;
+}
+
+fn _sort_newest_first(take src: vec::Vec[SidebarRow]) -> vec::Vec[SidebarRow] {
+    var rem: vec::Vec[SidebarRow] = src;
+    var epochs: vec::Vec[i64] = vec::new::[i64]();
+    var ei: usize = 0 as usize;
+    while ei < rem.count() {
+        var ep: i64 = 0 as i64;
+        if let option::Option::Some(rp) = rem.at_ptr(ei) {
+            if let option::Option::Some(ts) = parse_iso_epoch((*rp).updated_at.view()) {
+                ep = ts;
+            }
+        }
+        let _ = epochs.append(ep);
+        ei = ei +% (1 as usize);
+    }
+    var sorted: vec::Vec[SidebarRow] = vec::new::[SidebarRow]();
+    while rem.count() > (0 as usize) {
+        var best_i: usize = 0 as usize;
+        var best_ts: i64 = -1 as i64;
+        var i: usize = 0 as usize;
+        while i < epochs.count() {
+            if let option::Option::Some(ts) = epochs.at(i) {
+                if i == (0 as usize) || ts > best_ts {
+                    best_ts = ts;
+                    best_i = i;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        let _ = epochs.remove(at: best_i);
+        if let option::Option::Some(best) = rem.remove(at: best_i) {
+            let _ = sorted.append(best);
+        }
+    }
+    return sorted;
+}
+
+// ───────────────────────────── SessionsStore ─────────────────────────────
+
+struct SessionsStore {
+    sessions: vec::Vec[types::SessionSummary],
+    projects: vec::Vec[ProjectEntry],
+    pinned: string_set::StringSet,
+    archived: string_set::StringSet,
+    selected_project: text::Text,
+    filter_project: text::Text,
+    search_query: text::Text,
+    search_hits: vec::Vec[types::SearchHit],
+    _prefs_path: text::Text,
+    _gen: u64,
+    _changes: events::Signal[SessionsChange],
+}
+
+impl SessionsStore {
+    fn new(prefs_path: str = "") -> SessionsStore {
+        return SessionsStore {
+            sessions: vec::new::[types::SessionSummary](),
+            projects: vec::new::[ProjectEntry](),
+            pinned: string_set::new(),
+            archived: string_set::new(),
+            selected_project: text::from_str(""),
+            filter_project: text::from_str(""),
+            search_query: text::from_str(""),
+            search_hits: vec::new::[types::SearchHit](),
+            _prefs_path: text::from_str(prefs_path),
+            _gen: 0 as u64,
+            _changes: events::Signal[SessionsChange]::new(),
+        };
+    }
+
+    fn _emit(ref this) {
+        this._gen = this._gen +% (1 as u64);
+        this._changes.emit(SessionsChange { generation: this._gen });
+    }
+
+    fn watch(ref this, f: fn(SessionsChange, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[SessionsChange] {
+        return this._changes.on(f, ctx: ctx);
+    }
+
+    fn set_sessions(ref this, take list: vec::Vec[types::SessionSummary]) {
+        this.sessions = list;
+        this._emit();
+    }
+
+    // Ensure a newly-created or active session is immediately visible in the
+    // sidebar (before `session/list` next refreshes) with a current timestamp.
+    fn upsert_live_session(ref this, session_id: str, cwd: str = "", title: str = "", overwrite_title: bool = false) {
+        if session_id == "" { return; }
+        let now_str: text::Text = format_iso_epoch(time::now());
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                if (*sp).session_id.equals(session_id) {
+                    if cwd != "" && (*sp).cwd.is_empty() {
+                        (*sp).cwd = text::from_str(cwd);
+                    }
+                    if title != "" && (overwrite_title || (*sp).title.is_empty()) {
+                        (*sp).title = text::from_str(title);
+                    }
+                    (*sp).updated_at = now_str;
+                    this._emit();
+                    return;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        let _ = this.sessions.append(types::SessionSummary {
+            session_id: text::from_str(session_id),
+            cwd: text::from_str(cwd),
+            title: text::from_str(title),
+            updated_at: now_str,
+        });
+        this._emit();
+    }
+
+    fn remove_session(ref this, session_id: str) {
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                if (*sp).session_id.equals(session_id) {
+                    let _ = this.sessions.remove(at: i);
+                    break;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        let _ = this.pinned.remove(session_id);
+        let _ = this.archived.remove(session_id);
+        this._save_prefs();
+        this._emit();
+    }
+
+    fn set_search_query(ref this, q: str) {
+        this.search_query = text::from_str(q);
+        if q.trim().is_empty() {
+            this.search_hits.remove_all();
+        }
+        this._emit();
+    }
+
+    fn set_search_hits(ref this, take hits: vec::Vec[types::SearchHit]) {
+        this.search_hits = hits;
+        this._emit();
+    }
+
+    // Target folder for the next new run (does NOT filter the sidebar).
+    fn set_selected_project(ref this, folder_path: str) {
+        this.selected_project = text::from_str(folder_path);
+        this._emit();
+    }
+
+    // Explicit sidebar project filter (empty = show every project).
+    fn set_filter_project(ref this, folder_path: str) {
+        this.filter_project = text::from_str(folder_path);
+        this._emit();
+    }
+
+    fn add_project(ref this, folder_path: str) {
+        let trimmed: str = folder_path.trim();
+        if trimmed.is_empty() { return; }
+        var i: usize = 0 as usize;
+        while i < this.projects.count() {
+            if let option::Option::Some(pp) = this.projects.at_ptr(i) {
+                if (*pp).path.equals(trimmed) { return; }
+            }
+            i = i +% (1 as usize);
+        }
+        let label: text::Text = _folder_label(trimmed);
+        let _ = this.projects.append(ProjectEntry {
+            path: text::from_str(trimmed),
+            name: label,
+        });
+        this._save_prefs();
+        this._emit();
+    }
+
+    fn toggle_pin(ref this, session_id: str) {
+        if !this.pinned.remove(session_id) {
+            let _ = this.pinned.insert(text::from_str(session_id));
+        }
+        this._save_prefs();
+        this._emit();
+    }
+
+    fn is_pinned(this, session_id: str) -> bool {
+        return this.pinned.contains(session_id);
+    }
+
+    fn archive_session(ref this, session_id: str) {
+        if !this.archived.contains(session_id) {
+            let _ = this.archived.insert(text::from_str(session_id));
+            this._save_prefs();
+            this._emit();
+        }
+    }
+
+    fn _build_visible_rows(this, snaps: vec::Vec[conversation::SessionSummarySnapshot]) -> vec::Vec[SidebarRow] {
+        var bucket0: vec::Vec[SidebarRow] = vec::new::[SidebarRow](); // NeedsYou
+        var bucket1: vec::Vec[SidebarRow] = vec::new::[SidebarRow](); // Pinned
+        var bucket2: vec::Vec[SidebarRow] = vec::new::[SidebarRow](); // Running
+        var bucket3: vec::Vec[SidebarRow] = vec::new::[SidebarRow](); // Rest
+
+        let q_lower: text::Text = this.search_query.lowercased();
+        let q_view: str = q_lower.view().trim();
+        let filter_proj: str = this.filter_project.view();
+
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                let sid: str = (*sp).session_id.view();
+                if this.archived.contains(sid) {
+                    i = i +% (1 as usize);
+                    continue;
+                }
+                if filter_proj != "" && !(*sp).cwd.equals(filter_proj) {
+                    i = i +% (1 as usize);
+                    continue;
+                }
+
+                let snap: conversation::SessionSummarySnapshot = match snaps.at_ptr(i) {
+                    option::Option::Some(sn) => conversation::SessionSummarySnapshot {
+                        found: (*sn).found,
+                        title: (*sn).title.clone(),
+                        first_user_line: (*sn).first_user_line.clone(),
+                        is_waiting_permission: (*sn).is_waiting_permission,
+                        is_running: (*sn).is_running,
+                        has_error: (*sn).has_error,
+                        unread: (*sn).unread,
+                    },
+                    option::Option::None => conversation::SessionSummarySnapshot::empty(),
+                };
+                let title: text::Text = _display_title_from_snap((*sp).clone(), snap);
+                if !q_view.is_empty() {
+                    let t_lower: text::Text = title.lowercased();
+                    let title_hit: bool = t_lower.contains(q_view);
+                    let fts_hit: bool = _matches_search_hits(this.search_hits, sid);
+                    if !title_hit && !fts_hit {
+                        i = i +% (1 as usize);
+                        continue;
+                    }
+                }
+
+                let ts: TaskState = _task_state_from_snap(snap);
+                let pin: bool = this.pinned.contains(sid);
+                let row: SidebarRow = SidebarRow {
+                    session_id: (*sp).session_id.clone(),
+                    cwd: (*sp).cwd.clone(),
+                    title: title,
+                    folder_name: _folder_label((*sp).cwd.view()),
+                    updated_at: (*sp).updated_at.clone(),
+                    task_state: ts,
+                    pinned: pin,
+                };
+                match _bucket_of(row) {
+                    _RowBucket::NeedsYou => { let _ = bucket0.append(row); }
+                    _RowBucket::Pinned => { let _ = bucket1.append(row); }
+                    _RowBucket::Running => { let _ = bucket2.append(row); }
+                    _RowBucket::Rest => { let _ = bucket3.append(row); }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+
+        var s0: vec::Vec[SidebarRow] = _sort_newest_first(bucket0);
+        var s1: vec::Vec[SidebarRow] = _sort_newest_first(bucket1);
+        var s2: vec::Vec[SidebarRow] = _sort_newest_first(bucket2);
+        var s3: vec::Vec[SidebarRow] = _sort_newest_first(bucket3);
+
+        var out: vec::Vec[SidebarRow] = vec::new::[SidebarRow]();
+        for r in s0.drain() { let _ = out.append(r); }
+        for r in s1.drain() { let _ = out.append(r); }
+        for r in s2.drain() { let _ = out.append(r); }
+        for r in s3.drain() { let _ = out.append(r); }
+        return out;
+    }
+
+    fn needs_you_count_with(this, conv: conversation::ConversationStore) -> usize {
+        var c: usize = 0 as usize;
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                let sid: str = (*sp).session_id.view();
+                if !this.archived.contains(sid) {
+                    if _task_state_from_snap(conv.summary_snapshot(sid)) == TaskState::NeedsYou {
+                        c = c +% (1 as usize);
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return c;
+    }
+
+    fn needs_you_count(this) -> usize {
+        var c: usize = 0 as usize;
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                let sid: str = (*sp).session_id.view();
+                if !this.archived.contains(sid) {
+                    if _task_state_from_snap(conversation::summary_snapshot(sid)) == TaskState::NeedsYou {
+                        c = c +% (1 as usize);
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return c;
+    }
+
+    fn visible_rows_with(this, conv: conversation::ConversationStore) -> vec::Vec[SidebarRow] {
+        var snaps: vec::Vec[conversation::SessionSummarySnapshot] = vec::new::[conversation::SessionSummarySnapshot]();
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                let _ = snaps.append(conv.summary_snapshot((*sp).session_id.view()));
+            }
+            i = i +% (1 as usize);
+        }
+        return this._build_visible_rows(snaps);
+    }
+
+    fn visible_rows(this) -> vec::Vec[SidebarRow] {
+        var snaps: vec::Vec[conversation::SessionSummarySnapshot] = vec::new::[conversation::SessionSummarySnapshot]();
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                let _ = snaps.append(conversation::summary_snapshot((*sp).session_id.view()));
+            }
+            i = i +% (1 as usize);
+        }
+        return this._build_visible_rows(snaps);
+    }
+
+    // ---- lightweight JSON persistence (app-only prefs) ----------------------
+
+    fn _save_prefs(this) {
+        if this._prefs_path.is_empty() { return; }
+        let dir: str = path::parent(this._prefs_path.view());
+        if dir != "" { let _ = fs::create_dir_all(dir); }
+
+        var proj_arr: vec::Vec[json::Value] = vec::new::[json::Value]();
+        var i: usize = 0 as usize;
+        while i < this.projects.count() {
+            if let option::Option::Some(pp) = this.projects.at_ptr(i) {
+                let _ = proj_arr.append(json::Value::text((*pp).path.view()));
+            }
+            i = i +% (1 as usize);
+        }
+
+        var pin_arr: vec::Vec[json::Value] = vec::new::[json::Value]();
+        let pin_cap: usize = this.pinned.slot_capacity();
+        i = 0 as usize;
+        while i < pin_cap {
+            if let option::Option::Some(tp) = this.pinned.element_ptr_at_slot(i) {
+                let _ = pin_arr.append(json::Value::text((*tp).view()));
+            }
+            i = i +% (1 as usize);
+        }
+
+        var arch_arr: vec::Vec[json::Value] = vec::new::[json::Value]();
+        let arch_cap: usize = this.archived.slot_capacity();
+        i = 0 as usize;
+        while i < arch_cap {
+            if let option::Option::Some(tp) = this.archived.element_ptr_at_slot(i) {
+                let _ = arch_arr.append(json::Value::text((*tp).view()));
+            }
+            i = i +% (1 as usize);
+        }
+
+        var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+        let _ = m.append(json::Member::new("projects", json::Value::array(proj_arr)));
+        let _ = m.append(json::Member::new("pinned", json::Value::array(pin_arr)));
+        let _ = m.append(json::Member::new("archived", json::Value::array(arch_arr)));
+        let body: text::Text = json::Value::object(m).to_text();
+        let _ = fs::write_string(this._prefs_path.view(), body.view());
+    }
+
+    fn load_prefs(ref this) {
+        if this._prefs_path.is_empty() { return; }
+        guard let result::Result::Ok(raw) = fs::read_to_string(this._prefs_path.view()) else {
+            return;
+        };
+        guard let result::Result::Ok(root) = json::Value::parse(source: raw.view()) else {
+            return;
+        };
+
+        this.projects.remove_all();
+        if let option::Option::Some(pa) = root.value(for_key: "projects") {
+            var i: usize = 0 as usize;
+            while i < pa.item_count() {
+                if let option::Option::Some(v) = pa.item(at: i) {
+                    if let option::Option::Some(t) = v.as_text() {
+                        let _ = this.projects.append(ProjectEntry {
+                            name: _folder_label(t.view()),
+                            path: t,
+                        });
+                    }
+                }
+                i = i +% (1 as usize);
+            }
+        }
+
+        this.pinned.clear();
+        if let option::Option::Some(pa) = root.value(for_key: "pinned") {
+            var i: usize = 0 as usize;
+            while i < pa.item_count() {
+                if let option::Option::Some(v) = pa.item(at: i) {
+                    if let option::Option::Some(t) = v.as_text() {
+                        let _ = this.pinned.insert(t);
+                    }
+                }
+                i = i +% (1 as usize);
+            }
+        }
+
+        this.archived.clear();
+        if let option::Option::Some(aa) = root.value(for_key: "archived") {
+            var i: usize = 0 as usize;
+            while i < aa.item_count() {
+                if let option::Option::Some(v) = aa.item(at: i) {
+                    if let option::Option::Some(t) = v.as_text() {
+                        let _ = this.archived.insert(t);
+                    }
+                }
+                i = i +% (1 as usize);
+            }
+        }
+        this._emit();
+    }
+}
+
+// ───────────────────────────── app-wide singleton surface ─────────────────────────────
+
+static _SESS_LIVE: bool = false;
+static _SESS: SessionsStore = #zero::[SessionsStore]();
+
+fn _default_prefs_path() -> text::Text {
+    if let option::Option::Some(home) = env::var("HOME") {
+        return path::join(base: home.view(), child: ".desk420/state.json");
+    }
+    return text::from_str("/tmp/desk420-state.json");
+}
+
+fn _ensure() {
+    if !_SESS_LIVE {
+        let pp: text::Text = _default_prefs_path();
+        _SESS = SessionsStore::new(prefs_path: pp.view());
+        _SESS.load_prefs();
+        _SESS_LIVE = true;
+    }
+}
+
+fn watch(f: fn(SessionsChange, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[SessionsChange] {
+    _ensure();
+    return _SESS.watch(f, ctx: ctx);
+}
+
+fn set_sessions(take list: vec::Vec[types::SessionSummary]) {
+    _ensure();
+    _SESS.set_sessions(list);
+}
+
+fn upsert_live_session(session_id: str, cwd: str = "", title: str = "", overwrite_title: bool = false) {
+    _ensure();
+    _SESS.upsert_live_session(session_id, cwd: cwd, title: title, overwrite_title: overwrite_title);
+}
+
+fn remove_session(session_id: str) {
+    _ensure();
+    _SESS.remove_session(session_id);
+}
+
+fn set_search_query(q: str) {
+    _ensure();
+    _SESS.set_search_query(q);
+}
+
+fn search_query() -> text::Text {
+    _ensure();
+    return _SESS.search_query.clone();
+}
+
+fn set_search_hits(take hits: vec::Vec[types::SearchHit]) {
+    _ensure();
+    _SESS.set_search_hits(hits);
+}
+
+fn set_selected_project(folder_path: str) {
+    _ensure();
+    _SESS.set_selected_project(folder_path);
+}
+
+fn selected_project() -> text::Text {
+    _ensure();
+    return _SESS.selected_project.clone();
+}
+
+fn add_project(folder_path: str) {
+    _ensure();
+    _SESS.add_project(folder_path);
+}
+
+fn all_project_folders() -> vec::Vec[ProjectEntry] {
+    _ensure();
+    var out: vec::Vec[ProjectEntry] = vec::new::[ProjectEntry]();
+    var seen: string_set::StringSet = string_set::new();
+
+    // 1. Explicitly added project folders first
+    var i: usize = 0 as usize;
+    while i < _SESS.projects.count() {
+        if let option::Option::Some(pp) = _SESS.projects.at_ptr(i) {
+            if !seen.contains((*pp).path.view()) {
+                let _ = seen.insert((*pp).path.clone());
+                let _ = out.append((*pp).clone());
+            }
+        }
+        i = i +% (1 as usize);
+    }
+
+    // 2. Non-scratch folders discovered from Grok's session list
+    i = 0 as usize;
+    while i < _SESS.sessions.count() {
+        if let option::Option::Some(sp) = _SESS.sessions.at_ptr(i) {
+            let cwd_v: str = (*sp).cwd.view();
+            if cwd_v != "" && !cwd_v.contains(".desk420/") && !cwd_v.contains("desk420-scratch") {
+                if !seen.contains(cwd_v) {
+                    let _ = seen.insert((*sp).cwd.clone());
+                    let _ = out.append(ProjectEntry {
+                        path: (*sp).cwd.clone(),
+                        name: _folder_label(cwd_v),
+                    });
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+
+    return out;
+}
+
+fn toggle_pin(session_id: str) {
+    _ensure();
+    _SESS.toggle_pin(session_id);
+}
+
+fn is_pinned(session_id: str) -> bool {
+    _ensure();
+    return _SESS.is_pinned(session_id);
+}
+
+fn archive_session(session_id: str) {
+    _ensure();
+    _SESS.archive_session(session_id);
+}
+
+fn visible_rows() -> vec::Vec[SidebarRow] {
+    _ensure();
+    return _SESS.visible_rows();
+}
+
+fn needs_you_count() -> usize {
+    _ensure();
+    return _SESS.needs_you_count();
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[test]
+fn sidebar_sorts_needs_you_and_pinned_first_and_filters_by_project_and_search() {
+    var conv: conversation::ConversationStore = conversation::ConversationStore::new();
+    let _ = conv.ensure_session("s1");
+    let _ = conv.ensure_session("s2");
+    let _ = conv.ensure_session("s3");
+
+    // Put s3 into WaitingPermission ("NeedsYou").
+    conv.apply_permission_request(types::PermissionRequest {
+        rpc_id: wire::JsonRpcId::Num(1 as i64),
+        session_id: text::from_str("s3"),
+        tool_call_id: text::from_str("tc1"),
+        title: text::from_str("Run rm"),
+        kind: types::ToolKind::Execute,
+        command: text::from_str("rm a.txt"),
+        description: text::from_str(""),
+        options: vec::new::[types::PermissionOption](),
+    });
+
+    var ss: SessionsStore = SessionsStore::new();
+    var list: vec::Vec[types::SessionSummary] = vec::new::[types::SessionSummary]();
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("s1"),
+        cwd: text::from_str("/work/alpha"),
+        title: text::from_str("Trip ideas"),
+        updated_at: text::from_str("2026-11-22T10:00:00Z"),
+    });
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("s2"),
+        cwd: text::from_str("/work/beta"),
+        title: text::from_str("Fix build"),
+        updated_at: text::from_str("2026-11-22T11:00:00Z"),
+    });
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("s3"),
+        cwd: text::from_str("/work/alpha"),
+        title: text::from_str("Cleanup"),
+        updated_at: text::from_str("2026-11-22T12:00:00Z"),
+    });
+    ss.set_sessions(list);
+    ss.toggle_pin("s2");
+
+    assert ss.needs_you_count_with(conv) == (1 as usize);
+
+    // Order should be: s3 (NeedsYou), s2 (Pinned), s1 (Idle).
+    let rows: vec::Vec[SidebarRow] = ss.visible_rows_with(conv);
+    assert rows.count() == (3 as usize);
+    guard let option::Option::Some(r0) = rows.at_ptr(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(r1) = rows.at_ptr(1 as usize) else { assert false; return; };
+    guard let option::Option::Some(r2) = rows.at_ptr(2 as usize) else { assert false; return; };
+    assert (*r0).session_id.equals("s3") && (*r0).task_state == TaskState::NeedsYou;
+    assert (*r1).session_id.equals("s2") && (*r1).pinned;
+    assert (*r2).session_id.equals("s1");
+
+    // Picking a new-run target project must NOT hide other projects' chats.
+    ss.set_selected_project("/work/alpha");
+    assert ss.visible_rows_with(conv).count() == (3 as usize);
+
+    // Explicit project filter.
+    ss.set_filter_project("/work/alpha");
+    let proj_rows: vec::Vec[SidebarRow] = ss.visible_rows_with(conv);
+    assert proj_rows.count() == (2 as usize);
+
+    // Search filter (title + full-text hit).
+    ss.set_filter_project("");
+    ss.set_search_query("trip");
+    let q_rows: vec::Vec[SidebarRow] = ss.visible_rows_with(conv);
+    assert q_rows.count() == (1 as usize);
+    guard let option::Option::Some(qr0) = q_rows.at_ptr(0 as usize) else { assert false; return; };
+    assert (*qr0).session_id.equals("s1");
+
+    // Archive hides without deleting.
+    ss.set_search_query("");
+    ss.archive_session("s1");
+    assert ss.visible_rows_with(conv).count() == (2 as usize);
+}
+
+#[test]
+fn prefs_persist_projects_pins_and_archives() {
+    let p: str = "/tmp/desk420-prefs-test.json";
+    let _ = fs::remove_file(p);
+
+    var s1: SessionsStore = SessionsStore::new(prefs_path: p);
+    s1.add_project("/tmp/desk420-project-a");
+    s1.toggle_pin("sess-a");
+    s1.archive_session("sess-b");
+
+    var s2: SessionsStore = SessionsStore::new(prefs_path: p);
+    s2.load_prefs();
+    assert s2.projects.count() == (1 as usize);
+    assert s2.is_pinned("sess-a");
+    assert s2.archived.contains("sess-b");
+
+    let _ = fs::remove_file(p);
+}
+
+#[test]
+fn relative_time_formats_seconds_minutes_hours_days_and_invalid() {
+    guard let option::Option::Some(base) = parse_iso_epoch("2026-11-24T18:00:00Z") else {
+        assert false;
+        return;
+    };
+    assert format_relative_time("2026-11-24T17:59:30+00:00", base).equals("now");
+    assert format_relative_time("2026-11-24T17:55:00Z", base).equals("5m");
+    assert format_relative_time("2026-11-24T15:00:00Z", base).equals("3h");
+    assert format_relative_time("2026-11-21T18:00:00Z", base).equals("3d");
+    assert format_relative_time("2026-09-24T18:00:00Z", base).equals("2mo");
+    assert format_relative_time("", base).equals("");
+    assert format_relative_time("not-a-date", base).equals("");
+    assert format_iso_epoch(base).equals("2026-11-24T18:00:00Z");
+}
+
+#[test]
+fn visible_rows_sorts_newest_to_oldest_within_buckets() {
+    let conv: conversation::ConversationStore = conversation::ConversationStore::new();
+    var ss: SessionsStore = SessionsStore::new();
+    var list: vec::Vec[types::SessionSummary] = vec::new::[types::SessionSummary]();
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("old"),
+        cwd: text::from_str("/work/a"),
+        title: text::from_str("Old"),
+        updated_at: text::from_str("2026-11-20T10:00:00Z"),
+    });
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("newest"),
+        cwd: text::from_str("/work/a"),
+        title: text::from_str("Newest"),
+        updated_at: text::from_str("2026-11-24T18:30:00Z"),
+    });
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("mid"),
+        cwd: text::from_str("/work/a"),
+        title: text::from_str("Mid"),
+        updated_at: text::from_str("2026-11-22T12:00:00Z"),
+    });
+    ss.set_sessions(list);
+    let rows: vec::Vec[SidebarRow] = ss.visible_rows_with(conv);
+    assert rows.count() == (3 as usize);
+    guard let option::Option::Some(r0) = rows.at_ptr(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(r1) = rows.at_ptr(1 as usize) else { assert false; return; };
+    guard let option::Option::Some(r2) = rows.at_ptr(2 as usize) else { assert false; return; };
+    assert (*r0).session_id.equals("newest");
+    assert (*r1).session_id.equals("mid");
+    assert (*r2).session_id.equals("old");
+}

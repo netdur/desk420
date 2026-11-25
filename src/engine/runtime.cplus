@@ -1,0 +1,1853 @@
+// src/engine/runtime.cplus — app-wide background engine controller.
+//
+// Owns a single background worker thread that drives `Supervisor` and
+// `AcpClient`. The main thread never blocks on process I/O: UI handlers push
+// typed commands into `_CMD_TX`, and the worker pushes decoded updates into
+// `_WorkerArgs.ui_tx` (drained on the main thread from `_UI_RX` via a
+// `services::CoalescedHop`).
+
+import "events/events" as events;
+import "facet/services" as services;
+import "facet_runtime/runtime" as f_runtime;
+import "json/json" as json;
+import "notifications/notifications" as notifications;
+import "permissions/permissions" as permissions;
+import "stdlib/channel" as channel;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/process" as process;
+import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/time" as time;
+import "stdlib/vec" as vec;
+
+import "../acp/client" as client;
+import "../acp/types" as types;
+import "../acp/wire" as wire;
+import "../browser/mcp_server" as browser_mcp;
+import "../store/account" as account;
+import "../store/conversation" as conversation;
+import "../store/sessions" as sessions;
+import "./locate" as locate;
+import "./supervisor" as supervisor;
+
+// ───────────────────────────── status & commands ─────────────────────────────
+
+enum StatusKind {
+    Starting,
+    Ready,
+    MissingBinary,
+    InstallingCli,
+    NeedsAuth,
+    Authenticating,
+    Failed,
+}
+
+enum ApprovalMode {
+    Ask,
+    AutoApprove,
+    Custom,
+}
+
+impl ApprovalMode {
+    fn from_index(idx: i64) -> ApprovalMode {
+        if idx == (1 as i64) { return ApprovalMode::AutoApprove; }
+        if idx == (2 as i64) { return ApprovalMode::Custom; }
+        return ApprovalMode::Ask;
+    }
+
+    fn to_index(this) -> i64 {
+        return match this {
+            ApprovalMode::Ask => 0 as i64,
+            ApprovalMode::AutoApprove => 1 as i64,
+            ApprovalMode::Custom => 2 as i64,
+        };
+    }
+}
+
+enum RewindMode {
+    All,
+    Conversation,
+    Files,
+}
+
+impl RewindMode {
+    fn as_str(this) -> str {
+        return match this {
+            RewindMode::All => "all",
+            RewindMode::Conversation => "conversation",
+            RewindMode::Files => "files",
+        };
+    }
+}
+
+enum EngineChange {
+    All,
+    Status,
+    Session,
+    Config,
+    Turn,
+    Git,
+    Queue,
+    Mcp,
+    Rewind,
+    Notifications,
+    Clock,
+}
+
+struct EngineStateEvent {
+    kind: StatusKind,
+    change: EngineChange,
+}
+
+const BILLING_EVERY_N_PROMPTS: i32 = 3 as i32;
+const BILLING_PROMPT_MIN_SECS: i64 = 30 as i64;
+const BILLING_FOCUS_MIN_SECS: i64 = 60 as i64;
+const BILLING_IDLE_SECS: i64 = 300 as i64;
+const CLOCK_TICK_SECS: i64 = 60 as i64;
+
+enum _EngineCmd {
+    Start,
+    Retry,
+    InstallGrokCli,
+    SignIn,
+    SendPrompt(text::Text, vec::Vec[types::Attachment]),
+    Cancel,
+    NewChat(text::Text),                    // cwd (empty = fresh per-chat scratch)
+    RefreshSessions,
+    LoadSession(text::Text, text::Text, text::Text), // session_id, cwd, title
+    SetActiveSession(text::Text, text::Text),        // session_id, cwd (cache hit)
+    RenameSession(text::Text, text::Text),  // session_id, title
+    DeleteSession(text::Text, text::Text),  // session_id, cwd
+    SearchSessions(text::Text),             // query
+    SetConfigOption(text::Text, text::Text), // config_id, value
+    SetApprovalMode(ApprovalMode),
+    RespondPermission(text::Text, wire::JsonRpcId, text::Text, text::Text), // sid, rpc_id, tool_call_id, option_id
+    RewindTo(i64, RewindMode),              // prompt_ordinal (-1 = last), mode
+    RefreshGitStatus,
+    GitStageAll,
+    GitDiscardAll,
+    GitCommit(text::Text),
+    RefreshAccount,
+    RefreshAccountIfStale,
+    SignOut,
+    Shutdown,
+}
+
+enum _UiUpdate {
+    StatusChanged(StatusKind, text::Text),
+    ActiveSession(text::Text, text::Text),  // session_id, cwd
+    SessionResetForLoad(text::Text, text::Text, text::Text), // sid, cwd, title
+    SessionLoadFinished(text::Text),        // sid
+    SessionLoadFailed(text::Text, text::Text), // sid, error message
+    TurnBegan(text::Text, text::Text),
+    SessionUpdate(types::SessionUpdateEnvelope),
+    PermissionRequest(types::PermissionRequest),
+    PermissionResolved(text::Text, text::Text, text::Text), // sid, tool_call_id, option_id
+    ConfigOptionsUpdated(text::Text, vec::Vec[types::ConfigOption]),
+    PromptFinished(text::Text, types::PromptResult),
+    TurnError(text::Text, text::Text),
+    SessionsLoaded(vec::Vec[types::SessionSummary]),
+    SearchResults(vec::Vec[types::SearchHit]),
+    SessionDeleted(text::Text),
+    AccountIdentity(types::AccountInfo),
+    BillingLoaded(types::BillingSnapshot),
+    BillingUnsupported,
+    ContextLoaded(types::SessionContextInfo),
+    AccountCleared,
+    QueueUpdated(vec::Vec[text::Text]),
+    McpServersUpdated(vec::Vec[types::McpServerInfo]),
+    RewoundPrompt(text::Text),
+    GitStatusUpdated(text::Text),
+    GitDiffUpdated(text::Text, text::Text), // diff_text, action_status
+    SessionRenamed(text::Text, text::Text),
+    CliInfo(text::Text, text::Text), // path, version
+    ClockTick,
+}
+
+struct _InFlightPrompt {
+    session_id: text::Text,
+    pending: client::PendingResponse,
+}
+
+struct _InFlightLoad {
+    session_id: text::Text,
+    pending: client::PendingResponse,
+    ticks: i32,
+    dirty_since_flush: bool,
+}
+
+struct _WorkerArgs {
+    cmd_rx: channel::Channel[_EngineCmd],
+    ui_tx: channel::Channel[_UiUpdate],
+    chats_root: text::Text,
+}
+
+// ───────────────────────────── main-thread state ─────────────────────────────
+
+struct _EngineState {
+    started: bool,
+    status: StatusKind,
+    approval_mode: ApprovalMode,
+    detail: text::Text,
+    active_sid: text::Text,
+    active_cwd: text::Text,
+    queued_summary: text::Text,
+    rewound_prompt: text::Text,
+    git_summary: text::Text,
+    git_diff: text::Text,
+    git_action_status: text::Text,
+    cli_path: text::Text,
+    cli_version: text::Text,
+    mcp_summary: text::Text,
+    pending_model: text::Text,
+    pending_effort: text::Text,
+    app_active: bool,
+    notif_asked: bool,
+    cmd_tx: vec::Vec[channel::Channel[_EngineCmd]],
+    ui_rx: vec::Vec[channel::Channel[_UiUpdate]],
+    workers: vec::Vec[thread::JoinHandle[i32]],
+    ui_hop: services::CoalescedHop,
+    signal: events::Signal[EngineStateEvent],
+}
+
+static _LIVE: bool = false;
+static _STATE: _EngineState = #zero::[_EngineState]();
+
+fn _ensure() {
+    if !_LIVE {
+        _STATE = _EngineState {
+            started: false,
+            status: StatusKind::Starting,
+            approval_mode: ApprovalMode::Ask,
+            detail: text::from_str("Starting Grok…"),
+            active_sid: text::from_str(""),
+            active_cwd: text::from_str(""),
+            queued_summary: text::from_str(""),
+            rewound_prompt: text::from_str(""),
+            git_summary: text::from_str(""),
+            git_diff: text::from_str(""),
+            git_action_status: text::from_str(""),
+            cli_path: text::from_str(""),
+            cli_version: text::from_str(""),
+            mcp_summary: text::from_str(""),
+            pending_model: text::from_str(""),
+            pending_effort: text::from_str(""),
+            app_active: true,
+            notif_asked: false,
+            cmd_tx: vec::new::[channel::Channel[_EngineCmd]](),
+            ui_rx: vec::new::[channel::Channel[_UiUpdate]](),
+            workers: vec::new::[thread::JoinHandle[i32]](),
+            ui_hop: services::CoalescedHop::new(_drain_ui_on_main),
+            signal: events::Signal[EngineStateEvent]::new(),
+        };
+        _LIVE = true;
+    }
+}
+
+fn _emit_change(change: EngineChange) {
+    _STATE.signal.emit(EngineStateEvent { kind: _STATE.status, change: change });
+}
+
+fn _on_notif_perm(_name: str, _state: permissions::State, _ctx: *u8) {
+    _ensure();
+    _emit_change(EngineChange::Notifications);
+}
+
+fn _session_title_for_notif(sid: str) -> text::Text {
+    let t: text::Text = conversation::session_title(sid);
+    if !t.is_empty() { return t; }
+    let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+    var i: usize = 0 as usize;
+    while i < rows.count() {
+        if let option::Option::Some(rp) = rows.at_ptr(i) {
+            if (*rp).session_id.equals(sid) && !(*rp).title.is_empty() {
+                return (*rp).title.clone();
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return text::from_str("");
+}
+
+fn _post_bg_notification(id: str, title: str, body: str, sid: str) {
+    if _STATE.app_active { return; }
+    let out: notifications::Outcome = notifications::schedule(notifications::Notification::new(
+        id: id,
+        title: title,
+        body: body,
+        payload: sid,
+        category: "desk420_run",
+    ));
+    match out {
+        notifications::Outcome::NotPermitted => {
+            if !_STATE.notif_asked && permissions::can_prompt(permissions::NOTIFICATIONS) {
+                _STATE.notif_asked = true;
+                let _ = permissions::request(permissions::NOTIFICATIONS, _on_notif_perm);
+            }
+        }
+        _other => {}
+    }
+}
+
+// `notifications::on_tap` passes `(payload, action, ctx)` — payload first.
+fn _on_notification_tap(payload: str, _action: str, _ctx: *u8) {
+    let _front: bool = f_runtime::app().activate();
+    let _w = f_runtime::app().open_window("home");
+    if payload.is_empty() || payload == "__test__" { return; }
+    var cwd: text::Text = conversation::session_cwd(payload);
+    var title: text::Text = conversation::session_title(payload);
+    if cwd.is_empty() || title.is_empty() {
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if (*rp).session_id.equals(payload) {
+                    if cwd.is_empty() { cwd = (*rp).cwd.clone(); }
+                    if title.is_empty() { title = (*rp).title.clone(); }
+                    break;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+    }
+    load_session(payload, cwd.view(), title: title.view());
+}
+
+fn _session_mcp_servers() -> vec::Vec[json::Value] {
+    var out: vec::Vec[json::Value] = vec::new::[json::Value]();
+    if let option::Option::Some(entry) = browser_mcp::acp_mcp_server_entry() {
+        let _ = out.append(entry);
+    }
+    return out;
+}
+
+fn _chats_root_dir() -> text::Text {
+    if let option::Option::Some(home) = env::var("HOME") {
+        let dir: text::Text = path::join(base: home.view(), child: ".desk420/chats");
+        let _ = fs::create_dir_all(dir.view());
+        return dir;
+    }
+    let fallback: text::Text = text::from_str("/tmp/desk420-chats");
+    let _ = fs::create_dir_all(fallback.view());
+    return fallback;
+}
+
+fn _make_chat_cwd(chats_root: str, ref chat_seq: u64) -> text::Text {
+    chat_seq = chat_seq +% (1 as u64);
+    let pid: i32 = process::current_id();
+    let id: text::Text = "chat-${pid}-${chat_seq}";
+    let dir: text::Text = path::join(base: chats_root, child: id.view());
+    let _ = fs::create_dir_all(dir.view());
+    return dir;
+}
+
+fn _queue_ui(ui_tx: channel::Channel[_UiUpdate], take u: _UiUpdate) {
+    let _ = ui_tx.send(u);
+}
+
+fn _flush_ui() {
+    let _q: bool = _STATE.ui_hop.schedule();
+}
+
+fn _post_ui(ui_tx: channel::Channel[_UiUpdate], take u: _UiUpdate) {
+    let _ = ui_tx.send(u);
+    _flush_ui();
+}
+
+fn _merge_change(ref pending: option::Option[EngineChange], next: EngineChange) {
+    pending = match pending {
+        option::Option::None => option::Option[EngineChange]::Some(next),
+        option::Option::Some(cur) => if cur == next {
+            option::Option[EngineChange]::Some(cur)
+        } else {
+            option::Option[EngineChange]::Some(EngineChange::All)
+        },
+    };
+}
+
+fn _drain_ui_on_main(_ctx: *u8) {
+    _ensure();
+    guard let option::Option::Some(rxp) = _STATE.ui_rx.at_ptr(0 as usize) else { return; };
+    conversation::begin_batch();
+    var pending_change: option::Option[EngineChange] = option::Option[EngineChange]::None;
+    loop {
+        match (*rxp).try_receive() {
+            channel::TryReceiveResult::Value(u) => {
+                match u {
+                    _UiUpdate::StatusChanged(kind, detail) => {
+                        _STATE.status = kind;
+                        _STATE.detail = detail;
+                        _merge_change(pending_change, EngineChange::Status);
+                    }
+                    _UiUpdate::ActiveSession(sid, cwd) => {
+                        _STATE.active_sid = sid.clone();
+                        _STATE.active_cwd = cwd.clone();
+                        if !sid.is_empty() {
+                            let _ = conversation::ensure_session(sid.view(), cwd: cwd.view());
+                            conversation::mark_read(sid.view());
+                            sessions::upsert_live_session(sid.view(), cwd: cwd.view());
+                        }
+                        _merge_change(pending_change, EngineChange::Session);
+                    }
+                    _UiUpdate::SessionResetForLoad(sid, cwd, title) => {
+                        conversation::reset_session_blocks(sid.view(), cwd: cwd.view(), title: title.view());
+                        conversation::begin_load(sid.view(), cwd: cwd.view(), title: title.view(), clear_blocks: false);
+                        _merge_change(pending_change, EngineChange::Session);
+                    }
+                    _UiUpdate::SessionLoadFinished(sid) => {
+                        conversation::mark_loaded(sid.view());
+                        _merge_change(pending_change, EngineChange::Session);
+                    }
+                    _UiUpdate::SessionLoadFailed(sid, msg) => {
+                        conversation::mark_load_failed(sid.view(), msg.view());
+                        _merge_change(pending_change, EngineChange::Session);
+                    }
+                    _UiUpdate::TurnBegan(sid, prompt_txt) => {
+                        _STATE.active_sid = sid.clone();
+                        conversation::begin_turn(sid.view(), prompt_txt.view());
+                        let trimmed_p: str = prompt_txt.view().trim();
+                        let first_line: str = match trimmed_p.find("\n") {
+                            option::Option::Some(nl) => match trimmed_p.slice(from: 0 as usize, to: nl) {
+                                option::Option::Some(s) => s,
+                                option::Option::None => trimmed_p,
+                            },
+                            option::Option::None => trimmed_p,
+                        };
+                        sessions::upsert_live_session(sid.view(), cwd: _STATE.active_cwd.view(), title: first_line);
+                        _merge_change(pending_change, EngineChange::Turn);
+                    }
+                    _UiUpdate::SessionUpdate(env) => {
+                        var live_title_sid: text::Text = text::from_str("");
+                        var live_title: text::Text = text::from_str("");
+                        match env.update {
+                            types::SessionUpdate::SessionInfoUpdate(t) => {
+                                if !t.is_empty() {
+                                    live_title_sid = env.session_id.clone();
+                                    live_title = t.clone();
+                                }
+                            }
+                            _ => {}
+                        }
+                        conversation::apply_update(env);
+                        if !live_title.is_empty() {
+                            sessions::upsert_live_session(live_title_sid.view(), title: live_title.view(), overwrite_title: true);
+                        }
+                    }
+                    _UiUpdate::PermissionRequest(pr) => {
+                        let title_copy: text::Text = pr.title.clone();
+                        let sid_copy: text::Text = pr.session_id.clone();
+                        conversation::apply_permission_request(pr);
+                        let sess_t: text::Text = _session_title_for_notif(sid_copy.view());
+                        let body: text::Text = if sess_t.is_empty() {
+                            title_copy.clone()
+                        } else if title_copy.is_empty() {
+                            sess_t.clone()
+                        } else {
+                            "${sess_t.view()} — ${title_copy.view()}"
+                        };
+                        _post_bg_notification("desk420:approval", "Approval needed", body.view(), sid_copy.view());
+                        _merge_change(pending_change, EngineChange::Turn);
+                    }
+                    _UiUpdate::PermissionResolved(sid, tcid, opt_id) => {
+                        conversation::resolve_permission(sid.view(), tcid.view(), opt_id.view());
+                        _merge_change(pending_change, EngineChange::Turn);
+                    }
+                    _UiUpdate::ConfigOptionsUpdated(sid, opts) => {
+                        conversation::set_config_options(sid.view(), opts);
+                        _merge_change(pending_change, EngineChange::Config);
+                    }
+                    _UiUpdate::PromptFinished(sid, res) => {
+                        conversation::apply_prompt_result(sid.view(), res);
+                        if !sid.equals(_STATE.active_sid.view()) {
+                            conversation::mark_unread(sid.view());
+                        }
+                        let sess_t: text::Text = _session_title_for_notif(sid.view());
+                        let done_body: str = if sess_t.is_empty() { "Your answer is ready." } else { sess_t.view() };
+                        _post_bg_notification("desk420:done", "Grok finished", done_body, sid.view());
+                        _merge_change(pending_change, EngineChange::Turn);
+                    }
+                    _UiUpdate::TurnError(sid, msg) => {
+                        conversation::apply_turn_error(sid.view(), msg.view());
+                        _merge_change(pending_change, EngineChange::Turn);
+                    }
+                    _UiUpdate::SessionsLoaded(list) => {
+                        sessions::set_sessions(list);
+                    }
+                    _UiUpdate::SearchResults(hits) => {
+                        sessions::set_search_hits(hits);
+                    }
+                    _UiUpdate::SessionDeleted(sid) => {
+                        if _STATE.active_sid.equals(sid.view()) {
+                            _STATE.active_sid = text::from_str("");
+                            _STATE.active_cwd = text::from_str("");
+                        }
+                        sessions::remove_session(sid.view());
+                        _merge_change(pending_change, EngineChange::Session);
+                    }
+                    _UiUpdate::AccountIdentity(info) => {
+                        account::set_identity(info);
+                    }
+                    _UiUpdate::BillingLoaded(snap) => {
+                        account::set_billing(snap);
+                    }
+                    _UiUpdate::BillingUnsupported => {
+                        account::set_billing_unsupported();
+                    }
+                    _UiUpdate::ContextLoaded(ctx_info) => {
+                        account::set_context_info(ctx_info);
+                    }
+                    _UiUpdate::AccountCleared => {
+                        account::clear();
+                    }
+                    _UiUpdate::QueueUpdated(entries) => {
+                        if entries.count() == (0 as usize) {
+                            _STATE.queued_summary = text::from_str("");
+                        } else {
+                            let n: usize = entries.count();
+                            var first: text::Text = text::from_str("");
+                            if let option::Option::Some(p0) = entries.at_ptr(0 as usize) {
+                                first = (*p0).clone();
+                            }
+                            _STATE.queued_summary = "Queued (${n}): ${first.view()}";
+                        }
+                        _merge_change(pending_change, EngineChange::Queue);
+                    }
+                    _UiUpdate::McpServersUpdated(list) => {
+                        var buf: text::Text = text::new();
+                        var mi: usize = 0 as usize;
+                        while mi < list.count() {
+                            if let option::Option::Some(mp) = list.at_ptr(mi) {
+                                if !(*mp).name.equals("desk420-browser") {
+                                    if !buf.is_empty() { let _ = buf.append("\n"); }
+                                    let _ = buf.append("${(*mp).name.view()} · ${(*mp).status.view()}");
+                                }
+                            }
+                            mi = mi +% (1 as usize);
+                        }
+                        _STATE.mcp_summary = buf;
+                        _merge_change(pending_change, EngineChange::Mcp);
+                    }
+                    _UiUpdate::RewoundPrompt(ptxt) => {
+                        _STATE.rewound_prompt = ptxt;
+                        _merge_change(pending_change, EngineChange::Rewind);
+                    }
+                    _UiUpdate::GitStatusUpdated(summary) => {
+                        _STATE.git_summary = summary;
+                        _merge_change(pending_change, EngineChange::Git);
+                    }
+                    _UiUpdate::GitDiffUpdated(diff_txt, act_status) => {
+                        _STATE.git_diff = diff_txt;
+                        _STATE.git_action_status = act_status;
+                        _merge_change(pending_change, EngineChange::Git);
+                    }
+                    _UiUpdate::SessionRenamed(sid, new_title) => {
+                        conversation::set_session_title(sid.view(), new_title.view());
+                        _merge_change(pending_change, EngineChange::Session);
+                    }
+                    _UiUpdate::CliInfo(p, v) => {
+                        _STATE.cli_path = p;
+                        _STATE.cli_version = v;
+                        _merge_change(pending_change, EngineChange::Status);
+                    }
+                    _UiUpdate::ClockTick => {
+                        _merge_change(pending_change, EngineChange::Clock);
+                    }
+                }
+            }
+            channel::TryReceiveResult::Empty => { break; }
+            channel::TryReceiveResult::Closed => { break; }
+        }
+    }
+    conversation::end_batch();
+    if let option::Option::Some(ch) = pending_change {
+        _emit_change(ch);
+    }
+}
+
+// ───────────────────────────── worker thread ─────────────────────────────
+
+fn _build_supervisor(chats_root: str, ui_tx: channel::Channel[_UiUpdate]) -> option::Option[supervisor::Supervisor] {
+    guard let option::Option::Some(grok_path) = locate::find_grok() else {
+        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::MissingBinary, text::from_str("Grok CLI not found")));
+        return option::Option[supervisor::Supervisor]::None;
+    };
+
+    var sup: supervisor::Supervisor = supervisor::Supervisor::for_grok(grok_path.view(), cwd: chats_root);
+    if !sup.start() {
+        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Failed, text::from_str("Could not start Grok agent")));
+        return option::Option[supervisor::Supervisor]::None;
+    }
+
+    var label: text::Text = text::from_str("Grok");
+    var ver_str: text::Text = text::from_str("Unknown");
+    if let option::Option::Some(ver) = locate::read_version(grok_path.view()) {
+        label = "Grok ${ver.view()}";
+        ver_str = ver;
+    }
+    _queue_ui(ui_tx, _UiUpdate::CliInfo(grok_path.clone(), ver_str));
+    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Ready, label));
+    return option::Option[supervisor::Supervisor]::Some(sup);
+}
+
+fn _fetch_account_and_billing(ref sups: vec::Vec[supervisor::Supervisor], ui_tx: channel::Channel[_UiUpdate]) -> bool {
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return false; };
+    var signed_in: bool = true;
+    var got_billing: bool = false;
+
+    var attempt: i32 = 0 as i32;
+    while attempt < (2 as i32) && signed_in && !got_billing {
+        if attempt > (0 as i32) {
+            time::sleep(400 as u64).wait();
+        }
+        if let option::Option::Some(pb) = (*sp).send_request("_x.ai/billing", types::params_empty()) {
+            match pb.wait_timeout(8000 as i64) {
+                client::WaitOutcome::Response(resp) => {
+                    if let option::Option::Some(e) = resp.error {
+                        if e.code == (-32000 as i64) || e.message.contains("Authentication") {
+                            _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, e.message.clone()));
+                            signed_in = false;
+                        } else if e.code == (-32601 as i64) {
+                            _post_ui(ui_tx, _UiUpdate::BillingUnsupported);
+                            got_billing = true;
+                        }
+                    } else {
+                        if let option::Option::Some(rv) = resp.result {
+                            let snap: types::BillingSnapshot = types::decode_billing(rv);
+                            if snap.has_percent || attempt == (1 as i32) {
+                                _post_ui(ui_tx, _UiUpdate::BillingLoaded(snap));
+                                got_billing = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        attempt = attempt + (1 as i32);
+    }
+
+    if !signed_in { return false; }
+    if !got_billing {
+        var unavail: types::BillingSnapshot = types::BillingSnapshot::empty();
+        unavail.available = true;
+        unavail.has_percent = false;
+        _post_ui(ui_tx, _UiUpdate::BillingLoaded(unavail));
+    }
+
+    if let option::Option::Some(pa) = (*sp).send_request("_x.ai/auth/info", types::params_empty()) {
+        match pa.wait_timeout(5000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    _post_ui(ui_tx, _UiUpdate::AccountIdentity(types::decode_auth_info(rv)));
+                }
+            }
+            _ => {}
+        }
+    }
+    return true;
+}
+
+fn _fetch_session_context(ref sups: vec::Vec[supervisor::Supervisor], sid: str, ui_tx: channel::Channel[_UiUpdate]) {
+    if sid == "" { return; }
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return; };
+    if let option::Option::Some(pi) = (*sp).send_request("_x.ai/session/info", types::params_session_info(sid)) {
+        match pi.wait_timeout(3000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    _post_ui(ui_tx, _UiUpdate::ContextLoaded(types::decode_session_info(rv)));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn _run_git(cwd: str, args: vec::Vec[text::Text]) -> process::Output {
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("/usr/bin/git"));
+    let _ = argv.append(text::from_str("-C"));
+    let _ = argv.append(text::from_str(cwd));
+    var i: usize = 0 as usize;
+    while i < args.count() {
+        if let option::Option::Some(p) = args.at_ptr(i) {
+            let _ = argv.append((*p).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return process::capture(argv);
+}
+
+fn _fetch_local_git_diff(cwd: str, ui_tx: channel::Channel[_UiUpdate], action_note: str) {
+    if cwd == "" || cwd.contains(".desk420/") {
+        _post_ui(ui_tx, _UiUpdate::GitDiffUpdated(text::from_str(""), text::from_str(action_note)));
+        return;
+    }
+    var a_st: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a_st.append(text::from_str("status"));
+    let _ = a_st.append(text::from_str("--short"));
+    let _ = a_st.append(text::from_str("--branch"));
+    let st_out: process::Output = _run_git(cwd, a_st);
+    if st_out.code != (0 as i32) {
+        _post_ui(ui_tx, _UiUpdate::GitDiffUpdated(text::from_str(""), text::from_str(action_note)));
+        return;
+    }
+
+    var buf: text::Text = text::new();
+    let st_trim: str = st_out.stdout.view().trim();
+    if !st_trim.is_empty() {
+        let _ = buf.append(st_trim);
+        let _ = buf.append("\n\n");
+    }
+
+    var a_cached: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a_cached.append(text::from_str("diff"));
+    let _ = a_cached.append(text::from_str("--cached"));
+    let _ = a_cached.append(text::from_str("--no-color"));
+    let c_out: process::Output = _run_git(cwd, a_cached);
+    if c_out.code == (0 as i32) && !c_out.stdout.view().trim().is_empty() {
+        let _ = buf.append("# Staged diff\n");
+        let _ = buf.append(c_out.stdout.view());
+        let _ = buf.append("\n");
+    }
+
+    var a_diff: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a_diff.append(text::from_str("diff"));
+    let _ = a_diff.append(text::from_str("--no-color"));
+    let d_out: process::Output = _run_git(cwd, a_diff);
+    if d_out.code == (0 as i32) && !d_out.stdout.view().trim().is_empty() {
+        let _ = buf.append("# Unstaged diff\n");
+        let _ = buf.append(d_out.stdout.view());
+    }
+
+    if buf.count() > (20000 as usize) {
+        if let option::Option::Some(sl) = buf.view().slice(from: 0 as usize, to: 20000 as usize) {
+            buf = "${sl}\n… (diff truncated)";
+        }
+    }
+    _post_ui(ui_tx, _UiUpdate::GitDiffUpdated(buf, text::from_str(action_note)));
+}
+
+fn _fetch_git_status(ref sups: vec::Vec[supervisor::Supervisor], sid: str, ui_tx: channel::Channel[_UiUpdate], cwd: str = "") {
+    if cwd != "" {
+        _fetch_local_git_diff(cwd, ui_tx, "");
+    }
+    if sid == "" {
+        _post_ui(ui_tx, _UiUpdate::GitStatusUpdated(text::from_str("")));
+        return;
+    }
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return; };
+    if let option::Option::Some(pg) = (*sp).send_request("_x.ai/git/status", types::params_git_status(sid)) {
+        match pg.wait_timeout(3000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    let gs: types::GitStatusInfo = types::decode_git_status(rv);
+                    _post_ui(ui_tx, _UiUpdate::GitStatusUpdated(gs.format_summary()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn _fetch_session_list(ref sups: vec::Vec[supervisor::Supervisor], ui_tx: channel::Channel[_UiUpdate]) {
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return; };
+    if let option::Option::Some(pl) = (*sp).send_request("session/list", types::params_empty()) {
+        match pl.wait_timeout(3000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    let list: vec::Vec[types::SessionSummary] = types::decode_session_list(rv);
+                    _post_ui(ui_tx, _UiUpdate::SessionsLoaded(list));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// True when `word` appears as a standalone shell command token in `s`
+// (bounded on both sides by start/end, whitespace, or shell punctuation), so
+// "confirm" or "perform" never match "rm" while "rm", "rm -rf /", and "a && rm" do.
+fn _is_token_sep(b: u8) -> bool {
+    return b == (32 as u8) || b == (9 as u8) || b == (10 as u8) || b == (13 as u8)
+        || b == (59 as u8) || b == (124 as u8) || b == (38 as u8) || b == (40 as u8)
+        || b == (41 as u8) || b == (96 as u8) || b == (34 as u8) || b == (39 as u8)
+        || b == (47 as u8);
+}
+
+fn _has_cmd_token(s: str, token: str) -> bool {
+    let n: usize = s.count();
+    let tn: usize = token.count();
+    if tn == (0 as usize) || n < tn { return false; }
+    var pos: usize = 0 as usize;
+    while pos +% tn <= n {
+        guard let option::Option::Some(rest) = s.slice(from: pos, to: n) else { break; };
+        guard let option::Option::Some(rel) = rest.find(token) else { break; };
+        let at: usize = pos +% rel;
+        let left_ok: bool = if at == (0 as usize) {
+            true
+        } else {
+            match s.byte_at(at -% (1 as usize)) {
+                option::Option::Some(b) => _is_token_sep(b),
+                option::Option::None => true,
+            }
+        };
+        let end: usize = at +% tn;
+        let right_ok: bool = if end >= n {
+            true
+        } else {
+            match s.byte_at(end) {
+                option::Option::Some(b) => _is_token_sep(b),
+                option::Option::None => true,
+            }
+        };
+        if left_ok && right_ok { return true; }
+        pos = at +% (1 as usize);
+    }
+    return false;
+}
+
+fn _looks_destructive(text_s: str) -> bool {
+    let low: text::Text = text::from_str(text_s).lowercased();
+    let s: str = low.view();
+    return _has_cmd_token(s, "rm")
+        || _has_cmd_token(s, "sudo")
+        || _has_cmd_token(s, "dd")
+        || _has_cmd_token(s, "mkfs")
+        || _has_cmd_token(s, "kill")
+        || _has_cmd_token(s, "killall")
+        || _has_cmd_token(s, "chmod")
+        || _has_cmd_token(s, "chown")
+        || s.contains("git push --force")
+        || s.contains("git push -f")
+        || s.contains("git reset --hard")
+        || s.contains("git clean -f");
+}
+
+// Approval policy:
+// - Ask: never auto-approve.
+// - AutoApprove: auto-approve every request.
+// - Custom: auto-approve Read, Search, and Edit tools; for Execute, Other, or
+//   Unknown tools, prompt on destructive commands (checked with token
+//   boundaries across both command and title).
+fn _should_auto_approve(mode: ApprovalMode, pr: types::PermissionRequest) -> bool {
+    if mode == ApprovalMode::AutoApprove { return true; }
+    if mode != ApprovalMode::Custom { return false; }
+    return match pr.kind {
+        types::ToolKind::Read => true,
+        types::ToolKind::Search => true,
+        types::ToolKind::Edit => true,
+        _ => !_looks_destructive(pr.command.view()) && !_looks_destructive(pr.title.view()),
+    };
+}
+
+fn _pick_allow_option(pr: types::PermissionRequest) -> text::Text {
+    var i: usize = 0 as usize;
+    while i < pr.options.count() {
+        if let option::Option::Some(op) = pr.options.at_ptr(i) {
+            match (*op).kind {
+                types::PermissionKind::AllowOnce => { return (*op).option_id.clone(); }
+                _ => {}
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    i = 0 as usize;
+    while i < pr.options.count() {
+        if let option::Option::Some(op) = pr.options.at_ptr(i) {
+            match (*op).kind {
+                types::PermissionKind::AllowAlways => { return (*op).option_id.clone(); }
+                _ => {}
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return text::from_str("allow-once");
+}
+
+fn _drain_supervisor_events(ref sups: vec::Vec[supervisor::Supervisor],
+ui_tx: channel::Channel[_UiUpdate],
+mode: ApprovalMode,
+defer_flush: bool = false) -> usize {
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return 0 as usize; };
+    var disconnected: bool = false;
+    var sessions_dirty: bool = false;
+    var queued: usize = 0 as usize;
+    var urgent: bool = false;
+    loop {
+        match (*sp).try_poll_event() {
+            channel::TryReceiveResult::Value(ev) => {
+                match ev {
+                    client::ClientEvent::SessionUpdate(env) => {
+                        _queue_ui(ui_tx, _UiUpdate::SessionUpdate(env));
+                        queued = queued +% (1 as usize);
+                    }
+                    client::ClientEvent::PermissionRequest(pr) => {
+                        if _should_auto_approve(mode, pr) {
+                            let opt_id: text::Text = _pick_allow_option(pr);
+                            let _ = (*sp).send_response(pr.rpc_id.clone(), types::result_permission_selected(opt_id.view()));
+                        } else {
+                            _queue_ui(ui_tx, _UiUpdate::PermissionRequest(pr));
+                            queued = queued +% (1 as usize);
+                            urgent = true;
+                        }
+                    }
+                    client::ClientEvent::UnknownAgentRequest(req) => {
+                        let _ = (*sp).send_error(req.id, -32601 as i64, "Method not found");
+                    }
+                    client::ClientEvent::QueueChanged(qs) => {
+                        var cloned: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        var qi: usize = 0 as usize;
+                        while qi < qs.entries.count() {
+                            if let option::Option::Some(qp) = qs.entries.at_ptr(qi) {
+                                let _ = cloned.append((*qp).clone());
+                            }
+                            qi = qi +% (1 as usize);
+                        }
+                        _queue_ui(ui_tx, _UiUpdate::QueueUpdated(cloned));
+                        queued = queued +% (1 as usize);
+                    }
+                    client::ClientEvent::McpServersUpdated(list) => {
+                        _queue_ui(ui_tx, _UiUpdate::McpServersUpdated(list));
+                        queued = queued +% (1 as usize);
+                    }
+                    client::ClientEvent::ExtensionNotification(m) => {
+                        if m.equals("_x.ai/sessions/changed") {
+                            sessions_dirty = true;
+                        }
+                    }
+                    client::ClientEvent::Disconnected => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            channel::TryReceiveResult::Empty => { break; }
+            channel::TryReceiveResult::Closed => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    if queued > (0 as usize) && (!defer_flush || urgent) {
+        _flush_ui();
+    }
+    if disconnected {
+        if (*sp).restart() {
+            _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Ready, text::from_str("Grok (reconnected)")));
+            return queued;
+        }
+        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Failed, text::from_str("Grok agent disconnected")));
+        return queued;
+    }
+    if sessions_dirty {
+        _fetch_session_list(sups, ui_tx);
+    }
+    return queued;
+}
+
+fn _ensure_supervisor(ref sups: vec::Vec[supervisor::Supervisor], chats_root: str, ui_tx: channel::Channel[_UiUpdate]) -> bool {
+    if sups.count() > (0 as usize) { return true; }
+    if let option::Option::Some(s) = _build_supervisor(chats_root, ui_tx) {
+        let _ = sups.append(s);
+        return true;
+    }
+    return false;
+}
+
+fn _start_and_bootstrap(ref sups: vec::Vec[supervisor::Supervisor], chats_root: str, ui_tx: channel::Channel[_UiUpdate]) {
+    if _ensure_supervisor(sups, chats_root, ui_tx) {
+        if _fetch_account_and_billing(sups, ui_tx) {
+            _fetch_session_list(sups, ui_tx);
+        }
+    }
+}
+
+fn _send_set_config_option(sp: *supervisor::Supervisor, sid: str, config_id: str, value: str, ui_tx: channel::Channel[_UiUpdate]) {
+    if let option::Option::Some(pc) = (*sp).send_request(
+        "session/set_config_option",
+        types::params_set_config_option(sid, config_id, value),
+    ) {
+        match pc.wait_timeout(3000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    if let option::Option::Some(co) = rv.value(for_key: "configOptions") {
+                        _post_ui(ui_tx, _UiUpdate::ConfigOptionsUpdated(text::from_str(sid), types::decode_config_options(co)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn _execute_rewind(
+    ref sups: vec::Vec[supervisor::Supervisor],
+    sid: str,
+    cwd: str,
+    ordinal: i64,
+    mode: RewindMode,
+    approval_mode: ApprovalMode,
+    ui_tx: channel::Channel[_UiUpdate],
+) {
+    if sid == "" { return; }
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return; };
+    var target_idx: option::Option[i64] = option::Option[i64]::None;
+    if let option::Option::Some(pp) = (*sp).send_request("_x.ai/rewind/points", types::params_rewind_points(sid)) {
+        match pp.wait_timeout(3000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    target_idx = types::decode_rewind_point_at(rv, ordinal);
+                }
+            }
+            _ => {}
+        }
+    }
+    guard let option::Option::Some(ti) = target_idx else { return; };
+    let m_str: str = mode.as_str();
+    if let option::Option::Some(pe) = (*sp).send_request(
+        "_x.ai/rewind/execute",
+        types::params_rewind_execute(sid, ti, mode: m_str, force: true),
+    ) {
+        match pe.wait_timeout(5000 as i64) {
+            client::WaitOutcome::Response(resp) => {
+                if let option::Option::Some(rv) = resp.result {
+                    let rr: types::RewindResult = types::decode_rewind_execute(rv);
+                    if rr.success {
+                        if !rr.prompt_text.is_empty() {
+                            _post_ui(ui_tx, _UiUpdate::RewoundPrompt(rr.prompt_text.clone()));
+                        }
+                        if mode != RewindMode::Files {
+                            _post_ui(ui_tx, _UiUpdate::SessionResetForLoad(text::from_str(sid), text::from_str(cwd), text::from_str("")));
+                            if let option::Option::Some(pl) = (*sp).send_request("session/load", types::params_session_load_with_mcp(sid, cwd, _session_mcp_servers())) {
+                                let _ = pl.wait_timeout(5000 as i64);
+                                let _ = _drain_supervisor_events(sups, ui_tx, approval_mode);
+                            }
+                        }
+                        _fetch_git_status(sups, sid, ui_tx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn _worker_main(take args: _WorkerArgs) -> i32 {
+    let cmd_rx: channel::Channel[_EngineCmd] = args.cmd_rx.clone();
+    let ui_tx: channel::Channel[_UiUpdate] = args.ui_tx.clone();
+    let chats_root: text::Text = args.chats_root.clone();
+
+    var sups: vec::Vec[supervisor::Supervisor] = vec::new::[supervisor::Supervisor]();
+    var in_flight: vec::Vec[_InFlightPrompt] = vec::new::[_InFlightPrompt]();
+    var in_flight_loads: vec::Vec[_InFlightLoad] = vec::new::[_InFlightLoad]();
+    var current_sid: text::Text = text::from_str("");
+    var pending_cwd: text::Text = text::from_str("");
+    // Config picked before a session exists (the Home composer's Model and
+    // Effort): applied to the next session right after `session/new`, before
+    // its first prompt. Pairs of (config id, value).
+    var pending_cfg_ids: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var pending_cfg_vals: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var approval_mode: ApprovalMode = ApprovalMode::Ask;
+    var last_billing_ts: i64 = time::now();
+    var last_clock_ts: i64 = time::now();
+    var prompts_since_billing: i32 = 0 as i32;
+    var chat_seq: u64 = 0 as u64;
+
+    loop {
+        var got_cmd: option::Option[_EngineCmd] = option::Option[_EngineCmd]::None;
+        if sups.count() == (0 as usize) && in_flight.count() == (0 as usize) && in_flight_loads.count() == (0 as usize) {
+            match cmd_rx.receive() {
+                channel::ReceiveResult::Value(c) => { got_cmd = option::Option[_EngineCmd]::Some(c); }
+                channel::ReceiveResult::Closed => { break; }
+                channel::ReceiveResult::Cancelled => { break; }
+            }
+        } else {
+            match cmd_rx.try_receive() {
+                channel::TryReceiveResult::Value(c) => { got_cmd = option::Option[_EngineCmd]::Some(c); }
+                channel::TryReceiveResult::Empty => {}
+                channel::TryReceiveResult::Closed => { break; }
+            }
+        }
+
+        if let option::Option::Some(cmd) = got_cmd {
+            match cmd {
+                _EngineCmd::Start => {
+                    if sups.count() == (0 as usize) {
+                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Starting, text::from_str("Starting Grok…")));
+                        _start_and_bootstrap(sups, chats_root.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::Retry => {
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        (*sp).shutdown();
+                    }
+                    sups.remove_all();
+                    in_flight.remove_all();
+                    in_flight_loads.remove_all();
+                    current_sid = text::from_str("");
+                    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Starting, text::from_str("Starting Grok…")));
+                    _start_and_bootstrap(sups, chats_root.view(), ui_tx);
+                }
+                _EngineCmd::InstallGrokCli => {
+                    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::InstallingCli, text::from_str("Downloading and installing Grok CLI…")));
+                    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+                    let _ = argv.append(text::from_str("/bin/sh"));
+                    let _ = argv.append(text::from_str("-c"));
+                    let _ = argv.append(text::from_str("curl -fsSL https://x.ai/cli/install.sh | bash"));
+                    let out: process::Output = process::capture(argv);
+                    if out.code != (0 as i32) {
+                        let err_msg: text::Text = if !out.stderr.is_empty() {
+                            "Installer exited (${out.code}): ${out.stderr.view().trim()}"
+                        } else {
+                            "Installer exited with code ${out.code}. You can also run: curl -fsSL https://x.ai/cli/install.sh | bash"
+                        };
+                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::MissingBinary, err_msg));
+                    } else {
+                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Starting, text::from_str("Grok CLI installed. Starting Grok…")));
+                        _start_and_bootstrap(sups, chats_root.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::RefreshAccount => {
+                    let _ = _fetch_account_and_billing(sups, ui_tx);
+                    last_billing_ts = time::now();
+                    prompts_since_billing = 0 as i32;
+                }
+                _EngineCmd::RefreshAccountIfStale => {
+                    if sups.count() > (0 as usize)
+                        && in_flight.count() == (0 as usize) && in_flight_loads.count() == (0 as usize) {
+                        let now_s: i64 = time::now();
+                        if (now_s - last_billing_ts) >= BILLING_FOCUS_MIN_SECS {
+                            let _ = _fetch_account_and_billing(sups, ui_tx);
+                            last_billing_ts = now_s;
+                            prompts_since_billing = 0 as i32;
+                        }
+                    }
+                }
+                _EngineCmd::RefreshGitStatus => {
+                    _fetch_git_status(sups, current_sid.view(), ui_tx, cwd: pending_cwd.view());
+                }
+                _EngineCmd::GitStageAll => {
+                    if !pending_cwd.is_empty() && !pending_cwd.contains(".desk420/") {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("add"));
+                        let _ = a.append(text::from_str("-A"));
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: str = if r.code == (0 as i32) { "Staged all changes" } else { "git add failed" };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note);
+                        _fetch_git_status(sups, current_sid.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::GitDiscardAll => {
+                    if !pending_cwd.is_empty() && !pending_cwd.contains(".desk420/") {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("checkout"));
+                        let _ = a.append(text::from_str("--"));
+                        let _ = a.append(text::from_str("."));
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: str = if r.code == (0 as i32) { "Discarded unstaged changes" } else { "git checkout failed" };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note);
+                        _fetch_git_status(sups, current_sid.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::GitCommit(msg) => {
+                    if !pending_cwd.is_empty() && !pending_cwd.contains(".desk420/") && !msg.view().trim().is_empty() {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("commit"));
+                        let _ = a.append(text::from_str("-m"));
+                        let _ = a.append(msg.clone());
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: text::Text = if r.code == (0 as i32) {
+                            text::from_str("Committed changes")
+                        } else if !r.stderr.view().trim().is_empty() {
+                            text::from_str(r.stderr.view().trim())
+                        } else {
+                            text::from_str("Nothing staged to commit")
+                        };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note.view());
+                        _fetch_git_status(sups, current_sid.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::SignOut => {
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        if let option::Option::Some(pl) = (*sp).send_request("_x.ai/auth/logout", types::params_empty()) {
+                            let _ = pl.wait_timeout(3000 as i64);
+                        }
+                    }
+                    current_sid = text::from_str("");
+                    _post_ui(ui_tx, _UiUpdate::AccountCleared);
+                    _post_ui(ui_tx, _UiUpdate::ActiveSession(text::from_str(""), text::from_str("")));
+                    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, text::from_str("Signed out")));
+                }
+                _EngineCmd::RewindTo(ordinal, rw_mode) => {
+                    _execute_rewind(sups, current_sid.view(), pending_cwd.view(), ordinal, rw_mode, approval_mode, ui_tx);
+                }
+                _EngineCmd::SignIn => {
+                    let _ = _ensure_supervisor(sups, chats_root.view(), ui_tx);
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Authenticating, text::from_str("Complete sign-in in your browser…")));
+                        if let option::Option::Some(pa) = (*sp).send_request("authenticate", types::params_authenticate_grok()) {
+                            match pa.wait() {
+                                option::Option::Some(resp) => {
+                                    var auth_err: text::Text = text::from_str("");
+                                    if let option::Option::Some(e) = resp.error {
+                                        auth_err = e.message.clone();
+                                    }
+                                    if auth_err.is_empty() {
+                                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Ready, text::from_str("Grok")));
+                                        let _ = _fetch_account_and_billing(sups, ui_tx);
+                                        last_billing_ts = time::now();
+                                        prompts_since_billing = 0 as i32;
+                                        _fetch_session_list(sups, ui_tx);
+                                    } else {
+                                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, auth_err));
+                                    }
+                                }
+                                option::Option::None => {
+                                    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, text::from_str("Sign-in did not complete")));
+                                }
+                            }
+                        }
+                    }
+                }
+                _EngineCmd::NewChat(cwd) => {
+                    current_sid = text::from_str("");
+                    pending_cwd = cwd.clone();
+                }
+                _EngineCmd::RefreshSessions => {
+                    _fetch_session_list(sups, ui_tx);
+                }
+                _EngineCmd::SetActiveSession(sid, cwd) => {
+                    current_sid = sid;
+                    pending_cwd = cwd;
+                }
+                _EngineCmd::LoadSession(sid, cwd, title) => {
+                    current_sid = sid.clone();
+                    pending_cwd = cwd.clone();
+                    var already_loading: bool = false;
+                    var check_i: usize = 0 as usize;
+                    while check_i < in_flight_loads.count() {
+                        if let option::Option::Some(lp) = in_flight_loads.at_ptr(check_i) {
+                            if (*lp).session_id.equals(sid.view()) {
+                                already_loading = true;
+                                break;
+                            }
+                        }
+                        check_i = check_i +% (1 as usize);
+                    }
+                    if !already_loading {
+                        _post_ui(ui_tx, _UiUpdate::SessionResetForLoad(sid.clone(), cwd.clone(), title));
+                        if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                            if let option::Option::Some(pl) = (*sp).send_request("session/load", types::params_session_load_with_mcp(sid.view(), cwd.view(), _session_mcp_servers())) {
+                                let _ = in_flight_loads.append(_InFlightLoad {
+                                    session_id: sid,
+                                    pending: pl,
+                                    ticks: 0 as i32,
+                                    dirty_since_flush: false,
+                                });
+                            } else {
+                                _post_ui(ui_tx, _UiUpdate::SessionLoadFailed(sid, text::from_str("Could not send session/load to Grok")));
+                            }
+                        } else {
+                            _post_ui(ui_tx, _UiUpdate::SessionLoadFailed(sid, text::from_str("Grok engine is not running")));
+                        }
+                    }
+                }
+                _EngineCmd::SetApprovalMode(m) => {
+                    approval_mode = m;
+                }
+                _EngineCmd::SetConfigOption(config_id, value) => {
+                    if current_sid.is_empty() {
+                        var k: usize = 0 as usize;
+                        var replaced: bool = false;
+                        while k < pending_cfg_ids.count() {
+                            if let option::Option::Some(idp) = pending_cfg_ids.at_ptr(k) {
+                                if (*idp).equals(config_id.view()) {
+                                    let _ = pending_cfg_vals.set(value.clone(), at: k);
+                                    replaced = true;
+                                }
+                            }
+                            k = k +% (1 as usize);
+                        }
+                        if !replaced {
+                            let _ = pending_cfg_ids.append(config_id.clone());
+                            let _ = pending_cfg_vals.append(value.clone());
+                        }
+                    }
+                    if !current_sid.is_empty() {
+                        if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                            _send_set_config_option(sp, current_sid.view(), config_id.view(), value.view(), ui_tx);
+                        }
+                    }
+                }
+                _EngineCmd::RespondPermission(sid, rpc_id, tool_call_id, option_id) => {
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        let _ = (*sp).send_response(rpc_id, types::result_permission_selected(option_id.view()));
+                    }
+                    _post_ui(ui_tx, _UiUpdate::PermissionResolved(sid, tool_call_id, option_id));
+                }
+                _EngineCmd::RenameSession(sid, title) => {
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        if let option::Option::Some(pr) = (*sp).send_request("_x.ai/session/rename", types::params_session_rename(sid.view(), title.view())) {
+                            let _ = pr.wait_timeout(3000 as i64);
+                        }
+                    }
+                    _post_ui(ui_tx, _UiUpdate::SessionRenamed(sid, title));
+                    _fetch_session_list(sups, ui_tx);
+                }
+                _EngineCmd::DeleteSession(sid, cwd) => {
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        if let option::Option::Some(pd) = (*sp).send_request("_x.ai/session/delete", types::params_session_delete(sid.view(), cwd.view())) {
+                            let _ = pd.wait_timeout(3000 as i64);
+                        }
+                    }
+                    if current_sid.equals(sid.view()) {
+                        current_sid = text::from_str("");
+                    }
+                    _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
+                }
+                _EngineCmd::SearchSessions(query) => {
+                    let trimmed: str = query.view().trim();
+                    if !trimmed.is_empty() {
+                        if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                            if let option::Option::Some(ps) = (*sp).send_request("_x.ai/session/search", types::params_session_search(trimmed)) {
+                                match ps.wait_timeout(3000 as i64) {
+                                    client::WaitOutcome::Response(resp) => {
+                                        if let option::Option::Some(rv) = resp.result {
+                                            _post_ui(ui_tx, _UiUpdate::SearchResults(types::decode_session_search(rv)));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _EngineCmd::Cancel => {
+                    if !current_sid.is_empty() {
+                        if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                            let _ = (*sp).send_notification("session/cancel", types::params_session_cancel(current_sid.view()));
+                        }
+                    }
+                }
+                _EngineCmd::SendPrompt(prompt_txt, attachments) => {
+                    let _ = _ensure_supervisor(sups, chats_root.view(), ui_tx);
+                    var created_session: bool = false;
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        if current_sid.is_empty() {
+                            created_session = true;
+                            let use_cwd: text::Text = if pending_cwd.is_empty() {
+                                _make_chat_cwd(chats_root.view(), chat_seq)
+                            } else {
+                                pending_cwd.clone()
+                            };
+                            if let option::Option::Some(pn) = (*sp).send_request("session/new", types::params_session_new_with_mcp(use_cwd.view(), _session_mcp_servers())) {
+                                match pn.wait() {
+                                    option::Option::Some(rn) => {
+                                        var auth_needed: bool = false;
+                                        var err_msg: text::Text = text::from_str("");
+                                        if let option::Option::Some(e) = rn.error {
+                                            err_msg = e.message.clone();
+                                            if e.code == (-32000 as i64) || e.message.contains("Authentication") {
+                                                auth_needed = true;
+                                            }
+                                        }
+                                        if auth_needed {
+                                            _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, err_msg));
+                                        } else if !err_msg.is_empty() {
+                                            _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Failed, err_msg));
+                                        } else {
+                                            if let option::Option::Some(rv) = rn.result {
+                                                if let option::Option::Some(sn) = types::decode_session_new(rv) {
+                                                    current_sid = sn.session_id.clone();
+                                                    _post_ui(ui_tx, _UiUpdate::ActiveSession(current_sid.clone(), use_cwd));
+                                                    if let option::Option::Some(co) = rv.value(for_key: "configOptions") {
+                                                        _post_ui(ui_tx, _UiUpdate::ConfigOptionsUpdated(current_sid.clone(), types::decode_config_options(co)));
+                                                    }
+                                                    var pk: usize = 0 as usize;
+                                                    while pk < pending_cfg_ids.count() {
+                                                        if let option::Option::Some(idp) = pending_cfg_ids.at_ptr(pk) {
+                                                            if let option::Option::Some(vp) = pending_cfg_vals.at_ptr(pk) {
+                                                                _send_set_config_option(sp, current_sid.view(), (*idp).view(), (*vp).view(), ui_tx);
+                                                            }
+                                                        }
+                                                        pk = pk +% (1 as usize);
+                                                    }
+                                                    pending_cfg_ids.remove_all();
+                                                    pending_cfg_vals.remove_all();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    option::Option::None => {
+                                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Failed, text::from_str("Agent disconnected")));
+                                    }
+                                }
+                            }
+                        }
+
+                        if !current_sid.is_empty() {
+                            _post_ui(ui_tx, _UiUpdate::TurnBegan(current_sid.clone(), prompt_txt.clone()));
+                            if let option::Option::Some(pp) = (*sp).send_request(
+                                "session/prompt",
+                                types::params_session_prompt(current_sid.view(), prompt_txt.view(), attachments),
+                            ) {
+                                let _ = in_flight.append(_InFlightPrompt {
+                                    session_id: current_sid.clone(),
+                                    pending: pp,
+                                });
+                            }
+                        }
+                    }
+                    // A run made just now belongs in the sidebar straight away,
+                    // not at the next refresh.
+                    if created_session && !current_sid.is_empty() {
+                        _fetch_session_list(sups, ui_tx);
+                    }
+                }
+                _EngineCmd::Shutdown => {
+                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                        (*sp).shutdown();
+                    }
+                    sups.remove_all();
+                    in_flight.remove_all();
+                    in_flight_loads.remove_all();
+                    break;
+                }
+            }
+        }
+
+        // 2. Drain streaming updates from the active supervisor (coalesced into one main-thread hop).
+        let is_loading: bool = in_flight_loads.count() > (0 as usize);
+        var drained_n: usize = 0 as usize;
+        if sups.count() > (0 as usize) {
+            drained_n = _drain_supervisor_events(sups, ui_tx, approval_mode, defer_flush: is_loading);
+        }
+
+        // 2b. Poll non-blocking session/load requests; flush UI sparingly (first paint + completion)
+        // so large history replays don't flood the main thread with repeated table reloads.
+        var li: usize = 0 as usize;
+        while li < in_flight_loads.count() {
+            var load_done: option::Option[client::WaitOutcome] = option::Option[client::WaitOutcome]::None;
+            var should_flush: bool = false;
+            var timed_out: bool = false;
+            if let option::Option::Some(lp) = in_flight_loads.at_ptr(li) {
+                if drained_n > (0 as usize) {
+                    (*lp).dirty_since_flush = true;
+                }
+                load_done = (*lp).pending.try_wait();
+                if let option::Option::None = load_done {
+                    (*lp).ticks = (*lp).ticks + (1 as i32);
+                    if (*lp).ticks >= (1500 as i32) {
+                        timed_out = true;
+                    } else if (*lp).dirty_since_flush && ((*lp).ticks == (2 as i32) || ((*lp).ticks % (25 as i32)) == (0 as i32)) {
+                        (*lp).dirty_since_flush = false;
+                        should_flush = true;
+                    }
+                }
+            }
+            if should_flush {
+                _flush_ui();
+            }
+            if timed_out {
+                if let option::Option::Some(entry) = in_flight_loads.remove(at: li) {
+                    _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(entry.session_id.clone(), text::from_str("Timed out loading conversation")));
+                }
+                _flush_ui();
+                continue;
+            }
+            match load_done {
+                option::Option::Some(outcome) => {
+                    if let option::Option::Some(entry) = in_flight_loads.remove(at: li) {
+                        if sups.count() > (0 as usize) {
+                            let _ = _drain_supervisor_events(sups, ui_tx, approval_mode, defer_flush: true);
+                        }
+                        match outcome {
+                            client::WaitOutcome::Response(resp) => {
+                                var err_msg: text::Text = text::from_str("");
+                                if let option::Option::Some(e) = resp.error {
+                                    err_msg = e.message.clone();
+                                }
+                                if !err_msg.is_empty() {
+                                    _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(entry.session_id.clone(), err_msg));
+                                } else {
+                                    if let option::Option::Some(rv) = resp.result {
+                                        if let option::Option::Some(co) = rv.value(for_key: "configOptions") {
+                                            _queue_ui(ui_tx, _UiUpdate::ConfigOptionsUpdated(entry.session_id.clone(), types::decode_config_options(co)));
+                                        }
+                                    }
+                                    _queue_ui(ui_tx, _UiUpdate::SessionLoadFinished(entry.session_id.clone()));
+                                }
+                            }
+                            client::WaitOutcome::Disconnected => {
+                                _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(entry.session_id.clone(), text::from_str("Grok agent disconnected while loading")));
+                            }
+                            client::WaitOutcome::TimedOut => {
+                                _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(entry.session_id.clone(), text::from_str("Timed out loading conversation")));
+                            }
+                        }
+                        _flush_ui();
+                    }
+                }
+                option::Option::None => {
+                    li = li +% (1 as usize);
+                }
+            }
+        }
+
+        // 3. Poll any in-flight prompts for completion.
+        var pi: usize = 0 as usize;
+        while pi < in_flight.count() {
+            var done_outcome: option::Option[client::WaitOutcome] = option::Option[client::WaitOutcome]::None;
+            if let option::Option::Some(fp) = in_flight.at_ptr(pi) {
+                done_outcome = (*fp).pending.try_wait();
+            }
+            match done_outcome {
+                option::Option::Some(out) => {
+                    if sups.count() > (0 as usize) {
+                        let _ = _drain_supervisor_events(sups, ui_tx, approval_mode);
+                    }
+                    if let option::Option::Some(entry) = in_flight.remove(at: pi) {
+                        match out {
+                            client::WaitOutcome::Response(resp) => {
+                                var err_msg: text::Text = text::from_str("");
+                                var auth_err: bool = false;
+                                if let option::Option::Some(e) = resp.error {
+                                    err_msg = e.message.clone();
+                                    if e.code == (-32000 as i64) || e.message.contains("Authentication") {
+                                        auth_err = true;
+                                    }
+                                }
+                                if auth_err {
+                                    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, err_msg.clone()));
+                                    _post_ui(ui_tx, _UiUpdate::TurnError(entry.session_id.clone(), err_msg));
+                                } else if !err_msg.is_empty() {
+                                    _post_ui(ui_tx, _UiUpdate::TurnError(entry.session_id.clone(), err_msg));
+                                } else {
+                                    if let option::Option::Some(rv) = resp.result {
+                                        _post_ui(ui_tx, _UiUpdate::PromptFinished(entry.session_id.clone(), types::decode_prompt_result(rv)));
+                                    }
+                                }
+                            }
+                            client::WaitOutcome::Disconnected => {
+                                _post_ui(ui_tx, _UiUpdate::TurnError(entry.session_id.clone(), text::from_str("The answer was interrupted")));
+                            }
+                            client::WaitOutcome::TimedOut => {
+                                _post_ui(ui_tx, _UiUpdate::TurnError(entry.session_id.clone(), text::from_str("Request timed out")));
+                            }
+                        }
+                        _fetch_session_context(sups, entry.session_id.view(), ui_tx);
+                        prompts_since_billing = prompts_since_billing + (1 as i32);
+                        let now_s: i64 = time::now();
+                        if prompts_since_billing >= BILLING_EVERY_N_PROMPTS
+                            || (now_s - last_billing_ts) >= BILLING_PROMPT_MIN_SECS {
+                            let _ = _fetch_account_and_billing(sups, ui_tx);
+                            last_billing_ts = now_s;
+                            prompts_since_billing = 0 as i32;
+                        }
+                        _fetch_session_list(sups, ui_tx);
+                    }
+                }
+                option::Option::None => {
+                    pi = pi +% (1 as usize);
+                }
+            }
+        }
+
+        // 4. Lightweight periodic housekeeping for live app sessions:
+        //    - Every 60s: tick sidebar relative timestamps (4m -> 5m, 59m -> 1h).
+        //    - Every 5m while idle: refresh billing so external CLI/web usage appears.
+        if sups.count() > (0 as usize) {
+            let now_s: i64 = time::now();
+            if (now_s - last_clock_ts) >= CLOCK_TICK_SECS {
+                last_clock_ts = now_s;
+                _post_ui(ui_tx, _UiUpdate::ClockTick);
+            }
+            if in_flight.count() == (0 as usize) && in_flight_loads.count() == (0 as usize)
+                && (now_s - last_billing_ts) >= BILLING_IDLE_SECS {
+                let _ = _fetch_account_and_billing(sups, ui_tx);
+                last_billing_ts = now_s;
+                prompts_since_billing = 0 as i32;
+            }
+        }
+
+        time::sleep(10 as u64).wait();
+    }
+
+    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+        (*sp).shutdown();
+    }
+    sups.remove_all();
+    return 0 as i32;
+}
+
+// ───────────────────────────── public module surface ─────────────────────────────
+
+fn _send_cmd(take cmd: _EngineCmd) {
+    _ensure();
+    if let option::Option::Some(txp) = _STATE.cmd_tx.at_ptr(0 as usize) {
+        let _ = (*txp).send(cmd);
+    }
+}
+
+fn start() {
+    _ensure();
+    if _STATE.started { return; }
+    _STATE.started = true;
+    guard let option::Option::Some(cmd_ch) = channel::new::[_EngineCmd]() else { return; };
+    guard let option::Option::Some(ui_ch) = channel::new::[_UiUpdate]() else { return; };
+
+    let args: _WorkerArgs = _WorkerArgs {
+        cmd_rx: cmd_ch.clone(),
+        ui_tx: ui_ch.clone(),
+        chats_root: _chats_root_dir(),
+    };
+    let _ = _STATE.cmd_tx.append(cmd_ch);
+    let _ = _STATE.ui_rx.append(ui_ch);
+    let _ = _STATE.workers.append(thread::spawn_with::[_WorkerArgs, i32](args, _worker_main));
+    let _ = notifications::register_action("desk420_run", "open", "Open Desk420");
+    let _ = notifications::on_tap(_on_notification_tap);
+    if !_STATE.notif_asked && permissions::state(of: permissions::NOTIFICATIONS) == permissions::State::Unknown {
+        _STATE.notif_asked = true;
+        let _ = permissions::request(permissions::NOTIFICATIONS, _on_notif_perm);
+    }
+    _send_cmd(_EngineCmd::Start);
+}
+
+fn retry() { _send_cmd(_EngineCmd::Retry); }
+fn install_grok_cli() { _send_cmd(_EngineCmd::InstallGrokCli); }
+fn notification_state() -> permissions::State {
+    return permissions::state(of: permissions::NOTIFICATIONS);
+}
+fn request_notifications() {
+    _ensure();
+    _STATE.notif_asked = true;
+    let _ = permissions::request(permissions::NOTIFICATIONS, _on_notif_perm);
+}
+fn send_test_notification() -> notifications::Outcome {
+    return notifications::schedule(notifications::Notification::new(
+        id: "desk420-test",
+        title: "Desk420 notifications active",
+        body: "You'll be alerted here when Grok finishes a run or needs approval.",
+        payload: "__test__",
+        category: "desk420_run",
+    ));
+}
+fn sign_in() { _send_cmd(_EngineCmd::SignIn); }
+fn send_prompt(prompt_text: str) {
+    _send_cmd(_EngineCmd::SendPrompt(text::from_str(prompt_text), vec::new::[types::Attachment]()));
+}
+fn send_prompt_with_attachments(prompt_text: str, take attachments: vec::Vec[types::Attachment]) {
+    _send_cmd(_EngineCmd::SendPrompt(text::from_str(prompt_text), attachments));
+}
+fn rewind_last() { _send_cmd(_EngineCmd::RewindTo(-1 as i64, RewindMode::All)); }
+fn rewind_to(prompt_ordinal: i64, mode: RewindMode) {
+    _send_cmd(_EngineCmd::RewindTo(prompt_ordinal, mode));
+}
+fn queued_summary() -> text::Text {
+    _ensure();
+    return _STATE.queued_summary.clone();
+}
+fn rewound_prompt() -> text::Text {
+    _ensure();
+    return _STATE.rewound_prompt.clone();
+}
+fn clear_rewound_prompt() {
+    _ensure();
+    _STATE.rewound_prompt = text::from_str("");
+}
+fn cancel_turn() { _send_cmd(_EngineCmd::Cancel); }
+fn new_chat(cwd: str = "") {
+    _ensure();
+    _STATE.active_sid = text::from_str("");
+    _STATE.active_cwd = text::from_str(cwd);
+    _emit_change(EngineChange::Session);
+    _send_cmd(_EngineCmd::NewChat(text::from_str(cwd)));
+}
+fn refresh_sessions() { _send_cmd(_EngineCmd::RefreshSessions); }
+fn load_session(session_id: str, cwd: str, title: str = "") {
+    _ensure();
+    if _STATE.active_sid.equals(session_id) {
+        return;
+    }
+    _STATE.active_sid = text::from_str(session_id);
+    _STATE.active_cwd = text::from_str(cwd);
+    let _ = conversation::ensure_session(session_id, cwd: cwd);
+    conversation::mark_read(session_id);
+    if conversation::is_loaded(session_id) {
+        _send_cmd(_EngineCmd::SetActiveSession(text::from_str(session_id), text::from_str(cwd)));
+        _emit_change(EngineChange::Session);
+        return;
+    }
+    if conversation::is_loading(session_id) {
+        _send_cmd(_EngineCmd::SetActiveSession(text::from_str(session_id), text::from_str(cwd)));
+        _emit_change(EngineChange::Session);
+        return;
+    }
+    conversation::begin_load(session_id, cwd: cwd, title: title, clear_blocks: false);
+    _emit_change(EngineChange::Session);
+    _send_cmd(_EngineCmd::LoadSession(text::from_str(session_id), text::from_str(cwd), text::from_str(title)));
+}
+fn reload_session(session_id: str, cwd: str, title: str = "") {
+    _ensure();
+    _STATE.active_sid = text::from_str(session_id);
+    _STATE.active_cwd = text::from_str(cwd);
+    conversation::begin_load(session_id, cwd: cwd, title: title, clear_blocks: true);
+    _emit_change(EngineChange::Session);
+    _send_cmd(_EngineCmd::LoadSession(text::from_str(session_id), text::from_str(cwd), text::from_str(title)));
+}
+fn rename_session(session_id: str, title: str) {
+    _send_cmd(_EngineCmd::RenameSession(text::from_str(session_id), text::from_str(title)));
+}
+fn delete_session(session_id: str, cwd: str) {
+    _send_cmd(_EngineCmd::DeleteSession(text::from_str(session_id), text::from_str(cwd)));
+}
+fn search_sessions(query: str) {
+    sessions::set_search_query(query);
+    _send_cmd(_EngineCmd::SearchSessions(text::from_str(query)));
+}
+
+fn pending_config(config_id: str) -> text::Text {
+    _ensure();
+    if config_id == "model" { return _STATE.pending_model.clone(); }
+    if config_id == "reasoning_effort" { return _STATE.pending_effort.clone(); }
+    return text::from_str("");
+}
+
+fn set_config_option(config_id: str, value: str) {
+    _ensure();
+    if _STATE.active_sid.is_empty() {
+        if config_id == "model" { _STATE.pending_model = text::from_str(value); }
+        if config_id == "reasoning_effort" { _STATE.pending_effort = text::from_str(value); }
+    }
+    _send_cmd(_EngineCmd::SetConfigOption(text::from_str(config_id), text::from_str(value)));
+}
+fn set_approval_mode(mode: ApprovalMode) {
+    _ensure();
+    _STATE.approval_mode = mode;
+    _send_cmd(_EngineCmd::SetApprovalMode(mode));
+    _emit_change(EngineChange::Config);
+}
+fn approval_mode() -> ApprovalMode {
+    _ensure();
+    return _STATE.approval_mode;
+}
+fn is_auto_approve() -> bool {
+    _ensure();
+    return _STATE.approval_mode == ApprovalMode::AutoApprove;
+}
+fn refresh_account() { _send_cmd(_EngineCmd::RefreshAccount); }
+fn refresh_git_status() { _send_cmd(_EngineCmd::RefreshGitStatus); }
+fn git_stage_all() { _send_cmd(_EngineCmd::GitStageAll); }
+fn git_discard_all() { _send_cmd(_EngineCmd::GitDiscardAll); }
+fn git_commit(msg: str) { _send_cmd(_EngineCmd::GitCommit(text::from_str(msg))); }
+
+fn git_diff_text() -> text::Text {
+    _ensure();
+    return _STATE.git_diff.clone();
+}
+
+fn git_action_status() -> text::Text {
+    _ensure();
+    return _STATE.git_action_status.clone();
+}
+
+fn set_prefill_prompt(prompt: str) {
+    _ensure();
+    _STATE.rewound_prompt = text::from_str(prompt);
+    _emit_change(EngineChange::Rewind);
+}
+
+fn mcp_servers_summary() -> text::Text {
+    _ensure();
+    var out: text::Text = if browser_mcp::is_running() {
+        let u: text::Text = browser_mcp::mcp_url();
+        "desk420-browser · running (${u.view()})"
+    } else {
+        text::from_str("desk420-browser · stopped")
+    };
+    if !_STATE.mcp_summary.is_empty() {
+        let _ = out.append("\n");
+        let _ = out.append(_STATE.mcp_summary.view());
+    }
+    return out;
+}
+fn sign_out() { _send_cmd(_EngineCmd::SignOut); }
+fn set_app_active(active: bool) {
+    _ensure();
+    let was_inactive: bool = !_STATE.app_active;
+    _STATE.app_active = active;
+    if active && was_inactive {
+        _send_cmd(_EngineCmd::RefreshAccountIfStale);
+    }
+}
+fn git_status_summary() -> text::Text {
+    _ensure();
+    return _STATE.git_summary.clone();
+}
+
+fn respond_permission(session_id: str, rpc_id: wire::JsonRpcId, tool_call_id: str, option_id: str) {
+    _send_cmd(_EngineCmd::RespondPermission(
+        text::from_str(session_id),
+        rpc_id.clone(),
+        text::from_str(tool_call_id),
+        text::from_str(option_id),
+    ));
+}
+
+fn shutdown() {
+    _ensure();
+    if !_STATE.started { return; }
+    _send_cmd(_EngineCmd::Shutdown);
+    while let option::Option::Some(h) = _STATE.workers.remove_last() {
+        let _ = h.join();
+    }
+    _STATE.cmd_tx.remove_all();
+    _STATE.ui_rx.remove_all();
+    _STATE.started = false;
+}
+
+fn watch_status(f: fn(EngineStateEvent, *u8), ctx: *u8 = 0 as *u8) -> events::SignalSubscription[EngineStateEvent] {
+    _ensure();
+    return _STATE.signal.on(f, ctx: ctx);
+}
+
+fn status_kind() -> StatusKind {
+    _ensure();
+    return _STATE.status;
+}
+
+fn status_detail() -> text::Text {
+    _ensure();
+    return _STATE.detail.clone();
+}
+
+fn cli_path() -> text::Text {
+    _ensure();
+    if !_STATE.cli_path.is_empty() { return _STATE.cli_path.clone(); }
+    return text::from_str("Detecting…");
+}
+
+fn cli_version() -> text::Text {
+    _ensure();
+    if !_STATE.cli_version.is_empty() { return _STATE.cli_version.clone(); }
+    return text::from_str("—");
+}
+
+fn active_session_id() -> text::Text {
+    _ensure();
+    return _STATE.active_sid.clone();
+}
+
+fn active_cwd() -> text::Text {
+    _ensure();
+    return _STATE.active_cwd.clone();
+}
+
+fn is_active_turn_running() -> bool {
+    _ensure();
+    if _STATE.active_sid.is_empty() { return false; }
+    return conversation::is_turn_active(_STATE.active_sid.view());
+}

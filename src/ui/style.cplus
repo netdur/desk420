@@ -1,0 +1,405 @@
+// src/ui/style.cplus — the Desk420 look, said once.
+//
+// Adaptive semantic surfaces with a hairline rim and one lime accent, plus the node helpers
+// every screen repeats: section captions, cards, lime and outlined buttons,
+// labelled picker chips and the thin usage bar. Helpers that bind a handler
+// take the handler and its `*u8` context side by side, so a caller passes
+// `this.method` and the compiler fills the context.
+
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/label" as label;
+import "facet/mount" as mount;
+import "facet/props" as props;
+import "facet/symbol" as m_symbol;
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/math" as _;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+
+import "../store/prefs" as prefs;
+
+// ───────────────────────────── palette ─────────────────────────────
+
+fn _rgb(r: f64, g: f64, b: f64, a: f64 = 1.0f64) -> vocab::Color {
+    return vocab::Color::rgba(r, g, b, a);
+}
+
+// Every surface, rim and text colour is the PLATFORM's semantic colour, so
+// the app follows the system's light/dark setting (or the override chosen in
+// Settings) the way any native app does. Lime is the one brand colour.
+
+// The window floor: title bar, sidebar, and the right-hand panels.
+fn canvas() -> vocab::Color { return vocab::Color::window_background(); }
+fn panel() -> vocab::Color { return vocab::Color::window_background(); }
+
+// The content column between them — the document area of the window.
+fn content() -> vocab::Color { return vocab::Color::control_background(); }
+
+// Cards: composer, needs-you, project tiles. A translucent system fill, so a
+// card reads as one step up from whatever surface it sits on.
+fn card() -> vocab::Color { return vocab::Color::fill_secondary(); }
+
+// Opaque equivalent of `card()` for surfaces floating over scrolling content
+// (e.g. the chat composer dock), so scrolled text never bleeds through.
+fn floating_card() -> vocab::Color { return vocab::Color::raised(); }
+
+fn floating_lime_wash() -> vocab::Color {
+    return vocab::Color::adaptive(_rgb(0.919f64, 0.952f64, 0.837f64), _rgb(0.258f64, 0.277f64, 0.206f64));
+}
+
+// The filled chip behind a picker or a user bubble, and the recessed command
+// box inside an approval card.
+fn chip() -> vocab::Color { return vocab::Color::fill(); }
+fn well() -> vocab::Color { return vocab::Color::fill(); }
+
+// The 1pt rim on cards and the dividers between columns.
+fn hairline() -> vocab::Color { return vocab::Color::separator(); }
+
+// The accent as a FILL (buttons, dots, the usage bar).
+fn lime() -> vocab::Color {
+    return vocab::Color::adaptive(_rgb(0.784f64, 0.949f64, 0.341f64), _rgb(0.796f64, 0.957f64, 0.369f64));
+}
+
+// The accent as TEXT. Lime on white is unreadable, so light mode reads olive.
+fn lime_text() -> vocab::Color {
+    return vocab::Color::adaptive(_rgb(0.310f64, 0.420f64, 0.0f64), _rgb(0.796f64, 0.957f64, 0.369f64));
+}
+
+// The faint lime wash behind the "needs you" pill.
+fn lime_wash() -> vocab::Color {
+    return vocab::Color::adaptive(_rgb(0.784f64, 0.949f64, 0.341f64, 0.30f64), _rgb(0.796f64, 0.957f64, 0.369f64, 0.12f64));
+}
+
+// Text on a lime fill.
+fn on_lime() -> vocab::Color {
+    return _rgb(0.051f64, 0.059f64, 0.035f64);
+}
+
+// Shared prompt placeholder across Home and Conversation composers.
+const COMPOSER_PLACEHOLDER: str = "Ask anything, @ to mention, / for actions";
+
+fn ok_green() -> vocab::Color { return vocab::Color::system_green(); }
+fn danger() -> vocab::Color { return vocab::Color::system_red(); }
+fn danger_wash() -> vocab::Color {
+    return vocab::Color::adaptive(_rgb(0.85f64, 0.16f64, 0.14f64, 0.10f64), _rgb(0.95f64, 0.28f64, 0.25f64, 0.14f64));
+}
+
+// Brand app-icon tile behind `lime()`: deliberately dark in both appearances,
+// matching the macOS app icon.
+fn brand_badge() -> vocab::Color {
+    return _rgb(0.09f64, 0.10f64, 0.11f64);
+}
+
+fn ink() -> vocab::Color { return vocab::Color::text(); }
+fn muted() -> vocab::Color { return vocab::Color::text_secondary(); }
+fn faint() -> vocab::Color { return vocab::Color::text_tertiary(); }
+
+// Put the app in the appearance a preference names. System hands the choice
+// back to macOS; Light and Dark override it for every window.
+fn apply_appearance(a: prefs::AppearancePref) {
+    let ap: vocab::Appearance = match a {
+        prefs::AppearancePref::System => vocab::Appearance::Unspecified,
+        prefs::AppearancePref::Light => vocab::Appearance::Light,
+        prefs::AppearancePref::Dark => vocab::Appearance::Dark,
+    };
+    runtime::set_app_appearance(ap);
+}
+
+// ───────────────────────────── text ─────────────────────────────
+
+// An all-caps section caption — "NEEDS YOU · 1", "PROJECTS", "IDLE · 4".
+fn caption(title: str, key: str = "", accent: bool = false) -> core::Node {
+    let col: vocab::Color = if accent { lime_text() } else { muted() };
+    return ui::label(title, key: key,
+    font_size: 11.5f64,
+    font_weight: vocab::FontWeight::Bold,
+    character_spacing: 1.1f64,
+    text_color: col,
+    max_lines: 1 as i64);
+}
+
+// A small monospaced tag: a project folder on a run row, a CLI version.
+fn tag(t: str, key: str = "") -> core::Node {
+    return ui::label(t, key: key,
+    font_family: ftheme::MONOSPACE,
+    font_size: 12.0f64,
+    text_color: muted(),
+    line_break: vocab::LineBreak::TailTruncation,
+    max_lines: 1 as i64);
+}
+
+// Write a label found by key; silent when it is not mounted.
+fn set_label(key: str, value: str) {
+    if let option::Option::Some(l) = label::find(key) {
+        let _l: label::Label = l.set_text(value);
+    }
+}
+
+fn set_label_color(key: str, c: vocab::Color) {
+    if let option::Option::Some(l) = label::find(key) {
+        let _l: label::Label = l.set_text_color(c);
+    }
+}
+
+// Show or hide a keyed node; showing it again needs a relayout (facet §5).
+fn show(key: str, visible: bool) {
+    if let option::Option::Some(n) = mount::find(key) {
+        core::set_shown(n, visible);
+        if visible { core::relayout(n); }
+    }
+}
+
+// ───────────────────────────── surfaces ─────────────────────────────
+
+// A rounded card with a hairline rim (or a lime one when `accent`).
+fn card_box(key: str, take content: core::Node, radius: f64 = 14.0f64,
+accent: bool = false, fill: vocab::Color = card()) -> core::Node {
+    let rim: vocab::Color = if accent { lime() } else { hairline() };
+    let sw: f64 = if accent { 1.5f64 } else { 1.0f64 };
+    return @ui {
+        bordered(key: key,
+        stroke: vocab::Brush::solid(rim),
+        stroke_width: sw,
+        stroke_shape: vocab::Shape::rounded(radius)) {
+            content
+        }
+        .align(flex::Align::Stretch)
+            .set_background_color(fill)
+            .set_corner_radius(vocab::Corners::all(radius))
+    };
+}
+
+// A 1pt rule. `vertical` draws the divider between two columns.
+fn rule(vertical: bool = false) -> core::Node {
+    var n: core::Node = @ui { column {} };
+    n = if vertical { n.width(1.0f64).shrink(0.0f64) } else { n.height(1.0f64).shrink(0.0f64) };
+    n.set_background_color(hairline());
+    n.set_input_transparent(true);
+    return n;
+}
+
+// A filled circle — status dots.
+fn dot(size: f64, color: vocab::Color, key: str = "") -> core::Node {
+    var n: core::Node = @ui { column(key: key) {} }.width(size).height(size).shrink(0.0f64);
+    n.set_background_color(color);
+    n.set_corner_radius(vocab::Corners::all(size / 2.0f64));
+    n.set_input_transparent(true);
+    return n;
+}
+
+// ───────────────────────────── buttons ─────────────────────────────
+
+// The lime call to action: "New run", "Start run →", "Allow once".
+fn primary_button(title: str, key: str,
+on_click: fn(*u8, *u8) = props::no_handler,
+on_click_ctx: *u8 = 0 as *u8,
+height: f64 = 34.0f64, font_size: f64 = 14.0f64) -> core::Node {
+    var n: core::Node = ui::text_button(title, key: key,
+    text_color: on_lime(),
+    font_size: font_size,
+    font_weight: vocab::FontWeight::Semibold,
+    bordered: false,
+    corner_radius: vocab::Corners::all(9.0f64),
+    on_click: on_click, on_click_ctx: on_click_ctx)
+        .height(height)
+        .shrink(0.0f64)
+        .padding_edge(flex::Edge::Horizontal, 16.0f64);
+    n.set_background_color(lime());
+    return n;
+}
+
+// The outlined secondary: "Deny", "Open", "Always allow in llama", "Refresh".
+fn outline_button(title: str, key: str,
+on_click: fn(*u8, *u8) = props::no_handler,
+on_click_ctx: *u8 = 0 as *u8,
+height: f64 = 34.0f64, color: vocab::Color = ink()) -> core::Node {
+    return ui::text_button(title, key: key,
+    text_color: color,
+    font_size: 14.0f64,
+    font_weight: vocab::FontWeight::Medium,
+    bordered: true,
+    border_color: hairline(),
+    border_width: 1.0f64,
+    corner_radius: vocab::Corners::all(9.0f64),
+    on_click: on_click, on_click_ctx: on_click_ctx)
+        .height(height)
+        .shrink(0.0f64)
+        .padding_edge(flex::Edge::Horizontal, 16.0f64);
+}
+
+// A borderless text link: "Settings" in the sidebar footer.
+fn link_button(title: str, key: str,
+on_click: fn(*u8, *u8) = props::no_handler,
+on_click_ctx: *u8 = 0 as *u8) -> core::Node {
+    return ui::text_button(title, key: key,
+    text_color: muted(),
+    font_size: 13.0f64,
+    bordered: false,
+    on_click: on_click, on_click_ctx: on_click_ctx);
+}
+
+// A clean borderless MaterialSymbolsOutlined icon button with optical glyph
+// sizing (optionally given a fill/border when a button wants a solid badge,
+// e.g. the lime Send button or dark translucent thumbnail close badge).
+fn circle_icon(
+    sym: u32,
+    key: str,
+    title: str = "",
+    size: f64 = 28.0f64,
+    icon_size: f64 = 17.5f64,
+    fill_glyph: f64 = 0.0f64,
+    color: vocab::Color = muted(),
+    bg: vocab::Color = vocab::Color::clear(),
+    border: vocab::Color = vocab::Color::clear(),
+    border_width: f64 = 0.0f64,
+    on_click: fn(*u8, *u8) -> bool = gestures::no_gesture,
+    on_click_ctx: *u8 = 0 as *u8,
+) -> core::Node {
+    let radius: f64 = size / 2.0f64;
+    let sym_key: text::Text = if #str_len(key) > (0 as usize) { "${key}:sym" } else { text::from_str("") };
+    var n: core::Node = @ui {
+        bordered(key: key,
+        stroke: vocab::Brush::solid(border),
+        stroke_width: border_width,
+        stroke_shape: vocab::Shape::rounded(radius)) {
+            hstack {
+                symbol(sym, key: sym_key.view(), size: icon_size, fill: fill_glyph, color: color)
+                    .set_input_transparent(true)
+            }
+            .width(size)
+                .height(size)
+                .align(flex::Align::Center)
+                .justify(flex::Justify::Center)
+                .set_input_transparent(true)
+        }
+        .width(size)
+            .height(size)
+            .shrink(0.0f64)
+            .set_background_color(bg)
+            .set_corner_radius(vocab::Corners::all(radius))
+            .gesture(on_click: on_click, on_click_ctx: on_click_ctx)
+    };
+    if #str_len(title) > (0 as usize) {
+        n.set_accessibility_label(title);
+        n.set_tooltip(title);
+    }
+    return n;
+}
+
+// Update an existing `circle_icon` in place — swaps its glyph, sizing,
+// colours and tooltip/accessibility label without rebuilding the node.
+fn set_circle_icon(
+    key: str,
+    sym: u32,
+    title: str = "",
+    icon_size: f64 = 17.5f64,
+    fill_glyph: f64 = 0.0f64,
+    color: vocab::Color = muted(),
+    bg: vocab::Color = vocab::Color::clear(),
+) {
+    if let option::Option::Some(n) = mount::find(key) {
+        core::set_background_color(n, bg);
+        if #str_len(title) > (0 as usize) {
+            core::set_accessibility_label(n, title);
+            core::set_tooltip(n, title);
+        }
+    }
+    let sym_key: text::Text = "${key}:sym";
+    if let option::Option::Some(s) = m_symbol::find(sym_key.view()) {
+        let _s: m_symbol::Symbol = s
+            .set_icon(sym)
+            .set_size(icon_size)
+            .set_fill(fill_glyph)
+            .set_color(color);
+    }
+}
+
+// ───────────────────────────── picker chips ─────────────────────────────
+
+// "Model  Grok 4.7" — a filled chip that opens a native menu.
+//
+// The chip is drawn by facet; the menu is a real popup laid over it at
+// near-zero opacity, so a click lands on NSPopUpButton and its menu opens
+// where the chip is. The popup keeps `key`, so the agent surface and the
+// handlers address it exactly as before; the chip's value label is
+// `<key>:value` and the screen writes it when the selection moves.
+fn picker_chip(key: str, prefix: str,
+on_changed: fn(*u8, *u8) = props::no_handler,
+on_changed_ctx: *u8 = 0 as *u8,
+take items: vocab::TextList = vocab::TextList::new()) -> core::Node {
+    let value_key: text::Text = "${key}:value";
+    return @ui {
+        container {
+            hstack {
+                if !prefix.is_empty() {
+                    label(prefix, font_size: 12.0f64, text_color: muted(), max_lines: 1 as i64)
+                        .shrink(0.0f64)
+                }
+                label("", key: value_key.view(),
+                font_size: 12.0f64, font_weight: vocab::FontWeight::Medium,
+                text_color: ink(), max_lines: 1 as i64,
+                line_break: vocab::LineBreak::TailTruncation)
+                    .shrink(1.0f64)
+                    .min_width(24.0f64)
+            }
+            .gap(4.0f64)
+                .align(flex::Align::Center)
+                .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                .height(29.0f64)
+                .shrink(1.0f64)
+                .set_input_transparent(true)
+            popup("", key: key, font_size: 12.5f64,
+            on_selected_index_changed: on_changed,
+            on_selected_index_changed_ctx: on_changed_ctx,
+            items: items)
+                .absolute()
+                .position_edge(flex::Edge::All, 0.0f64)
+                .set_opacity(0.02f64)
+        }
+        .shrink(1.0f64)
+            .min_width(40.0f64)
+            .set_background_color(chip())
+            .set_corner_radius(vocab::Corners::all(8.0f64))
+    };
+}
+
+// ───────────────────────────── usage bar ─────────────────────────────
+
+// A thin track with a lime fill. `set_bar` moves the fill; the two halves
+// share the track by grow, so no width is measured.
+fn usage_bar(key: str) -> core::Node {
+    let fill_key: text::Text = "${key}:fill";
+    let rest_key: text::Text = "${key}:rest";
+    return @ui {
+        hstack(key: key) {
+            column(key: fill_key.view()) {}
+            .grow(0.0f64)
+                .basis(0.0f64)
+                .min_width(6.0f64)
+                .set_background_color(lime())
+                .set_corner_radius(vocab::Corners::all(3.0f64))
+            column(key: rest_key.view()) {}
+            .grow(1.0f64)
+                .basis(0.0f64)
+        }
+        .height(6.0f64)
+            .shrink(0.0f64)
+            .set_background_color(vocab::Color::ink(0.08f64))
+            .set_corner_radius(vocab::Corners::all(3.0f64))
+            .set_input_transparent(true)
+    };
+}
+
+fn set_bar(key: str, fraction: f64) {
+    let f: f64 = fraction.clamp(0.0f64, 1.0f64);
+    let fill_key: text::Text = "${key}:fill";
+    let rest_key: text::Text = "${key}:rest";
+    if let option::Option::Some(n) = mount::find(fill_key.view()) { core::set_grow(n, f); }
+    if let option::Option::Some(n) = mount::find(rest_key.view()) { core::set_grow(n, 1.0f64 - f); }
+    if let option::Option::Some(t) = mount::find(key) { core::relayout(t); }
+}
