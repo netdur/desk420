@@ -13,6 +13,7 @@ cask "desk420" do
   end
 
   depends_on arch: :arm64
+  depends_on cask: "grok-build"
   depends_on macos: :ventura
 
   app "Desk420.app"
@@ -24,9 +25,6 @@ cask "desk420" do
   ]
 
   caveats <<~EOS
-    Desk420 drives the Grok CLI (`grok`) over ACP. Install it from Desk420's
-    onboarding screen or from https://x.ai if it is not already installed.
-
     Desk420.app is currently ad-hoc signed. If macOS Gatekeeper blocks the first
     launch, run:
       xattr -dr com.apple.quarantine /Applications/Desk420.app

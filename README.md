@@ -16,7 +16,7 @@ Desk420 drives the `grok` CLI directly over the **Agent Client Protocol (ACP)** 
 
 ## Install with Homebrew (macOS Apple Silicon)
 
-This repository doubles as a Homebrew tap via [Casks/desk420.rb](Casks/desk420.rb):
+This repository doubles as a Homebrew tap via [Casks/desk420.rb](Casks/desk420.rb) (which also installs the `grok-build` CLI automatically):
 
 ```bash
 brew tap netdur/desk420 https://github.com/netdur/desk420.git
