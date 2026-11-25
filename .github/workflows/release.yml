@@ -34,7 +34,7 @@ permissions:
 jobs:
   build-macos-arm64:
     name: Build, test & package (macOS arm64)
-    runs-on: macos-14
+    runs-on: macos-latest
     outputs:
       is_release: ${{ steps.meta.outputs.is_release }}
       tag: ${{ steps.meta.outputs.tag }}
@@ -42,6 +42,13 @@ jobs:
       sha: ${{ steps.pkg.outputs.sha }}
       asset: ${{ steps.pkg.outputs.asset }}
     steps:
+      - name: Verify Apple Silicon runner
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          echo "Runner arch: $ARCH ($(sw_vers -productVersion))"
+          [[ "$ARCH" == "arm64" ]] || { echo "Expected arm64 runner, got $ARCH" >&2; exit 1; }
+
       - name: Check out Desk420
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -115,13 +122,24 @@ jobs:
           set -euo pipefail
           cargo build --manifest-path _cplus/Cargo.toml --locked --release -p cpc
 
-      - name: Install LLVM (>= 19) via Homebrew and wire toolchain
+      - name: Configure clang (>= LLVM 19) and wire C+ toolchain
         run: |
           set -euo pipefail
-          brew install llvm
-          PFX="$(brew --prefix llvm)"
-          echo "CPC_CLANG=$PFX/bin/clang" >> "$GITHUB_ENV"
-          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+          if clang -Wno-override-module -x ir -c - -o /dev/null <<'LL' 2>/dev/null
+          define preserve_nonecc void @probe(ptr sret([32 x i8]) writable %out) {
+            ret void
+          }
+          LL
+          then
+            echo "Using system Apple clang: $(clang --version | head -1)"
+            echo "CPC_CLANG=$(command -v clang)" >> "$GITHUB_ENV"
+          else
+            echo "System clang too old; installing Homebrew llvm..."
+            brew install llvm
+            PFX="$(brew --prefix llvm)"
+            echo "CPC_CLANG=$PFX/bin/clang" >> "$GITHUB_ENV"
+            echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+          fi
           ln -sfn "$PWD/_cplus/target/release/cpc" ./cpc
           ln -sfn "$PWD/_cplus/vendor" ./vendor
 
