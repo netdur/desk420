@@ -20,6 +20,7 @@ This repository doubles as a Homebrew tap via [Casks/desk420.rb](Casks/desk420.r
 
 ```bash
 brew tap netdur/desk420 https://github.com/netdur/desk420.git
+brew trust netdur/desk420   # required on Homebrew 7+
 brew install --cask netdur/desk420/desk420
 ```
 
