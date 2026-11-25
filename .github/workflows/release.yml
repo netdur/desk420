@@ -1,0 +1,252 @@
+name: CI & Release (macOS)
+
+# Runs ONLY on version tags (`vX.Y.Z`) and manual `workflow_dispatch` (never on
+# normal branch pushes).
+#
+# - Tag push (`v*`): builds `cpc` cleanly from `netdur/cplus`, runs fmt/check/test,
+#   packages `Desk420-<version>-arm64.dmg`, publishes a provenance-attested GitHub
+#   Release, and updates `Casks/desk420.rb` in this repository so Homebrew installs
+#   pick up the new release automatically.
+# - Manual dispatch (`workflow_dispatch`): runs the full macOS build + test +
+#   packaging verification without publishing a release or modifying `Casks/`.
+#
+# Supply-chain hardening:
+# - The build job holds `contents: read` only (no write token while running build
+#   scripts or tests).
+# - Publishing and Homebrew cask updates run in separate jobs with no build code,
+#   verify the SHA-256 measured by the build job, and attest provenance.
+# - Every action is pinned to a full commit SHA.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      cplus_ref:
+        description: "Branch, tag, or commit of netdur/cplus to build with"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-arm64:
+    name: Build, test & package (macOS arm64)
+    runs-on: macos-14
+    outputs:
+      is_release: ${{ steps.meta.outputs.is_release }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.pkg.outputs.sha }}
+      asset: ${{ steps.pkg.outputs.asset }}
+    steps:
+      - name: Check out Desk420
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve version and validate tag
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TOML_VER="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cplus.toml | head -1)"
+          PLIST_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/Info.plist)"
+          if [[ -z "$TOML_VER" || "$TOML_VER" != "$PLIST_VER" ]]; then
+            echo "Version mismatch: Cplus.toml ($TOML_VER) != macos/Info.plist ($PLIST_VER)" >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "push" && "$REF" == refs/tags/v* ]]; then
+            [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "Not a release semver tag: $REF_NAME" >&2
+              exit 1
+            }
+            TAG_VER="${REF_NAME#v}"
+            if [[ "$TAG_VER" != "$TOML_VER" ]]; then
+              echo "Tag version ($TAG_VER) does not match Cplus.toml ($TOML_VER)" >&2
+              exit 1
+            fi
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "version=$TAG_VER" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "tag=v$TOML_VER" >> "$GITHUB_OUTPUT"
+            echo "version=$TOML_VER" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out C+ toolchain (netdur/cplus)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: netdur/cplus
+          ref: ${{ inputs.cplus_ref || 'main' }}
+          path: _cplus
+          persist-credentials: false
+
+      - name: Record netdur/cplus commit
+        id: cplus
+        run: |
+          set -euo pipefail
+          SHA="$(git -C _cplus rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Using netdur/cplus @ $SHA"
+
+      - name: Restore cached cpc binary (manual dispatch only)
+        id: cpc-cache
+        if: steps.meta.outputs.is_release != 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: _cplus/target/release/cpc
+          key: cpc-macos-arm64-${{ steps.cplus.outputs.sha }}
+
+      - name: Set up Rust toolchain
+        if: steps.meta.outputs.is_release == 'true' || steps.cpc-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - name: Build cpc compiler
+        if: steps.meta.outputs.is_release == 'true' || steps.cpc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path _cplus/Cargo.toml --locked --release -p cpc
+
+      - name: Install LLVM (>= 19) via Homebrew and wire toolchain
+        run: |
+          set -euo pipefail
+          brew install llvm
+          PFX="$(brew --prefix llvm)"
+          echo "CPC_CLANG=$PFX/bin/clang" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+          ln -sfn "$PWD/_cplus/target/release/cpc" ./cpc
+          ln -sfn "$PWD/_cplus/vendor" ./vendor
+
+      - name: Print toolchain versions
+        run: |
+          ./cpc --version
+          "$CPC_CLANG" --version | head -1
+          echo "SDKROOT=$SDKROOT"
+
+      - name: Format check, type-check, and run unit + ACP fixture tests
+        run: |
+          set -euo pipefail
+          ./cpc fmt --check
+          ./cpc check
+          ./cpc test
+
+      - name: Validate Homebrew Cask syntax and style
+        run: |
+          set -euo pipefail
+          ruby -c Casks/desk420.rb
+          brew style Casks/desk420.rb
+
+      - name: Package release Desk420.app and DMG
+        id: pkg
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/package_macos.sh --release --dmg
+          ASSET="Desk420-${VERSION}-arm64.dmg"
+          cp target/release/Desk420.dmg "$ASSET"
+          SHA="$(shasum -a 256 "$ASSET" | cut -d' ' -f1)"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Packaged $ASSET ($SHA)"
+
+      - name: Upload DMG artifact for publish job
+        if: steps.meta.outputs.is_release == 'true'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-macos-arm64
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-macos-arm64:
+    name: Publish GitHub Release
+    needs: build-macos-arm64
+    if: needs.build-macos-arm64.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-macos-arm64
+
+      - name: Verify DMG SHA-256 and write SHA256SUMS.txt
+        env:
+          ASSET: ${{ needs.build-macos-arm64.outputs.asset }}
+          SHA: ${{ needs.build-macos-arm64.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "$SHA  $ASSET" | sha256sum -c -
+          echo "$SHA  $ASSET" > SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ needs.build-macos-arm64.outputs.asset }}
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build-macos-arm64.outputs.tag }}
+          ASSET: ${{ needs.build-macos-arm64.outputs.asset }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --title "Desk420 $TAG" --generate-notes \
+            || gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" "$ASSET" SHA256SUMS.txt
+
+  update-homebrew-cask:
+    name: Update Casks/desk420.rb
+    needs: [build-macos-arm64, publish-macos-arm64]
+    if: needs.build-macos-arm64.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          token: ${{ github.token }}
+
+      - name: Render Casks/desk420.rb from template
+        env:
+          VERSION: ${{ needs.build-macos-arm64.outputs.version }}
+          SHA: ${{ needs.build-macos-arm64.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version: $VERSION" >&2; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "bad sha256: $SHA" >&2; exit 1; }
+          sed -e "s/@VERSION@/$VERSION/g" \
+              -e "s/@SHA@/$SHA/g" \
+              .github/homebrew/desk420.rb.in > Casks/desk420.rb
+          echo "----- rendered Casks/desk420.rb -----"
+          cat Casks/desk420.rb
+
+      - name: Commit and push updated Homebrew cask
+        env:
+          VERSION: ${{ needs.build-macos-arm64.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Casks/desk420.rb; then
+            echo "Casks/desk420.rb is already up to date."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/desk420.rb
+          git commit -m "chore(homebrew): update desk420 cask to $VERSION"
+          git push origin main

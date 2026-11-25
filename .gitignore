@@ -1,6 +1,7 @@
 /target
 /vendor
 /cpc
+/_cplus
 /issues/
 .DS_Store
 *.dmg

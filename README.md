@@ -14,10 +14,28 @@ Desk420 drives the `grok` CLI directly over the **Agent Client Protocol (ACP)** 
 - **Desktop shell** — Floating **Quick Ask** HUD (`⌥Space`), menu-bar status item with recent runs & approval count, Dock badge, native macOS notifications, and `desk420://` deep links.
 - **Agent-Controlled Interface (ACI)** — Built-in local MCP surface (`src/app.cplus`) with optional consent gating so external agents can inspect or drive the UI.
 
-## Prerequisites
+## Install with Homebrew (macOS Apple Silicon)
+
+This repository doubles as a Homebrew tap via [Casks/desk420.rb](Casks/desk420.rb):
+
+```bash
+brew tap netdur/desk420 https://github.com/netdur/desk420.git
+brew install --cask netdur/desk420/desk420
+```
+
+To update later:
+
+```bash
+brew upgrade --cask desk420
+```
+
+> **Note:** Prebuilt releases are currently ad-hoc signed. If macOS Gatekeeper blocks the first launch, clear the quarantine attribute with:
+> `xattr -dr com.apple.quarantine /Applications/Desk420.app`
+
+## Prerequisites (Building from Source)
 
 - **macOS 13.0+** (Apple Silicon or Intel)
-- **C+ toolchain (`cpc`)** built from a current C+ checkout that includes `facet`, `facet/hotkey`, `facet/status_item`, `facet/panel`, and `facet_agent`
+- **C+ toolchain (`cpc`)** built from [`netdur/cplus`](https://github.com/netdur/cplus) (`main`)
   - Ensure `cpc` is on `PATH` (or symlinked as `./cpc` at the repo root) and `vendor/` resolves to your C+ `vendor/` directory.
 - **[Grok CLI](https://x.ai)** (`grok`) installed on your Mac (or installable directly from Desk420's onboarding screen).
 
