@@ -30,6 +30,7 @@ import "stdlib/url" as url;
 import "stdlib/vec" as vec;
 
 import "../ui/browser_pane" as browser_pane;
+import "../version" as version;
 
 // ───────────────────────────── URL safety policy ─────────────────────────────
 
@@ -754,7 +755,7 @@ fn handle_jsonrpc(raw: str, session_cwd: str = "") -> option::Option[text::Text]
         let _ = caps.append(json::Member::new("tools", json::Value::object(vec::new::[json::Member]())));
         var info: vec::Vec[json::Member] = vec::new::[json::Member]();
         let _ = info.append(json::Member::new("name", json::Value::text("desk420-browser")));
-        let _ = info.append(json::Member::new("version", json::Value::text("0.1.3")));
+        let _ = info.append(json::Member::new("version", json::Value::text(version::VERSION)));
         var r: vec::Vec[json::Member] = vec::new::[json::Member]();
         let _ = r.append(json::Member::new("protocolVersion", json::Value::text(proto.view())));
         let _ = r.append(json::Member::new("capabilities", json::Value::object(caps)));

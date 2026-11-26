@@ -1,0 +1,80 @@
+// src/version.cplus — the single C+ source of truth for Desk420's version.
+//
+// `Cplus.toml` (`[package] version`) is the canonical release version.
+// Run `./scripts/sync_version.sh` (or `./scripts/sync_version.sh X.Y.Z`) to
+// keep `Cplus.toml`, `src/version.cplus`, and `macos/Info.plist` in lockstep.
+// The drift-guard tests below fail `cpc test` immediately if any of the three
+// ever disagree.
+
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+// Synced from Cplus.toml by scripts/sync_version.sh.
+const VERSION: str = "0.1.3";
+
+fn current() -> str { return VERSION; }
+
+fn manifest_version(manifest: str) -> text::Text {
+    let lines: vec::Vec[str] = manifest.split(separator: "\n");
+    var in_package: bool = false;
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if let option::Option::Some(raw) = lines.at(i) {
+            let t: str = raw.trim();
+            if t.has_prefix("[") {
+                in_package = t.has_prefix("[package]");
+            } else if in_package && t.has_prefix("version") {
+                if let option::Option::Some(a) = t.find("\"") {
+                    if let option::Option::Some(rest) = t.slice(from: a +% (1 as usize), to: t.count()) {
+                        if let option::Option::Some(b) = rest.find("\"") {
+                            if let option::Option::Some(v) = rest.slice(from: 0 as usize, to: b) {
+                                return text::from_str(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return text::from_str("");
+}
+
+fn plist_version(plist_xml: str) -> text::Text {
+    guard let option::Option::Some(k) = plist_xml.find("<key>CFBundleShortVersionString</key>") else {
+        return text::from_str("");
+    };
+    guard let option::Option::Some(after_key) = plist_xml.slice(from: k, to: plist_xml.count()) else {
+        return text::from_str("");
+    };
+    guard let option::Option::Some(s_open) = after_key.find("<string>") else {
+        return text::from_str("");
+    };
+    let val_start: usize = s_open +% (8 as usize);
+    guard let option::Option::Some(after_open) = after_key.slice(from: val_start, to: after_key.count()) else {
+        return text::from_str("");
+    };
+    guard let option::Option::Some(s_close) = after_open.find("</string>") else {
+        return text::from_str("");
+    };
+    guard let option::Option::Some(v) = after_open.slice(from: 0 as usize, to: s_close) else {
+        return text::from_str("");
+    };
+    return text::from_str(v.trim());
+}
+
+#[test]
+fn version_matches_manifest_and_info_plist() {
+    assert VERSION != "";
+    if let result::Result::Ok(toml_txt) = fs::read_to_string("Cplus.toml") {
+        let mv: text::Text = manifest_version(toml_txt.view());
+        assert mv.equals(VERSION);
+    }
+    if let result::Result::Ok(plist_txt) = fs::read_to_string("macos/Info.plist") {
+        let pv: text::Text = plist_version(plist_txt.view());
+        assert pv.equals(VERSION);
+    }
+}

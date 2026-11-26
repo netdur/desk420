@@ -18,9 +18,8 @@ import "stdlib/option" as option;
 import "stdlib/text" as text;
 
 import "../engine/runtime" as engine;
+import "../version" as version;
 import "./style" as style;
-
-const APP_VERSION: str = "0.1.3";
 
 struct AboutScreen {}
 
@@ -85,7 +84,7 @@ impl AboutScreen: component::Component {
                     text_color: style::ink())
                         .margin_edge(flex::Edge::Top, 10.0f64)
 
-                    label("Version ${APP_VERSION}", key: "about:version",
+                    label("Version ${version::VERSION}", key: "about:version",
                     font_size: 13.0f64,
                     text_color: style::muted())
 

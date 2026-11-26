@@ -19,9 +19,9 @@ import "stdlib/vec" as vec;
 import "../browser/mcp_server" as browser_mcp;
 import "../store/prefs" as prefs;
 import "../store/sessions" as sessions;
+import "../version" as version;
 import "./runtime" as engine;
 
-const CURRENT_VERSION: str = "0.1.3";
 const LATEST_RELEASE_API: str = "https://api.github.com/repos/netdur/desk420/releases/latest";
 const RELEASES_FALLBACK_URL: str = "https://github.com/netdur/desk420/releases";
 
@@ -79,7 +79,7 @@ fn is_newer_version(current: str, candidate: str) -> bool {
     return false;
 }
 
-fn parse_latest_release_json(raw_json: str, current_ver: str = CURRENT_VERSION) -> UpdateCheckResult {
+fn parse_latest_release_json(raw_json: str, current_ver: str = version::VERSION) -> UpdateCheckResult {
     guard let result::Result::Ok(root) = json::Value::parse(source: raw_json) else {
         return UpdateCheckResult {
             kind: UpdateKind::Error,
@@ -116,7 +116,7 @@ fn parse_latest_release_json(raw_json: str, current_ver: str = CURRENT_VERSION) 
 
 fn check_latest_release_sync() -> UpdateCheckResult {
     var req: http::Request = http::Request::new(LATEST_RELEASE_API, timeout_seconds: 8.0f64);
-    let _ = req.set_header("User-Agent", to: "Desk420/${CURRENT_VERSION}");
+    let _ = req.set_header("User-Agent", to: "Desk420/${version::VERSION}");
     let _ = req.set_header("Accept", to: "application/vnd.github+json");
     return match http::send(req) {
         result::Result::Ok(resp) => {
@@ -129,7 +129,7 @@ fn check_latest_release_sync() -> UpdateCheckResult {
                 }
             } else {
                 let body: text::Text = resp.body_text();
-                parse_latest_release_json(body.view(), current_ver: CURRENT_VERSION)
+                parse_latest_release_json(body.view(), current_ver: version::VERSION)
             }
         }
         result::Result::Err(err) => UpdateCheckResult {
@@ -157,11 +157,11 @@ fn _present_update_on_main(_ctx: *u8) {
     if !_PENDING_RES_LIVE { return; }
     match _PENDING_RES.kind {
         UpdateKind::UpToDate => {
-            let msg: text::Text = "You are running Desk420 v${CURRENT_VERSION}, the latest version.";
+            let msg: text::Text = "You are running Desk420 v${version::VERSION}, the latest version.";
             runtime::alert("Desk420 is up to date", msg.view(), "OK");
         }
         UpdateKind::Available => {
-            let msg: text::Text = "Desk420 ${_PENDING_RES.latest_tag.view()} is available (you have v${CURRENT_VERSION}).\n\nHomebrew users can run: brew upgrade --cask desk420";
+            let msg: text::Text = "Desk420 ${_PENDING_RES.latest_tag.view()} is available (you have v${version::VERSION}).\n\nHomebrew users can run: brew upgrade --cask desk420";
             runtime::alert(
                 "Update available",
                 msg.view(),
@@ -197,7 +197,7 @@ fn build_debug_diagnostics() -> text::Text {
     var out: text::Text = text::new();
     let _ = out.append("Desk420 Diagnostics\n");
     let _ = out.append("===================\n");
-    let _ = out.append("Desk420 version: ${CURRENT_VERSION}\n");
+    let _ = out.append("Desk420 version: ${version::VERSION}\n");
 
     var sw_args: vec::Vec[text::Text] = vec::new::[text::Text]();
     let _ = sw_args.append(text::from_str("/usr/bin/sw_vers"));
