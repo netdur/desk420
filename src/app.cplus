@@ -15,6 +15,7 @@ import "facet/vocabulary" as vocab;
 import "facet/window" as window;
 import "facet_agent/agent" as agent;
 import "facet_runtime/runtime" as runtime;
+import "stdlib/fs" as fs;
 import "stdlib/option" as option;
 import "stdlib/result" as result;
 import "stdlib/status" as status;
@@ -22,15 +23,19 @@ import "stdlib/text" as text;
 import "stdlib/url" as url;
 import "stdlib/vec" as vec;
 
+import "./acp/types" as types;
 import "./agent_consent" as agent_consent;
 import "./browser/mcp_server" as browser_mcp;
 import "./engine/runtime" as engine;
+import "./engine/updater" as updater;
+import "./engine/worktree" as worktree;
 import "./store/conversation" as conversation;
 import "./store/prefs" as prefs;
 import "./store/sessions" as sessions;
 import "./ui/about_screen" as about_screen;
 import "./ui/browser_pane" as browser_pane;
 import "./ui/chat_screen" as chat_screen;
+import "./ui/command_palette" as command_palette;
 import "./ui/home_view" as home_view;
 import "./ui/main_screen" as main_screen;
 import "./ui/panels" as panels;
@@ -44,6 +49,14 @@ fn _menu_about(_sender: *u8, _ctx: *u8) {
     let _ = runtime::app().open_window("about");
 }
 
+fn _menu_check_updates(_sender: *u8, _ctx: *u8) {
+    updater::check_for_updates_async();
+}
+
+fn _menu_export_diagnostics(_sender: *u8, _ctx: *u8) {
+    updater::export_debug_diagnostics();
+}
+
 fn _menu_settings(_sender: *u8, _ctx: *u8) {
     let _ = runtime::app().open_window("settings");
 }
@@ -51,6 +64,64 @@ fn _menu_settings(_sender: *u8, _ctx: *u8) {
 fn _menu_new_chat(_sender: *u8, _ctx: *u8) {
     let proj: text::Text = sessions::selected_project();
     engine::new_chat(cwd: proj.view());
+}
+
+static _PENDING_WT_REPO_LIVE: bool = false;
+static _PENDING_WT_REPO: text::Text = #zero::[text::Text]();
+static _PENDING_WT_LABEL: text::Text = #zero::[text::Text]();
+
+fn _on_wt_label_typed(s: str, _ctx: *u8) {
+    _PENDING_WT_LABEL = text::from_str(s);
+}
+
+fn _on_wt_prompt_answer(index: i32, _ctx: *u8) {
+    engine::refocus_main_window();
+    if !_PENDING_WT_REPO_LIVE { return; }
+    let repo: text::Text = _PENDING_WT_REPO.clone();
+    let lbl: text::Text = _PENDING_WT_LABEL.clone();
+    _PENDING_WT_REPO = text::from_str("");
+    _PENDING_WT_LABEL = text::from_str("");
+    _PENDING_WT_REPO_LIVE = false;
+    if index != (0 as i32) || repo.is_empty() { return; }
+    match worktree::create_worktree(repo.view(), label: lbl.view()) {
+        result::Result::Ok(info) => {
+            sessions::add_project(info.path.view());
+            sessions::set_selected_project(info.path.view());
+            engine::new_chat(cwd: info.path.view());
+        }
+        result::Result::Err(err) => {
+            runtime::alert("Could not create worktree", err.view(), "OK");
+        }
+    }
+}
+
+fn start_new_worktree_run() {
+    var repo: text::Text = engine::active_cwd();
+    if repo.is_empty() || repo.contains(".desk420/chats") {
+        repo = sessions::selected_project();
+    }
+    if repo.is_empty() {
+        if let option::Option::Some(dir) = runtime::choose_directory() {
+            repo = dir;
+        }
+    }
+    if repo.is_empty() { return; }
+    _PENDING_WT_REPO = repo;
+    _PENDING_WT_LABEL = text::from_str("");
+    _PENDING_WT_REPO_LIVE = true;
+    runtime::prompt(
+        "New isolated worktree run",
+        "Desk420 will create a fresh git worktree and branch from HEAD so this run won't touch your main working tree.",
+        placeholder: "Optional task name (e.g. fix-auth)",
+        primary: "Create Worktree",
+        secondary: "Cancel",
+        on_typed: _on_wt_label_typed,
+        on_answer: _on_wt_prompt_answer,
+    );
+}
+
+fn _menu_new_worktree(_sender: *u8, _ctx: *u8) {
+    start_new_worktree_run();
 }
 
 fn _menu_add_project(_sender: *u8, _ctx: *u8) {
@@ -119,6 +190,26 @@ fn _menu_copy_last_answer(_sender: *u8, _ctx: *u8) {
     let _ok: bool = runtime::copy_text(out.view());
 }
 
+fn _menu_export_markdown(_sender: *u8, _ctx: *u8) {
+    let sid: text::Text = engine::active_session_id();
+    if sid.is_empty() { return; }
+    let md_body: text::Text = conversation::export_markdown(sid.view());
+    if md_body.is_empty() { return; }
+    let title: text::Text = conversation::session_title(sid.view());
+    let default_name: str = if title.is_empty() { "conversation.md" } else { title.view() };
+    if let option::Option::Some(dest) = runtime::choose_save_path(name: default_name, extension: "md") {
+        let _ = fs::write_string(dest.view(), md_body.view());
+    }
+}
+
+fn _menu_paste_image(_sender: *u8, _ctx: *u8) {
+    if engine::active_session_id().is_empty() {
+        home_view::paste_clipboard_image();
+    } else {
+        chat_screen::paste_clipboard_image();
+    }
+}
+
 fn _menu_slash_commands(_sender: *u8, _ctx: *u8) {
     if engine::active_session_id().is_empty() {
         home_view::open_slash_commands();
@@ -127,15 +218,58 @@ fn _menu_slash_commands(_sender: *u8, _ctx: *u8) {
     }
 }
 
+fn _menu_command_palette(_sender: *u8, _ctx: *u8) {
+    command_palette::toggle();
+}
+
 fn _menu_search_chats(_sender: *u8, _ctx: *u8) {
     sidebar::open_search();
 }
+
+fn _menu_tab_run(_sender: *u8, _ctx: *u8) { chat_screen::select_tab("run"); }
+fn _menu_tab_files(_sender: *u8, _ctx: *u8) { chat_screen::select_tab("files"); }
+fn _menu_tab_browser(_sender: *u8, _ctx: *u8) { chat_screen::select_tab("browser"); }
+fn _menu_tab_terminal(_sender: *u8, _ctx: *u8) { chat_screen::select_tab("terminal"); }
+fn _menu_tab_changes(_sender: *u8, _ctx: *u8) { chat_screen::select_tab("preview"); }
+
+fn _resolve_pending_perm(allow: bool) {
+    let sid: text::Text = engine::active_session_id();
+    if sid.is_empty() { return; }
+    guard let option::Option::Some(pb) = conversation::pending_permission(sid.view()) else { return; };
+    var chosen: text::Text = text::from_str("");
+    var i: usize = 0 as usize;
+    while i < pb.options.count() {
+        if let option::Option::Some(op) = pb.options.at_ptr(i) {
+            let ok: bool = match (*op).kind {
+                types::PermissionKind::AllowOnce => allow,
+                types::PermissionKind::AllowAlways => allow,
+                types::PermissionKind::RejectOnce => !allow,
+                types::PermissionKind::RejectAlways => !allow,
+                _ => false,
+            };
+            if ok {
+                chosen = (*op).option_id.clone();
+                break;
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    if chosen.is_empty() {
+        chosen = text::from_str(if allow { "allow-once" } else { "reject-once" });
+    }
+    engine::respond_permission(sid.view(), pb.rpc_id, pb.tool_call_id.view(), chosen.view());
+}
+
+fn _menu_approve_pending(_sender: *u8, _ctx: *u8) { _resolve_pending_perm(true); }
+fn _menu_deny_pending(_sender: *u8, _ctx: *u8) { _resolve_pending_perm(false); }
 
 fn _build_app_menu() -> screen::AppMenu {
     var m: screen::AppMenu = runtime::app_menu("Desk420");
 
     // App menu
     m.add_command("Desk420", "About Desk420", on_click: _menu_about);
+    m.add_command("Desk420", "Check for Updates…", on_click: _menu_check_updates);
+    m.add_command("Desk420", "Export Debug Diagnostics…", on_click: _menu_export_diagnostics);
     m.add_separator("Desk420");
     m.add_command("Desk420", "Settings…", key: ",", on_click: _menu_settings);
     m.add_separator("Desk420");
@@ -143,6 +277,7 @@ fn _build_app_menu() -> screen::AppMenu {
 
     // File menu
     m.add_command("File", "New Chat", key: "n", on_click: _menu_new_chat);
+    m.add_command("File", "New Worktree Run…", key: "n", on_click: _menu_new_worktree, shift: true);
     m.add_command("File", "Add Project Folder…", key: "o", on_click: _menu_add_project);
     m.add_command("File", "Quick Ask…", on_click: _menu_quick_ask);
     m.add_separator("File");
@@ -155,6 +290,7 @@ fn _build_app_menu() -> screen::AppMenu {
     m.add_item("Edit", "Cut", "x", runtime::menu_action_cut());
     m.add_item("Edit", "Copy", "c", runtime::menu_action_copy());
     m.add_item("Edit", "Paste", "v", runtime::menu_action_paste());
+    m.add_command("Edit", "Paste Image as Attachment", key: "v", on_click: _menu_paste_image, shift: true);
     m.add_item("Edit", "Select All", "a", runtime::menu_action_select_all());
     m.add_separator("Edit");
     m.add_item("Edit", "Find…", "f", runtime::menu_action_find());
@@ -162,9 +298,14 @@ fn _build_app_menu() -> screen::AppMenu {
     // Chat menu
     m.add_command("Chat", "Stop Response", key: ".", on_click: _menu_stop_turn);
     m.add_command("Chat", "Copy Last Answer", key: "c", on_click: _menu_copy_last_answer, shift: true);
+    m.add_command("Chat", "Export as Markdown…", key: "e", on_click: _menu_export_markdown, shift: true);
     m.add_command("Chat", "Slash Commands…", key: "/", on_click: _menu_slash_commands);
-    m.add_command("Chat", "Search Conversations…", key: "k", on_click: _menu_search_chats);
+    m.add_command("Chat", "Command Palette…", key: "k", on_click: _menu_command_palette);
+    m.add_command("Chat", "Search Sidebar…", key: "f", on_click: _menu_search_chats, shift: true);
     m.add_command("Chat", "Rewind Last Turn", on_click: _menu_rewind);
+    m.add_separator("Chat");
+    m.add_command("Chat", "Approve Pending Tool", key: "y", on_click: _menu_approve_pending, shift: true);
+    m.add_command("Chat", "Deny Pending Tool", key: "x", on_click: _menu_deny_pending, shift: true);
     m.add_separator("Chat");
     m.add_command("Chat", "Pin / Unpin Conversation", on_click: _menu_pin_active);
     m.add_command("Chat", "Rename Conversation…", on_click: _menu_rename_active);
@@ -179,6 +320,12 @@ fn _build_app_menu() -> screen::AppMenu {
     // View menu
     m.add_command("View", "Toggle Sidebar", key: "s", on_click: _menu_toggle_sidebar, alt: true);
     m.add_command("View", "Toggle Inspector", key: "i", on_click: _menu_toggle_panel, alt: true);
+    m.add_separator("View");
+    m.add_command("View", "Inspector: Run", key: "1", on_click: _menu_tab_run);
+    m.add_command("View", "Inspector: Files", key: "2", on_click: _menu_tab_files);
+    m.add_command("View", "Inspector: Browser", key: "3", on_click: _menu_tab_browser);
+    m.add_command("View", "Inspector: Terminal", key: "4", on_click: _menu_tab_terminal);
+    m.add_command("View", "Inspector: Changes", key: "5", on_click: _menu_tab_changes);
 
     return m;
 }
@@ -208,6 +355,9 @@ struct DesktopShell {
     tray_sessions: vec::Vec[_TraySessionRef],
     sessions_sub: events::SignalSubscription[sessions::SessionsChange],
     status_sub: events::SignalSubscription[engine::EngineStateEvent],
+    wt_sub: events::Subscription,
+    export_sub: events::Subscription,
+    updates_sub: events::Subscription,
 }
 
 impl DesktopShell {
@@ -219,11 +369,29 @@ impl DesktopShell {
             tray_sessions: vec::new::[_TraySessionRef](),
             sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
             status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
+            wt_sub: events::Subscription::none(),
+            export_sub: events::Subscription::none(),
+            updates_sub: events::Subscription::none(),
         };
+    }
+
+    fn on_palette_worktree(ref this, _ev: str) {
+        start_new_worktree_run();
+    }
+
+    fn on_palette_export(ref this, _ev: str) {
+        _menu_export_markdown(0 as *u8, 0 as *u8);
+    }
+
+    fn on_palette_updates(ref this, _ev: str) {
+        updater::check_for_updates_async();
     }
 
     fn on_launch(ref this) {
         style::apply_appearance(prefs::appearance());
+        this.wt_sub = events::on(command_palette::EV_ACTION_WORKTREE, this.on_palette_worktree);
+        this.export_sub = events::on(command_palette::EV_ACTION_EXPORT_MD, this.on_palette_export);
+        this.updates_sub = events::on(command_palette::EV_ACTION_CHECK_UPDATES, this.on_palette_updates);
 
         // 1. Register global hotkey: Option-Space, falling back to Ctrl-Option-Space if taken.
         match hotkey::register("space", this.toggle_quick_ask, alt: true) {
@@ -555,6 +723,24 @@ fn run(require_consent: bool = false) -> i32 {
             min_height: quick_ask::PANEL_H,
             max_width: quick_ask::PANEL_W,
             max_height: quick_ask::PANEL_H,
+            bar: screen::Bar::Custom,
+            maximizable: false,
+            minimizable: false,
+            floating: true,
+            panel: true,
+        ),
+    );
+    app.window(
+        "command_palette",
+        command_palette::boxed,
+        chrome: screen::Chrome::new(
+            title: "Command Palette",
+            width: command_palette::PANEL_W,
+            height: command_palette::PANEL_H,
+            min_width: command_palette::PANEL_W,
+            min_height: command_palette::PANEL_H,
+            max_width: command_palette::PANEL_W,
+            max_height: command_palette::PANEL_H,
             bar: screen::Bar::Custom,
             maximizable: false,
             minimizable: false,

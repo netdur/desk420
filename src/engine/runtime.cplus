@@ -31,6 +31,7 @@ import "../acp/wire" as wire;
 import "../browser/mcp_server" as browser_mcp;
 import "../store/account" as account;
 import "../store/conversation" as conversation;
+import "../store/prefs" as prefs;
 import "../store/sessions" as sessions;
 import "./locate" as locate;
 import "./supervisor" as supervisor;
@@ -115,6 +116,81 @@ struct DeleteTarget {
     cwd: text::Text,
 }
 
+struct GitFileChange {
+    status: text::Text,
+    path: text::Text,
+    staged: bool,
+    unstaged: bool,
+}
+
+impl GitFileChange {
+    fn clone(this) -> GitFileChange {
+        return GitFileChange {
+            status: this.status.clone(),
+            path: this.path.clone(),
+            staged: this.staged,
+            unstaged: this.unstaged,
+        };
+    }
+}
+
+fn _is_scratch_cwd(cwd: str) -> bool {
+    return cwd == "" || cwd.contains(".desk420/chats");
+}
+
+fn parse_porcelain_changes(raw: str) -> vec::Vec[GitFileChange] {
+    var out: vec::Vec[GitFileChange] = vec::new::[GitFileChange]();
+    if raw == "" { return out; }
+    let lines: vec::Vec[str] = raw.split(separator: "\n");
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if let option::Option::Some(line) = lines.at(i) {
+            if line.count() >= (4 as usize) {
+                let x: u8 = match line.byte_at(0 as usize) {
+                    option::Option::Some(b) => b,
+                    option::Option::None => 32 as u8,
+                };
+                let y: u8 = match line.byte_at(1 as usize) {
+                    option::Option::Some(b) => b,
+                    option::Option::None => 32 as u8,
+                };
+                if let option::Option::Some(raw_p) = line.slice(from: 3 as usize, to: line.count()) {
+                    var clean_p: text::Text = text::from_str(raw_p.trim());
+                    if let option::Option::Some(arrow) = raw_p.find(" -> ") {
+                        if let option::Option::Some(rhs) = raw_p.slice(from: arrow +% (4 as usize), to: raw_p.count()) {
+                            clean_p = text::from_str(rhs.trim());
+                        }
+                    }
+                    if !clean_p.is_empty() {
+                        let is_untracked: bool = x == (63 as u8) && y == (63 as u8);
+                        let is_staged: bool = !is_untracked && x != (32 as u8);
+                        let is_unstaged: bool = is_untracked || y != (32 as u8);
+                        let st_code: str = if is_untracked {
+                            "?"
+                        } else if x == (68 as u8) || y == (68 as u8) {
+                            "D"
+                        } else if x == (65 as u8) || y == (65 as u8) {
+                            "A"
+                        } else if x == (82 as u8) {
+                            "R"
+                        } else {
+                            "M"
+                        };
+                        let _ = out.append(GitFileChange {
+                            status: text::from_str(st_code),
+                            path: clean_p,
+                            staged: is_staged,
+                            unstaged: is_unstaged,
+                        });
+                    }
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
 enum _EngineCmd {
     Start,
     Retry,
@@ -137,6 +213,12 @@ enum _EngineCmd {
     RefreshGitStatus,
     GitStageAll,
     GitDiscardAll,
+    GitStageFile(text::Text),
+    GitUnstageFile(text::Text),
+    GitDiscardFile(text::Text),
+    GitFilterFile(text::Text),
+    GitPush,
+    GitCreatePr,
     GitCommit(text::Text),
     RefreshAccount,
     RefreshAccountIfStale,
@@ -170,6 +252,7 @@ enum _UiUpdate {
     RewoundPrompt(text::Text),
     GitStatusUpdated(text::Text),
     GitDiffUpdated(text::Text, text::Text), // diff_text, action_status
+    GitFilesUpdated(text::Text, vec::Vec[GitFileChange]), // branch, changed files
     SessionRenamed(text::Text, text::Text),
     CliInfo(text::Text, text::Text), // path, version
     ClockTick,
@@ -266,6 +349,9 @@ struct _EngineState {
     queued_summary: text::Text,
     rewound_prompt: text::Text,
     git_summary: text::Text,
+    git_branch: text::Text,
+    git_files: vec::Vec[GitFileChange],
+    git_filter_path: text::Text,
     git_diff: text::Text,
     git_action_status: text::Text,
     cli_path: text::Text,
@@ -298,6 +384,9 @@ fn _ensure() {
             queued_summary: text::from_str(""),
             rewound_prompt: text::from_str(""),
             git_summary: text::from_str(""),
+            git_branch: text::from_str(""),
+            git_files: vec::new::[GitFileChange](),
+            git_filter_path: text::from_str(""),
             git_diff: text::from_str(""),
             git_action_status: text::from_str(""),
             cli_path: text::from_str(""),
@@ -624,6 +713,11 @@ fn _drain_ui_on_main(_ctx: *u8) {
                         _STATE.git_action_status = act_status;
                         _merge_change(pending_change, EngineChange::Git);
                     }
+                    _UiUpdate::GitFilesUpdated(branch, files) => {
+                        _STATE.git_branch = branch;
+                        _STATE.git_files = files;
+                        _merge_change(pending_change, EngineChange::Git);
+                    }
                     _UiUpdate::SessionRenamed(sid, new_title) => {
                         conversation::set_session_title(sid.view(), new_title.view());
                         _merge_change(pending_change, EngineChange::Session);
@@ -761,32 +855,48 @@ fn _run_git(cwd: str, args: vec::Vec[text::Text]) -> process::Output {
     return process::capture(argv);
 }
 
-fn _fetch_local_git_diff(cwd: str, ui_tx: channel::Channel[_UiUpdate], action_note: str) {
-    if cwd == "" || cwd.contains(".desk420/") {
+fn _fetch_local_git_diff(cwd: str, ui_tx: channel::Channel[_UiUpdate], action_note: str, filter_file: str = "") {
+    if _is_scratch_cwd(cwd) {
+        _queue_ui(ui_tx, _UiUpdate::GitFilesUpdated(text::from_str(""), vec::new::[GitFileChange]()));
         _post_ui(ui_tx, _UiUpdate::GitDiffUpdated(text::from_str(""), text::from_str(action_note)));
         return;
     }
-    var a_st: vec::Vec[text::Text] = vec::new::[text::Text]();
-    let _ = a_st.append(text::from_str("status"));
-    let _ = a_st.append(text::from_str("--short"));
-    let _ = a_st.append(text::from_str("--branch"));
-    let st_out: process::Output = _run_git(cwd, a_st);
-    if st_out.code != (0 as i32) {
+    var a_br: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a_br.append(text::from_str("rev-parse"));
+    let _ = a_br.append(text::from_str("--abbrev-ref"));
+    let _ = a_br.append(text::from_str("HEAD"));
+    let br_out: process::Output = _run_git(cwd, a_br);
+    if br_out.code != (0 as i32) {
+        _queue_ui(ui_tx, _UiUpdate::GitFilesUpdated(text::from_str(""), vec::new::[GitFileChange]()));
         _post_ui(ui_tx, _UiUpdate::GitDiffUpdated(text::from_str(""), text::from_str(action_note)));
         return;
     }
+    let branch_name: text::Text = text::from_str(br_out.stdout.view().trim());
+
+    var a_porc: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a_porc.append(text::from_str("status"));
+    let _ = a_porc.append(text::from_str("--porcelain=v1"));
+    let porc_out: process::Output = _run_git(cwd, a_porc);
+    let parsed_files: vec::Vec[GitFileChange] = if porc_out.code == (0 as i32) {
+        parse_porcelain_changes(porc_out.stdout.view())
+    } else {
+        vec::new::[GitFileChange]()
+    };
+    _queue_ui(ui_tx, _UiUpdate::GitFilesUpdated(branch_name, parsed_files));
 
     var buf: text::Text = text::new();
-    let st_trim: str = st_out.stdout.view().trim();
-    if !st_trim.is_empty() {
-        let _ = buf.append(st_trim);
-        let _ = buf.append("\n\n");
+    if filter_file != "" {
+        let _ = buf.append("# ${filter_file}\n\n");
     }
 
     var a_cached: vec::Vec[text::Text] = vec::new::[text::Text]();
     let _ = a_cached.append(text::from_str("diff"));
     let _ = a_cached.append(text::from_str("--cached"));
     let _ = a_cached.append(text::from_str("--no-color"));
+    if filter_file != "" {
+        let _ = a_cached.append(text::from_str("--"));
+        let _ = a_cached.append(text::from_str(filter_file));
+    }
     let c_out: process::Output = _run_git(cwd, a_cached);
     if c_out.code == (0 as i32) && !c_out.stdout.view().trim().is_empty() {
         let _ = buf.append("# Staged diff\n");
@@ -797,6 +907,10 @@ fn _fetch_local_git_diff(cwd: str, ui_tx: channel::Channel[_UiUpdate], action_no
     var a_diff: vec::Vec[text::Text] = vec::new::[text::Text]();
     let _ = a_diff.append(text::from_str("diff"));
     let _ = a_diff.append(text::from_str("--no-color"));
+    if filter_file != "" {
+        let _ = a_diff.append(text::from_str("--"));
+        let _ = a_diff.append(text::from_str(filter_file));
+    }
     let d_out: process::Output = _run_git(cwd, a_diff);
     if d_out.code == (0 as i32) && !d_out.stdout.view().trim().is_empty() {
         let _ = buf.append("# Unstaged diff\n");
@@ -972,7 +1086,11 @@ fn _is_safe_readonly_command(raw_cmd: str) -> bool {
         return true;
     }
 
-    return _is_allowlisted_readonly_bin(cmd0);
+    if _is_allowlisted_readonly_bin(cmd0) {
+        return true;
+    }
+    let extra: text::Text = prefs::custom_allowlist();
+    return prefs::matches_extra_allowlist(trimmed, extra.view());
 }
 
 // Approval policy:
@@ -1345,7 +1463,7 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                     _fetch_git_status(sups, current_sid.view(), ui_tx, cwd: pending_cwd.view());
                 }
                 _EngineCmd::GitStageAll => {
-                    if !pending_cwd.is_empty() && !pending_cwd.contains(".desk420/") {
+                    if !_is_scratch_cwd(pending_cwd.view()) {
                         var a: vec::Vec[text::Text] = vec::new::[text::Text]();
                         let _ = a.append(text::from_str("add"));
                         let _ = a.append(text::from_str("-A"));
@@ -1356,7 +1474,7 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                     }
                 }
                 _EngineCmd::GitDiscardAll => {
-                    if !pending_cwd.is_empty() && !pending_cwd.contains(".desk420/") {
+                    if !_is_scratch_cwd(pending_cwd.view()) {
                         var a: vec::Vec[text::Text] = vec::new::[text::Text]();
                         let _ = a.append(text::from_str("checkout"));
                         let _ = a.append(text::from_str("--"));
@@ -1367,8 +1485,95 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                         _fetch_git_status(sups, current_sid.view(), ui_tx);
                     }
                 }
+                _EngineCmd::GitStageFile(rel) => {
+                    if !_is_scratch_cwd(pending_cwd.view()) && !rel.is_empty() {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("add"));
+                        let _ = a.append(text::from_str("--"));
+                        let _ = a.append(rel.clone());
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: text::Text = if r.code == (0 as i32) { "Staged ${rel.view()}" } else { text::from_str("git add failed") };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note.view());
+                        _fetch_git_status(sups, current_sid.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::GitUnstageFile(rel) => {
+                    if !_is_scratch_cwd(pending_cwd.view()) && !rel.is_empty() {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("restore"));
+                        let _ = a.append(text::from_str("--staged"));
+                        let _ = a.append(text::from_str("--"));
+                        let _ = a.append(rel.clone());
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: text::Text = if r.code == (0 as i32) { "Unstaged ${rel.view()}" } else { text::from_str("git restore --staged failed") };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note.view());
+                        _fetch_git_status(sups, current_sid.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::GitDiscardFile(rel) => {
+                    if !_is_scratch_cwd(pending_cwd.view()) && !rel.is_empty() {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("checkout"));
+                        let _ = a.append(text::from_str("--"));
+                        let _ = a.append(rel.clone());
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: text::Text = if r.code == (0 as i32) { "Discarded ${rel.view()}" } else { text::from_str("git checkout failed") };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note.view());
+                        _fetch_git_status(sups, current_sid.view(), ui_tx);
+                    }
+                }
+                _EngineCmd::GitFilterFile(rel) => {
+                    _fetch_local_git_diff(pending_cwd.view(), ui_tx, "", filter_file: rel.view());
+                }
+                _EngineCmd::GitPush => {
+                    if !_is_scratch_cwd(pending_cwd.view()) {
+                        var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = a.append(text::from_str("push"));
+                        let r: process::Output = _run_git(pending_cwd.view(), a);
+                        let note: text::Text = if r.code == (0 as i32) {
+                            text::from_str("Pushed to remote")
+                        } else if !r.stderr.view().trim().is_empty() {
+                            text::from_str(r.stderr.view().trim())
+                        } else {
+                            text::from_str("git push failed")
+                        };
+                        _fetch_local_git_diff(pending_cwd.view(), ui_tx, note.view());
+                    }
+                }
+                _EngineCmd::GitCreatePr => {
+                    if !_is_scratch_cwd(pending_cwd.view()) {
+                        var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = argv.append(text::from_str("/usr/bin/env"));
+                        let _ = argv.append(text::from_str("gh"));
+                        let _ = argv.append(text::from_str("pr"));
+                        let _ = argv.append(text::from_str("create"));
+                        let _ = argv.append(text::from_str("--web"));
+                        let _ = argv.append(text::from_str("--fill"));
+                        // Run inside pending_cwd using `sh -c`? Never — spawn with `-R`? `gh` uses cwd; check via git remote URL fallback.
+                        var r_url: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = r_url.append(text::from_str("remote"));
+                        let _ = r_url.append(text::from_str("get-url"));
+                        let _ = r_url.append(text::from_str("origin"));
+                        let ro: process::Output = _run_git(pending_cwd.view(), r_url);
+                        var br_a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                        let _ = br_a.append(text::from_str("rev-parse"));
+                        let _ = br_a.append(text::from_str("--abbrev-ref"));
+                        let _ = br_a.append(text::from_str("HEAD"));
+                        let bo: process::Output = _run_git(pending_cwd.view(), br_a);
+                        let pr_url: text::Text = _github_compare_url(ro.stdout.view().trim(), bo.stdout.view().trim());
+                        if !pr_url.is_empty() {
+                            var open_a: vec::Vec[text::Text] = vec::new::[text::Text]();
+                            let _ = open_a.append(text::from_str("/usr/bin/open"));
+                            let _ = open_a.append(pr_url);
+                            let _ = process::spawn(open_a);
+                            _fetch_local_git_diff(pending_cwd.view(), ui_tx, "Opened PR compare page in browser");
+                        } else {
+                            _fetch_local_git_diff(pending_cwd.view(), ui_tx, "Could not resolve GitHub origin URL");
+                        }
+                    }
+                }
                 _EngineCmd::GitCommit(msg) => {
-                    if !pending_cwd.is_empty() && !pending_cwd.contains(".desk420/") && !msg.view().trim().is_empty() {
+                    if !_is_scratch_cwd(pending_cwd.view()) && !msg.view().trim().is_empty() {
                         var a: vec::Vec[text::Text] = vec::new::[text::Text]();
                         let _ = a.append(text::from_str("commit"));
                         let _ = a.append(text::from_str("-m"));
@@ -2084,8 +2289,60 @@ fn is_auto_approve() -> bool {
 }
 fn refresh_account() { _send_cmd(_EngineCmd::RefreshAccount); }
 fn refresh_git_status() { _send_cmd(_EngineCmd::RefreshGitStatus); }
+fn _github_compare_url(remote_url: str, branch: str) -> text::Text {
+    if remote_url == "" || branch == "" || branch == "HEAD" { return text::from_str(""); }
+    var base: text::Text = text::from_str("");
+    if remote_url.has_prefix("git@github.com:") {
+        if let option::Option::Some(rest) = remote_url.slice(from: 15 as usize, to: remote_url.count()) {
+            base = "https://github.com/${rest}";
+        }
+    } else if remote_url.has_prefix("https://github.com/") || remote_url.has_prefix("http://github.com/") {
+        base = text::from_str(remote_url);
+    } else {
+        return text::from_str("");
+    }
+    var clean_base: text::Text = base.clone();
+    if base.view().has_suffix(".git") {
+        if let option::Option::Some(stripped) = base.view().slice(from: 0 as usize, to: base.count() -% (4 as usize)) {
+            clean_base = text::from_str(stripped);
+        }
+    }
+    return "${clean_base.view()}/compare/${branch}?expand=1";
+}
+
 fn git_stage_all() { _send_cmd(_EngineCmd::GitStageAll); }
 fn git_discard_all() { _send_cmd(_EngineCmd::GitDiscardAll); }
+fn git_stage_file(rel: str) { _send_cmd(_EngineCmd::GitStageFile(text::from_str(rel))); }
+fn git_unstage_file(rel: str) { _send_cmd(_EngineCmd::GitUnstageFile(text::from_str(rel))); }
+fn git_discard_file(rel: str) { _send_cmd(_EngineCmd::GitDiscardFile(text::from_str(rel))); }
+fn git_push() { _send_cmd(_EngineCmd::GitPush); }
+fn git_create_pr() { _send_cmd(_EngineCmd::GitCreatePr); }
+fn git_set_filter_file(rel: str) {
+    _ensure();
+    _STATE.git_filter_path = text::from_str(rel);
+    _emit_change(EngineChange::Git);
+    _send_cmd(_EngineCmd::GitFilterFile(text::from_str(rel)));
+}
+fn git_filter_path() -> text::Text {
+    _ensure();
+    return _STATE.git_filter_path.clone();
+}
+fn git_branch() -> text::Text {
+    _ensure();
+    return _STATE.git_branch.clone();
+}
+fn git_files() -> vec::Vec[GitFileChange] {
+    _ensure();
+    var out: vec::Vec[GitFileChange] = vec::new::[GitFileChange]();
+    var i: usize = 0 as usize;
+    while i < _STATE.git_files.count() {
+        if let option::Option::Some(fp) = _STATE.git_files.at_ptr(i) {
+            let _ = out.append((*fp).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
 fn git_commit(msg: str) { _send_cmd(_EngineCmd::GitCommit(text::from_str(msg))); }
 
 fn git_diff_text() -> text::Text {
@@ -2255,4 +2512,22 @@ fn session_approval_modes_are_isolated() {
     _remove_session_mode(modes, "sess-a");
     assert _get_session_mode(modes, "sess-a", ApprovalMode::Ask) == ApprovalMode::Ask;
     assert _get_session_mode(modes, "sess-b", ApprovalMode::Ask) == ApprovalMode::Custom;
+}
+
+#[test]
+fn porcelain_parser_and_github_compare_url_work() {
+    let sample: str = " M src/app.cplus\nA  src/new.cplus\n?? notes.txt\nR  old.txt -> renamed.txt\n";
+    let files: vec::Vec[GitFileChange] = parse_porcelain_changes(sample);
+    assert files.count() == (4 as usize);
+    guard let option::Option::Some(f0) = files.at_ptr(0 as usize) else { assert false; return; };
+    assert (*f0).status.equals("M") && (*f0).path.equals("src/app.cplus") && !(*f0).staged && (*f0).unstaged;
+    guard let option::Option::Some(f1) = files.at_ptr(1 as usize) else { assert false; return; };
+    assert (*f1).status.equals("A") && (*f1).staged && !(*f1).unstaged;
+    guard let option::Option::Some(f2) = files.at_ptr(2 as usize) else { assert false; return; };
+    assert (*f2).status.equals("?") && !(*f2).staged && (*f2).unstaged;
+    guard let option::Option::Some(f3) = files.at_ptr(3 as usize) else { assert false; return; };
+    assert (*f3).status.equals("R") && (*f3).path.equals("renamed.txt");
+
+    assert _github_compare_url("git@github.com:netdur/desk420.git", "feat/x").equals("https://github.com/netdur/desk420/compare/feat/x?expand=1");
+    assert _github_compare_url("https://github.com/netdur/desk420.git", "main").equals("https://github.com/netdur/desk420/compare/main?expand=1");
 }

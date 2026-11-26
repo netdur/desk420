@@ -1,0 +1,548 @@
+// src/ui/command_palette.cplus — Spotlight-style Command Palette (Cmd-K).
+//
+// Searches across built-in actions, saved project folders, and conversations
+// with live filtering, arrow-key navigation, Return to execute, and Esc to close.
+
+import "events/events" as events;
+import "facet/component" as component;
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/gestures" as gestures;
+import "facet/icons" as icons;
+import "facet/label" as label;
+import "facet/mount" as mount;
+import "facet/nav" as nav;
+import "facet/obs_vec" as obs_vec;
+import "facet/relist" as m_relist;
+import "facet/screen" as screen;
+import "facet/services" as services;
+import "facet/symbol" as symbol;
+import "facet/text_field" as text_field;
+import "facet/vocabulary" as vocab;
+import "facet/window" as window;
+import "facet_runtime/runtime" as runtime;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../engine/runtime" as engine;
+import "../store/prefs" as prefs;
+import "../store/sessions" as sessions;
+import "./chat_screen" as chat_screen;
+import "./home_view" as home_view;
+import "./panels" as panels;
+import "./pickers" as pickers;
+import "./style" as style;
+
+const PANEL_W: f64 = 580.0f64;
+const PANEL_H: f64 = 420.0f64;
+
+const EV_PALETTE_REFRESH: str = "desk420.palette.refresh";
+const EV_ACTION_WORKTREE: str = "desk420.palette.worktree";
+const EV_ACTION_EXPORT_MD: str = "desk420.palette.export_md";
+const EV_ACTION_CHECK_UPDATES: str = "desk420.palette.check_updates";
+
+enum ItemKind {
+    Action,
+    Project,
+    Conversation,
+}
+
+struct PaletteItem {
+    kind: ItemKind,
+    id: text::Text,
+    title: text::Text,
+    subtitle: text::Text,
+    shortcut: text::Text,
+    cwd: text::Text,
+}
+
+impl PaletteItem {
+    fn clone(this) -> PaletteItem {
+        return PaletteItem {
+            kind: this.kind,
+            id: this.id.clone(),
+            title: this.title.clone(),
+            subtitle: this.subtitle.clone(),
+            shortcut: this.shortcut.clone(),
+            cwd: this.cwd.clone(),
+        };
+    }
+}
+
+fn _push_action(ref out: vec::Vec[PaletteItem], id: str, title: str, subtitle: str, shortcut: str = "") {
+    let _ = out.append(PaletteItem {
+        kind: ItemKind::Action,
+        id: text::from_str(id),
+        title: text::from_str(title),
+        subtitle: text::from_str(subtitle),
+        shortcut: text::from_str(shortcut),
+        cwd: text::from_str(""),
+    });
+}
+
+fn _matches_query(query_low: str, title: str, subtitle: str) -> bool {
+    if query_low == "" { return true; }
+    let t_low: text::Text = text::from_str(title).lowercased();
+    if t_low.contains(query_low) { return true; }
+    let s_low: text::Text = text::from_str(subtitle).lowercased();
+    return s_low.contains(query_low);
+}
+
+fn filter_items(all: vec::Vec[PaletteItem], raw_query: str) -> vec::Vec[PaletteItem] {
+    let q_low: text::Text = text::from_str(raw_query.trim()).lowercased();
+    let qv: str = q_low.view();
+    var out: vec::Vec[PaletteItem] = vec::new::[PaletteItem]();
+    var i: usize = 0 as usize;
+    while i < all.count() {
+        if let option::Option::Some(ip) = all.at_ptr(i) {
+            if _matches_query(qv, (*ip).title.view(), (*ip).subtitle.view()) {
+                let _ = out.append((*ip).clone());
+                if out.count() >= (40 as usize) { break; }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
+fn _collect_all_items() -> vec::Vec[PaletteItem] {
+    var out: vec::Vec[PaletteItem] = vec::new::[PaletteItem]();
+
+    // 1. Core commands
+    _push_action(out, "new_chat", "New Chat", "Start a fresh conversation", shortcut: "⌘N");
+    _push_action(out, "new_worktree", "New Worktree Run…", "Create an isolated git worktree + branch", shortcut: "⌘⇧N");
+    _push_action(out, "add_project", "Add Project Folder…", "Link a folder to your sidebar", shortcut: "⌘O");
+    _push_action(out, "tab_run", "Inspector: Run", "Show run timeline", shortcut: "⌘1");
+    _push_action(out, "tab_files", "Inspector: Files", "Browse and preview project files", shortcut: "⌘2");
+    _push_action(out, "tab_browser", "Inspector: Browser", "Open built-in isolated browser", shortcut: "⌘3");
+    _push_action(out, "tab_terminal", "Inspector: Terminal", "Focus interactive PTY shell", shortcut: "⌘4");
+    _push_action(out, "tab_changes", "Inspector: Changes", "Review git diff, stage, commit, push, PR", shortcut: "⌘5");
+    _push_action(out, "open_editor", "Open Project in Editor", "Launch current folder in your configured editor");
+    _push_action(out, "paste_image", "Paste Image as Attachment", "Attach screenshot from clipboard", shortcut: "⌘⇧V");
+    _push_action(out, "export_md", "Export Conversation as Markdown…", "Save transcript to a .md file", shortcut: "⌘⇧E");
+    _push_action(out, "toggle_sidebar", "Toggle Sidebar", "Show or hide left sidebar", shortcut: "⌥⌘S");
+    _push_action(out, "toggle_inspector", "Toggle Inspector", "Show or hide right panel", shortcut: "⌥⌘I");
+    _push_action(out, "mode_ask", "Approval Mode: Ask", "Prompt before every tool call");
+    _push_action(out, "mode_custom", "Approval Mode: Custom (Read-only)", "Auto-approve allowlisted read-only tools");
+    _push_action(out, "mode_auto", "Approval Mode: Auto-approve", "Auto-approve all tool calls in this chat");
+    _push_action(out, "check_updates", "Check for Updates…", "Check GitHub Releases for a newer Desk420");
+    _push_action(out, "settings", "Settings…", "Appearance, Editor, Approvals, Agent Access", shortcut: "⌘,");
+
+    // 2. Projects
+    let projs: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+    var pi: usize = 0 as usize;
+    while pi < projs.count() {
+        if let option::Option::Some(pp) = projs.at_ptr(pi) {
+            let _ = out.append(PaletteItem {
+                kind: ItemKind::Project,
+                id: (*pp).path.clone(),
+                title: (*pp).name.clone(),
+                subtitle: (*pp).path.clone(),
+                shortcut: text::from_str("Project"),
+                cwd: (*pp).path.clone(),
+            });
+        }
+        pi = pi +% (1 as usize);
+    }
+
+    // 3. Conversations
+    let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+    var ri: usize = 0 as usize;
+    while ri < rows.count() {
+        if let option::Option::Some(rp) = rows.at_ptr(ri) {
+            let t: text::Text = if (*rp).title.is_empty() { text::from_str("Untitled run") } else { (*rp).title.clone() };
+            let sub: text::Text = if (*rp).cwd.is_empty() || (*rp).cwd.contains(".desk420/chats") {
+                text::from_str("General")
+            } else {
+                sessions::folder_label((*rp).cwd.view())
+            };
+            let _ = out.append(PaletteItem {
+                kind: ItemKind::Conversation,
+                id: (*rp).session_id.clone(),
+                title: t,
+                subtitle: sub,
+                shortcut: text::from_str("Chat"),
+                cwd: (*rp).cwd.clone(),
+            });
+        }
+        ri = ri +% (1 as usize);
+    }
+
+    return out;
+}
+
+fn place_on_active_screen(w: window::Window) {
+    let s: vocab::Rect = window::active_screen_frame();
+    if s.width <= 0.0f64 { return; }
+    w.set_frame(vocab::Rect {
+        x: s.x + (s.width - PANEL_W) / 2.0f64,
+        y: s.y + (s.height - PANEL_H) * 0.58f64,
+        width: PANEL_W,
+        height: PANEL_H,
+    });
+}
+
+fn toggle() {
+    if let option::Option::Some(w) = runtime::app().find_window("command_palette") {
+        if w.is_visible() && w.is_active() {
+            let _h: bool = w.hide();
+            return;
+        }
+        place_on_active_screen(w);
+        events::emit(EV_PALETTE_REFRESH);
+        let _a: bool = w.activate();
+    } else {
+        let _w = runtime::app().open_window("command_palette");
+    }
+}
+
+struct CommandPaletteScreen {
+    context: nav::Context,
+    blur: services::Cancellable,
+    refresh_sub: events::Subscription,
+    all_items: vec::Vec[PaletteItem],
+    filtered: obs_vec::ObsVec[PaletteItem],
+    selected: usize,
+    epoch: u64,
+}
+
+impl CommandPaletteScreen {
+    fn new() -> CommandPaletteScreen {
+        return CommandPaletteScreen {
+            context: nav::Context::none(),
+            blur: services::Cancellable::none(),
+            refresh_sub: events::Subscription::none(),
+            all_items: vec::new::[PaletteItem](),
+            filtered: obs_vec::ObsVec[PaletteItem]::new(),
+            selected: 0 as usize,
+            epoch: 0 as u64,
+        };
+    }
+
+    fn _hide(ref this) {
+        if let option::Option::Some(w) = runtime::app().find_window("command_palette") {
+            let _h: bool = w.hide();
+        }
+    }
+
+    fn _reload(ref this, query: str) {
+        var next: vec::Vec[PaletteItem] = filter_items(this.all_items, query);
+        this.epoch = this.epoch +% (1 as u64);
+        let fv: *vec::Vec[PaletteItem] = this.filtered.as_vec_ptr();
+        (*fv).remove_all();
+        for item in next.drain() {
+            let _ = (*fv).append(item);
+        }
+        if this.selected >= this.filtered.count() {
+            this.selected = 0 as usize;
+        }
+        this.filtered.note_reload();
+    }
+
+    fn _prepare_open(ref this) {
+        this.all_items = _collect_all_items();
+        this.selected = 0 as usize;
+        if let option::Option::Some(tf) = text_field::find("palette:query", within: this.context.root()) {
+            let _tf: text_field::TextField = tf.set_text("").focus();
+        }
+        this._reload("");
+    }
+
+    fn _execute_item(ref this, item: PaletteItem) {
+        this._hide();
+        let _front: bool = runtime::app().activate();
+        let _w = runtime::app().open_window("home");
+        match item.kind {
+            ItemKind::Conversation => {
+                engine::load_session(item.id.view(), item.cwd.view(), title: item.title.view());
+            }
+            ItemKind::Project => {
+                sessions::set_selected_project(item.cwd.view());
+                engine::new_chat(cwd: item.cwd.view());
+            }
+            ItemKind::Action => {
+                let id: str = item.id.view();
+                if id == "new_chat" {
+                    let proj: text::Text = sessions::selected_project();
+                    engine::new_chat(cwd: proj.view());
+                } else if id == "new_worktree" {
+                    events::emit(EV_ACTION_WORKTREE);
+                } else if id == "add_project" {
+                    pickers::choose_and_open_project();
+                } else if id == "tab_run" {
+                    chat_screen::select_tab("run");
+                } else if id == "tab_files" {
+                    chat_screen::select_tab("files");
+                } else if id == "tab_browser" {
+                    chat_screen::select_tab("browser");
+                } else if id == "tab_terminal" {
+                    chat_screen::select_tab("terminal");
+                } else if id == "tab_changes" {
+                    chat_screen::select_tab("preview");
+                } else if id == "open_editor" {
+                    let cwd: text::Text = engine::active_cwd();
+                    if !cwd.is_empty() && !cwd.contains(".desk420/chats") {
+                        prefs::open_in_editor(cwd.view());
+                    }
+                } else if id == "paste_image" {
+                    if engine::active_session_id().is_empty() {
+                        home_view::paste_clipboard_image();
+                    } else {
+                        chat_screen::paste_clipboard_image();
+                    }
+                } else if id == "export_md" {
+                    events::emit(EV_ACTION_EXPORT_MD);
+                } else if id == "toggle_sidebar" {
+                    panels::toggle_sidebar();
+                } else if id == "toggle_inspector" {
+                    panels::toggle_panel();
+                } else if id == "mode_ask" {
+                    engine::set_approval_mode(engine::ApprovalMode::Ask);
+                } else if id == "mode_custom" {
+                    engine::set_approval_mode(engine::ApprovalMode::Custom);
+                } else if id == "mode_auto" {
+                    engine::set_approval_mode(engine::ApprovalMode::AutoApprove);
+                } else if id == "check_updates" {
+                    events::emit(EV_ACTION_CHECK_UPDATES);
+                } else if id == "settings" {
+                    let _sw = runtime::app().open_window("settings");
+                }
+            }
+        }
+    }
+
+    fn on_query_change(ref this, _sender: *u8) {
+        guard let option::Option::Some(tf) = text_field::find("palette:query", within: this.context.root()) else { return; };
+        let q: text::Text = text::from_str(tf.text());
+        this.selected = 0 as usize;
+        this._reload(q.view());
+    }
+
+    fn on_submit(ref this, _sender: *u8) {
+        guard let option::Option::Some(ip) = this.filtered.at_ptr(this.selected) else { return; };
+        let item: PaletteItem = (*ip).clone();
+        this._execute_item(item);
+    }
+
+    fn on_row_click(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return false; };
+        guard let option::Option::Some(ip) = this.filtered.at_ptr(idx) else { return false; };
+        let item: PaletteItem = (*ip).clone();
+        this._execute_item(item);
+        return true;
+    }
+
+    fn on_key(ref this, event: *u8) -> bool {
+        let k: i64 = gestures::key_named(event);
+        if k == gestures::key_escape() {
+            this._hide();
+            return true;
+        }
+        let n: usize = this.filtered.count();
+        if n == (0 as usize) { return false; }
+        if k == gestures::key_arrow_down() {
+            this.selected = if this.selected +% (1 as usize) < n { this.selected +% (1 as usize) } else { 0 as usize };
+            this.epoch = this.epoch +% (1 as u64);
+            this.filtered.note_reload();
+            return true;
+        }
+        if k == gestures::key_arrow_up() {
+            this.selected = if this.selected > (0 as usize) { this.selected -% (1 as usize) } else { n -% (1 as usize) };
+            this.epoch = this.epoch +% (1 as u64);
+            this.filtered.note_reload();
+            return true;
+        }
+        return false;
+    }
+
+    fn on_blur(ref this) {
+        this._hide();
+    }
+
+    fn on_refresh_event(ref this, _ev: str) {
+        this._prepare_open();
+    }
+
+    fn row_height_at(ref this, _index: usize, _width: f64) -> f64 {
+        return 42.0f64;
+    }
+
+    fn build_row(ref this, index: usize) -> core::Node {
+        let g: u64 = this.epoch;
+        let outer_key: text::Text = "palette:row:${g}:${index}";
+        guard let option::Option::Some(ip) = this.filtered.at_ptr(index) else {
+            return @ui { column(key: outer_key.view()) {} };
+        };
+        let title: text::Text = (*ip).title.clone();
+        let sub: text::Text = (*ip).subtitle.clone();
+        let sc: text::Text = (*ip).shortcut.clone();
+        let icon_id: u32 = match (*ip).kind {
+            ItemKind::Action => icons::bolt,
+            ItemKind::Project => icons::folder,
+            ItemKind::Conversation => icons::chat_bubble_outline,
+        };
+        let is_sel: bool = index == this.selected;
+        let bg: vocab::Color = if is_sel { style::chip() } else { vocab::Color::clear() };
+        let ic_col: vocab::Color = if is_sel { style::lime_text() } else { style::muted() };
+        let click_key: text::Text = "palette:item:${index}";
+        return @ui {
+            column(key: outer_key.view()) {
+                hstack(key: click_key.view()) {
+                    symbol(icon_id, size: 15.0f64, color: ic_col)
+                        .shrink(0.0f64)
+                        .set_input_transparent(true)
+                    column {
+                        label(title.view(),
+                        font_size: 13.0f64,
+                        font_weight: vocab::FontWeight::Medium,
+                        text_color: style::ink(),
+                        line_break: vocab::LineBreak::TailTruncation,
+                        max_lines: 1 as i64)
+                            .set_input_transparent(true)
+                        if !sub.is_empty() {
+                            label(sub.view(),
+                            font_size: 11.0f64,
+                            text_color: style::faint(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                                .set_input_transparent(true)
+                        }
+                    }
+                    .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                        .gap(1.0f64)
+                        .set_input_transparent(true)
+                    if !sc.is_empty() {
+                        label(sc.view(),
+                        font_size: 11.0f64,
+                        font_weight: vocab::FontWeight::Medium,
+                        text_color: style::muted())
+                            .shrink(0.0f64)
+                            .set_input_transparent(true)
+                    }
+                }
+                .height(38.0f64)
+                    .align(flex::Align::Center)
+                    .gap(10.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                    .set_background_color(bg)
+                    .set_corner_radius(vocab::Corners::all(8.0f64))
+                    .gesture(on_click: this.on_row_click)
+            }
+            .height(42.0f64)
+                .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                .padding_edge(flex::Edge::Vertical, 2.0f64)
+        };
+    }
+}
+
+impl CommandPaletteScreen: component::Component {
+    fn build(ref this) -> core::Node {
+        var root: core::Node = @ui {
+            bordered(key: "palette:shell",
+            stroke: vocab::Brush::solid(style::hairline()),
+            stroke_width: 1.0f64,
+            stroke_shape: vocab::Shape::rounded(14.0f64)) {
+                column {
+                    hstack {
+                        symbol(icons::search, size: 18.0f64, color: style::lime_text())
+                            .shrink(0.0f64)
+                        text_field("", key: "palette:query",
+                        placeholder: "Jump to conversation, project, or command…",
+                        font_size: 16.0f64,
+                        bordered: false,
+                        on_text_changed: this.on_query_change,
+                        on_submit: this.on_submit)
+                            .gesture(on_key: this.on_key)
+                            .grow(1.0f64)
+                            .shrink(1.0f64)
+                    }
+                    .align(flex::Align::Center)
+                        .gap(10.0f64)
+                        .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                        .padding_edge(flex::Edge::Vertical, 12.0f64)
+                        .shrink(0.0f64)
+
+                    style::rule()
+
+                    relist(this.filtered,
+                    key: "palette:list",
+                    builder: this.build_row,
+                    row_height_at: this.row_height_at)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+
+                    style::rule()
+
+                    hstack {
+                        label("↑↓ navigate · Return run · Esc close",
+                        font_size: 11.0f64,
+                        text_color: style::faint())
+                        spacer().grow(1.0f64)
+                        label("⌘K",
+                        font_size: 11.0f64,
+                        font_weight: vocab::FontWeight::Medium,
+                        text_color: style::muted())
+                    }
+                    .align(flex::Align::Center)
+                        .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                        .padding_edge(flex::Edge::Vertical, 7.0f64)
+                        .shrink(0.0f64)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .set_background_color(style::canvas())
+                .set_corner_radius(vocab::Corners::all(14.0f64))
+        };
+        root.set_safe_area(vocab::SafeArea::None);
+        return root;
+    }
+}
+
+impl CommandPaletteScreen: component::Lifecycle {
+    fn on_attach(ref this, why: component::Attach) {
+        if why != component::Attach::Mount { return; }
+        this.refresh_sub = events::on(EV_PALETTE_REFRESH, this.on_refresh_event);
+        this._prepare_open();
+    }
+}
+
+impl CommandPaletteScreen: screen::Screen {
+    fn on_context(ref this, context: nav::Context) { this.context = context; }
+
+    fn on_navigation(ref this, _state: nav::State) {
+        guard let option::Option::Some(w) = runtime::app().find_window("command_palette") else { return; };
+        if !this.blur.pending() {
+            this.blur = w.on_inactive(this.on_blur);
+        }
+        place_on_active_screen(w);
+        this._prepare_open();
+    }
+}
+
+fn boxed() -> screen::ScreenBox {
+    return screen::screen_box::[CommandPaletteScreen](CommandPaletteScreen::new());
+}
+
+#[test]
+fn palette_filter_matches_case_insensitively() {
+    var all: vec::Vec[PaletteItem] = vec::new::[PaletteItem]();
+    _push_action(all, "tab_terminal", "Inspector: Terminal", "Focus interactive PTY shell", shortcut: "⌘4");
+    _push_action(all, "new_worktree", "New Worktree Run…", "Create an isolated git worktree + branch", shortcut: "⌘⇧N");
+
+    let r1: vec::Vec[PaletteItem] = filter_items(all, "pty");
+    assert r1.count() == (1 as usize);
+    guard let option::Option::Some(p0) = r1.at_ptr(0 as usize) else { assert false; return; };
+    assert (*p0).id.equals("tab_terminal");
+
+    let r2: vec::Vec[PaletteItem] = filter_items(all, "WORKTREE");
+    assert r2.count() == (1 as usize);
+    let r3: vec::Vec[PaletteItem] = filter_items(all, "");
+    assert r3.count() == (2 as usize);
+}

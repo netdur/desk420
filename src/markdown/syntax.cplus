@@ -1,0 +1,342 @@
+// src/markdown/syntax.cplus — lightweight adaptive syntax highlighter for
+// fenced code blocks in the transcript.
+//
+// Produces `vocab::Spans` using adaptive light/dark colors so highlights update
+// automatically when macOS switches appearance.
+
+import "facet/theme" as ftheme;
+import "facet/vocabulary" as vocab;
+import "stdlib/option" as option;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+import "../ui/style" as style;
+
+const MAX_HIGHLIGHT_BYTES: usize = 16000 as usize;
+
+fn _c(lr: f64, lg: f64, lb: f64, dr: f64, dg: f64, db: f64) -> vocab::Color {
+    return vocab::Color::adaptive(
+        vocab::Color::rgba(lr, lg, lb, 1.0f64),
+        vocab::Color::rgba(dr, dg, db, 1.0f64),
+    );
+}
+
+fn _col_comment() -> vocab::Color { return style::muted(); }
+fn _col_string() -> vocab::Color { return _c(0.14f64, 0.48f64, 0.20f64, 0.64f64, 0.86f64, 0.50f64); }
+fn _col_number() -> vocab::Color { return _c(0.72f64, 0.34f64, 0.05f64, 0.95f64, 0.70f64, 0.42f64); }
+fn _col_keyword() -> vocab::Color { return _c(0.56f64, 0.16f64, 0.74f64, 0.82f64, 0.60f64, 0.98f64); }
+fn _col_type() -> vocab::Color { return _c(0.06f64, 0.44f64, 0.68f64, 0.46f64, 0.80f64, 0.96f64); }
+fn _col_attr() -> vocab::Color { return _c(0.58f64, 0.44f64, 0.04f64, 0.92f64, 0.84f64, 0.46f64); }
+
+fn _byte(s: str, i: usize) -> u8 {
+    return match s.byte_at(i) {
+        option::Option::Some(b) => b,
+        option::Option::None => 0 as u8,
+    };
+}
+
+fn _is_digit(b: u8) -> bool { return b >= (48 as u8) && b <= (57 as u8); }
+fn _is_upper(b: u8) -> bool { return b >= (65 as u8) && b <= (90 as u8); }
+fn _is_lower(b: u8) -> bool { return b >= (97 as u8) && b <= (122 as u8); }
+fn _is_ident_start(b: u8) -> bool { return _is_upper(b) || _is_lower(b) || b == (95 as u8); }
+fn _is_ident_cont(b: u8) -> bool { return _is_ident_start(b) || _is_digit(b); }
+fn _is_hex(b: u8) -> bool {
+    return _is_digit(b) || (b >= (65 as u8) && b <= (70 as u8)) || (b >= (97 as u8) && b <= (102 as u8));
+}
+
+fn _lang_uses_hash_comments(lang_low: str) -> bool {
+    return lang_low == "py" || lang_low == "python"
+        || lang_low == "sh" || lang_low == "bash" || lang_low == "zsh" || lang_low == "shell"
+        || lang_low == "rb" || lang_low == "ruby"
+        || lang_low == "yaml" || lang_low == "yml"
+        || lang_low == "toml" || lang_low == "dockerfile" || lang_low == "makefile"
+        || lang_low == "r" || lang_low == "perl" || lang_low == "conf";
+}
+
+fn _is_keyword(w: str) -> bool {
+    return w == "fn" || w == "let" || w == "var" || w == "const" || w == "static"
+        || w == "struct" || w == "enum" || w == "impl" || w == "trait" || w == "type"
+        || w == "import" || w == "export" || w == "from" || w == "as" || w == "use"
+        || w == "if" || w == "else" || w == "elif" || w == "match" || w == "switch"
+        || w == "case" || w == "default" || w == "for" || w == "in" || w == "while"
+        || w == "loop" || w == "break" || w == "continue" || w == "return" || w == "guard"
+        || w == "ref" || w == "take" || w == "mut" || w == "pub" || w == "private"
+        || w == "public" || w == "internal" || w == "extern" || w == "unsafe" || w == "defer"
+        || w == "async" || w == "await" || w == "yield" || w == "try" || w == "catch"
+        || w == "except" || w == "finally" || w == "throw" || w == "raise" || w == "with"
+        || w == "def" || w == "class" || w == "interface" || w == "extends" || w == "implements"
+        || w == "function" || w == "new" || w == "this" || w == "self" || w == "super"
+        || w == "true" || w == "false" || w == "null" || w == "nil" || w == "None"
+        || w == "True" || w == "False" || w == "undefined" || w == "void" || w == "where"
+        || w == "func" || w == "package" || w == "go" || w == "chan" || w == "select"
+        || w == "do" || w == "then" || w == "fi" || w == "done" || w == "esac"
+        || w == "assert" || w == "pass" || w == "lambda" || w == "and" || w == "or" || w == "not"
+        || w == "SELECT" || w == "FROM" || w == "WHERE" || w == "INSERT" || w == "UPDATE"
+        || w == "DELETE" || w == "JOIN" || w == "CREATE" || w == "TABLE" || w == "ORDER" || w == "BY";
+}
+
+fn _is_builtin_type(w: str) -> bool {
+    return w == "bool" || w == "str" || w == "char" || w == "int" || w == "float" || w == "double"
+        || w == "i8" || w == "i16" || w == "i32" || w == "i64" || w == "isize"
+        || w == "u8" || w == "u16" || w == "u32" || w == "u64" || w == "usize"
+        || w == "f32" || w == "f64" || w == "string" || w == "number" || w == "boolean"
+        || w == "any" || w == "never" || w == "unknown" || w == "size_t" || w == "uint8_t"
+        || w == "Some" || w == "Ok" || w == "Err";
+}
+
+fn _push_span(ref spans: vocab::Spans, txt: str, font_size: f64, col: vocab::Color,
+weight: vocab::FontWeight = vocab::FontWeight::Regular, italic: bool = false) {
+    if txt == "" { return; }
+    let _ = spans.add(vocab::TextSpan::of(
+        txt,
+        font_size: font_size,
+        font_weight: weight,
+        italic: italic,
+        font_family: ftheme::MONOSPACE,
+        color: col,
+    ));
+}
+
+fn _highlight_diff_code(src: str, font_size: f64) -> vocab::Spans {
+    var spans: vocab::Spans = vocab::Spans::new();
+    let lines: vec::Vec[str] = src.split(separator: "\n");
+    var i: usize = 0 as usize;
+    while i < lines.count() {
+        if i > (0 as usize) {
+            _push_span(spans, "\n", font_size, style::ink());
+        }
+        if let option::Option::Some(line) = lines.at(i) {
+            if line.has_prefix("+++") || line.has_prefix("---") || line.has_prefix("@@") || line.has_prefix("diff ") {
+                _push_span(spans, line, font_size, _col_type(), weight: vocab::FontWeight::Semibold);
+            } else if line.has_prefix("+") {
+                _push_span(spans, line, font_size, _col_string());
+            } else if line.has_prefix("-") {
+                _push_span(spans, line, font_size, style::danger());
+            } else {
+                _push_span(spans, line, font_size, style::ink());
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return spans;
+}
+
+fn highlight_code(src: str, lang: str, font_size: f64) -> vocab::Spans {
+    let lang_low: text::Text = text::from_str(lang.trim()).lowercased();
+    let lv: str = lang_low.view();
+    if lv == "diff" || lv == "patch" {
+        return _highlight_diff_code(src, font_size);
+    }
+
+    var spans: vocab::Spans = vocab::Spans::new();
+    let total: usize = src.count();
+    let limit: usize = if total > MAX_HIGHLIGHT_BYTES { MAX_HIGHLIGHT_BYTES } else { total };
+    let hash_comments: bool = _lang_uses_hash_comments(lv);
+
+    var i: usize = 0 as usize;
+    var plain_start: usize = 0 as usize;
+
+    while i < limit {
+        let b: u8 = _byte(src, i);
+        let next_b: u8 = if i +% (1 as usize) < limit { _byte(src, i +% (1 as usize)) } else { 0 as u8 };
+
+        // Line comment: // ...
+        if b == (47 as u8) && next_b == (47 as u8) {
+            if plain_start < i {
+                if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                    _push_span(spans, pl, font_size, style::ink());
+                }
+            }
+            let start: usize = i;
+            while i < limit && _byte(src, i) != (10 as u8) { i = i +% (1 as usize); }
+            if let option::Option::Some(cm) = src.slice(from: start, to: i) {
+                _push_span(spans, cm, font_size, _col_comment(), italic: true);
+            }
+            plain_start = i;
+            continue;
+        }
+
+        // Block comment: /* ... */
+        if b == (47 as u8) && next_b == (42 as u8) {
+            if plain_start < i {
+                if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                    _push_span(spans, pl, font_size, style::ink());
+                }
+            }
+            let start: usize = i;
+            i = i +% (2 as usize);
+            while i +% (1 as usize) < limit {
+                if _byte(src, i) == (42 as u8) && _byte(src, i +% (1 as usize)) == (47 as u8) {
+                    i = i +% (2 as usize);
+                    break;
+                }
+                i = i +% (1 as usize);
+            }
+            if i == limit -% (1 as usize) { i = limit; }
+            if let option::Option::Some(cm) = src.slice(from: start, to: i) {
+                _push_span(spans, cm, font_size, _col_comment(), italic: true);
+            }
+            plain_start = i;
+            continue;
+        }
+
+        // Hash comment (# ...) for shell/python/yaml/toml, or attribute (#[...] / #intrinsic / @decorator)
+        if b == (35 as u8) {
+            if hash_comments {
+                if plain_start < i {
+                    if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                        _push_span(spans, pl, font_size, style::ink());
+                    }
+                }
+                let start: usize = i;
+                while i < limit && _byte(src, i) != (10 as u8) { i = i +% (1 as usize); }
+                if let option::Option::Some(cm) = src.slice(from: start, to: i) {
+                    _push_span(spans, cm, font_size, _col_comment(), italic: true);
+                }
+                plain_start = i;
+                continue;
+            } else if next_b == (91 as u8) || _is_ident_start(next_b) {
+                if plain_start < i {
+                    if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                        _push_span(spans, pl, font_size, style::ink());
+                    }
+                }
+                let start: usize = i;
+                i = i +% (1 as usize);
+                if next_b == (91 as u8) {
+                    while i < limit && _byte(src, i) != (93 as u8) && _byte(src, i) != (10 as u8) {
+                        i = i +% (1 as usize);
+                    }
+                    if i < limit && _byte(src, i) == (93 as u8) { i = i +% (1 as usize); }
+                } else {
+                    while i < limit && _is_ident_cont(_byte(src, i)) { i = i +% (1 as usize); }
+                }
+                if let option::Option::Some(at) = src.slice(from: start, to: i) {
+                    _push_span(spans, at, font_size, _col_attr());
+                }
+                plain_start = i;
+                continue;
+            }
+        }
+
+        // @decorator / @ui
+        if b == (64 as u8) && _is_ident_start(next_b) {
+            if plain_start < i {
+                if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                    _push_span(spans, pl, font_size, style::ink());
+                }
+            }
+            let start: usize = i;
+            i = i +% (1 as usize);
+            while i < limit && _is_ident_cont(_byte(src, i)) { i = i +% (1 as usize); }
+            if let option::Option::Some(at) = src.slice(from: start, to: i) {
+                _push_span(spans, at, font_size, _col_attr());
+            }
+            plain_start = i;
+            continue;
+        }
+
+        // Strings: "...", '...', `...`
+        if b == (34 as u8) || b == (39 as u8) || b == (96 as u8) {
+            if plain_start < i {
+                if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                    _push_span(spans, pl, font_size, style::ink());
+                }
+            }
+            let quote: u8 = b;
+            let start: usize = i;
+            i = i +% (1 as usize);
+            while i < limit {
+                let c: u8 = _byte(src, i);
+                if c == (92 as u8) && i +% (1 as usize) < limit {
+                    i = i +% (2 as usize);
+                    continue;
+                }
+                i = i +% (1 as usize);
+                if c == quote || (c == (10 as u8) && quote != (96 as u8)) {
+                    break;
+                }
+            }
+            if let option::Option::Some(st) = src.slice(from: start, to: i) {
+                _push_span(spans, st, font_size, _col_string());
+            }
+            plain_start = i;
+            continue;
+        }
+
+        // Numbers
+        if _is_digit(b) {
+            if plain_start < i {
+                if let option::Option::Some(pl) = src.slice(from: plain_start, to: i) {
+                    _push_span(spans, pl, font_size, style::ink());
+                }
+            }
+            let start: usize = i;
+            if b == (48 as u8) && (next_b == (120 as u8) || next_b == (88 as u8)) {
+                i = i +% (2 as usize);
+                while i < limit && (_is_hex(_byte(src, i)) || _byte(src, i) == (95 as u8)) {
+                    i = i +% (1 as usize);
+                }
+            } else {
+                while i < limit && (_is_digit(_byte(src, i)) || _byte(src, i) == (46 as u8) || _byte(src, i) == (95 as u8)) {
+                    i = i +% (1 as usize);
+                }
+                while i < limit && _is_ident_cont(_byte(src, i)) {
+                    i = i +% (1 as usize);
+                }
+            }
+            if let option::Option::Some(num) = src.slice(from: start, to: i) {
+                _push_span(spans, num, font_size, _col_number());
+            }
+            plain_start = i;
+            continue;
+        }
+
+        // Identifiers / Keywords / Types
+        if _is_ident_start(b) {
+            let start: usize = i;
+            i = i +% (1 as usize);
+            while i < limit && _is_ident_cont(_byte(src, i)) { i = i +% (1 as usize); }
+            if let option::Option::Some(word) = src.slice(from: start, to: i) {
+                if _is_keyword(word) {
+                    if plain_start < start {
+                        if let option::Option::Some(pl) = src.slice(from: plain_start, to: start) {
+                            _push_span(spans, pl, font_size, style::ink());
+                        }
+                    }
+                    _push_span(spans, word, font_size, _col_keyword(), weight: vocab::FontWeight::Medium);
+                    plain_start = i;
+                } else if _is_builtin_type(word) || (_is_upper(b) && word.count() > (1 as usize)) {
+                    if plain_start < start {
+                        if let option::Option::Some(pl) = src.slice(from: plain_start, to: start) {
+                            _push_span(spans, pl, font_size, style::ink());
+                        }
+                    }
+                    _push_span(spans, word, font_size, _col_type());
+                    plain_start = i;
+                }
+            }
+            continue;
+        }
+
+        i = i +% (1 as usize);
+    }
+
+    if plain_start < total {
+        if let option::Option::Some(rest) = src.slice(from: plain_start, to: total) {
+            _push_span(spans, rest, font_size, style::ink());
+        }
+    }
+    return spans;
+}
+
+#[test]
+fn syntax_highlighter_preserves_text_and_colors_tokens() {
+    let sample: str = "fn greet(name: Text) -> i32 {\n    // comment\n    let s = \"hi\";\n    return 42;\n}";
+    let spans: vocab::Spans = highlight_code(sample, "cplus", 13.0f64);
+    assert spans.count() >= (8 as usize);
+
+    let diff_sample: str = "@@ -1,2 +1,2 @@\n-old\n+new\n ctx";
+    let dspans: vocab::Spans = highlight_code(diff_sample, "diff", 13.0f64);
+    assert dspans.count() >= (4 as usize);
+}

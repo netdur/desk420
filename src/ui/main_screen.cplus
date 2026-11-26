@@ -25,14 +25,18 @@ import "facet/symbol" as m_symbol;
 import "facet/text_area" as m_text_area;
 import "facet/text_field" as m_text_field;
 import "facet/vocabulary" as vocab;
+import "facet/window" as window;
 import "facet/window_chrome" as window_chrome;
+import "facet_runtime/runtime" as runtime;
 import "flex_layout/flex_layout" as flex;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 
 import "../engine/runtime" as engine;
+import "../store/conversation" as conversation;
 import "../store/sessions" as sessions;
+import "../store/ui_state" as ui_state;
 import "./chat_screen" as chat_screen;
 import "./home_view" as home_view;
 import "./panels" as panels;
@@ -84,6 +88,8 @@ struct MainScreen {
     status_sub: events::SignalSubscription[engine::EngineStateEvent],
     sessions_sub: events::SignalSubscription[sessions::SessionsChange],
     rename_sub: events::Subscription,
+    resize_obs: services::Cancellable,
+    restored_session: bool,
     renaming: bool,
     pending_prefill: text::Text,
 }
@@ -96,9 +102,69 @@ impl MainScreen {
             status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
             sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
             rename_sub: events::Subscription::none(),
+            resize_obs: services::Cancellable::none(),
+            restored_session: false,
             renaming: false,
             pending_prefill: text::from_str(""),
         };
+    }
+
+    fn _save_window_frame(this, immediate: bool = false) {
+        guard let option::Option::Some(w) = runtime::app().find_window("home") else { return; };
+        let f: vocab::Rect = w.frame();
+        if f.width < 600.0f64 || f.height < 400.0f64 { return; }
+        ui_state::set_window_frame(f.x, f.y, f.width, f.height, immediate: immediate);
+    }
+
+    fn _restore_window_frame(this) {
+        if !ui_state::has_window_frame() { return; }
+        guard let option::Option::Some(w) = runtime::app().find_window("home") else { return; };
+        var ww: f64 = ui_state::window_w();
+        var wh: f64 = ui_state::window_h();
+        var wx: f64 = ui_state::window_x();
+        var wy: f64 = ui_state::window_y();
+        let scr: vocab::Rect = window::active_screen_frame();
+        if scr.width > 0.0f64 && scr.height > 0.0f64 {
+            if ww > scr.width { ww = scr.width; }
+            if wh > scr.height { wh = scr.height; }
+            if wx + ww < scr.x + 80.0f64 || wx > scr.x + scr.width - 80.0f64 {
+                wx = scr.x + (scr.width - ww) / 2.0f64;
+            }
+            if wy + wh < scr.y + 80.0f64 || wy > scr.y + scr.height - 80.0f64 {
+                wy = scr.y + (scr.height - wh) / 2.0f64;
+            }
+        }
+        w.set_frame(vocab::Rect { x: wx, y: wy, width: ww, height: wh });
+    }
+
+    fn on_window_resized(ref this) {
+        this._save_window_frame(immediate: false);
+    }
+
+    fn _maybe_restore_last_session(ref this) {
+        if this.restored_session { return; }
+        if !engine::active_session_id().is_empty() {
+            this.restored_session = true;
+            return;
+        }
+        let want_sid: text::Text = ui_state::last_session_id();
+        if want_sid.is_empty() {
+            this.restored_session = true;
+            return;
+        }
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        if rows.count() == (0 as usize) { return; }
+        this.restored_session = true;
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if (*rp).session_id.equals(want_sid.view()) {
+                    engine::load_session((*rp).session_id.view(), (*rp).cwd.view(), title: (*rp).title.view());
+                    return;
+                }
+            }
+            i = i +% (1 as usize);
+        }
     }
 
     fn _apply_prefill(ref this) {
@@ -256,6 +322,15 @@ impl MainScreen {
 
     fn on_status_changed(ref this, ev: engine::EngineStateEvent) {
         let ch: engine::EngineChange = ev.change;
+        if ch == engine::EngineChange::Session {
+            let sid: text::Text = engine::active_session_id();
+            let cwd: text::Text = engine::active_cwd();
+            let title: text::Text = if sid.is_empty() { text::from_str("") } else { conversation::session_title(sid.view()) };
+            if !sid.is_empty() {
+                this.restored_session = true;
+            }
+            ui_state::set_last_session(sid.view(), cwd.view(), title: title.view());
+        }
         if ch == engine::EngineChange::All
             || ch == engine::EngineChange::Status
             || ch == engine::EngineChange::Session {
@@ -267,6 +342,7 @@ impl MainScreen {
     }
 
     fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) {
+        this._maybe_restore_last_session();
         this._sync_bar();
     }
 
@@ -504,7 +580,7 @@ impl MainScreen: component::Component {
 
                 // ── Sidebar | centre ──
                 split(key: "main:split",
-                position: panels::SIDEBAR_W,
+                position: panels::initial_sidebar_width(),
                 min_leading: panels::SIDEBAR_MIN,
                 max_leading: panels::SIDEBAR_MAX,
                 min_trailing: 760.0f64,
@@ -571,12 +647,18 @@ impl MainScreen: component::Lifecycle {
         if let option::Option::Some(p) = m_popup::find("bar:more_menu") {
             let _p: m_popup::Popup = p.set_selected_index(-1 as i64);
         }
+        this._restore_window_frame();
+        if let option::Option::Some(w) = runtime::app().find_window("home") {
+            this.resize_obs = w.on_resize(this.on_window_resized);
+        }
+        panels::arm_sidebar();
         this._sync_mode();
         this._sync_bar();
         engine::start();
     }
 
     fn on_detach(ref this, why: component::Detach) {
+        this._save_window_frame(immediate: true);
         match why {
             component::Detach::Inactive => { engine::set_app_active(false); }
             component::Detach::Background => { engine::set_app_active(false); }

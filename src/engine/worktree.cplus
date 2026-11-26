@@ -1,0 +1,217 @@
+// src/engine/worktree.cplus — isolated git worktrees for parallel Grok runs.
+//
+// Creates per-run worktrees under ~/.desk420/worktrees/<repo>-<slug>-<hex> on
+// a dedicated branch (`desk420/<slug>-<hex>`) so concurrent conversations in
+// the same repository never overwrite each other's working tree.
+
+import "stdlib/crypto" as crypto;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/process" as process;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+struct WorktreeInfo {
+    path: text::Text,
+    branch: text::Text,
+    repo_root: text::Text,
+}
+
+fn worktrees_root() -> text::Text {
+    if let option::Option::Some(home) = env::var("HOME") {
+        let d: text::Text = path::join(base: home.view(), child: ".desk420/worktrees");
+        let _ = fs::create_dir_all(d.view());
+        return d;
+    }
+    let fallback: text::Text = text::from_str("/tmp/desk420-worktrees");
+    let _ = fs::create_dir_all(fallback.view());
+    return fallback;
+}
+
+fn is_worktree_path(cwd: str) -> bool {
+    return cwd.contains(".desk420/worktrees/") || cwd.contains("/desk420-worktrees/");
+}
+
+fn sanitize_slug(raw: str) -> text::Text {
+    let low: text::Text = text::from_str(raw.trim()).lowercased();
+    let s: str = low.view();
+    let n: usize = s.count();
+    var out: text::Text = text::new();
+    var last_dash: bool = true;
+    var i: usize = 0 as usize;
+    while i < n && out.count() < (28 as usize) {
+        if let option::Option::Some(b) = s.byte_at(i) {
+            let is_alnum: bool = (b >= (97 as u8) && b <= (122 as u8))
+                || (b >= (48 as u8) && b <= (57 as u8));
+            if is_alnum {
+                if let option::Option::Some(ch) = s.slice(from: i, to: i +% (1 as usize)) {
+                    let _ = out.append(ch);
+                }
+                last_dash = false;
+            } else if !last_dash {
+                let _ = out.append("-");
+                last_dash = true;
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    let ov: str = out.view();
+    if ov.has_suffix("-") && ov.count() > (1 as usize) {
+        if let option::Option::Some(trimmed) = ov.slice(from: 0 as usize, to: ov.count() -% (1 as usize)) {
+            return text::from_str(trimmed);
+        }
+    }
+    return out;
+}
+
+fn _git(cwd: str, args: vec::Vec[text::Text]) -> process::Output {
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("/usr/bin/git"));
+    let _ = argv.append(text::from_str("-C"));
+    let _ = argv.append(text::from_str(cwd));
+    var i: usize = 0 as usize;
+    while i < args.count() {
+        if let option::Option::Some(ap) = args.at_ptr(i) {
+            let _ = argv.append((*ap).clone());
+        }
+        i = i +% (1 as usize);
+    }
+    return process::capture(argv);
+}
+
+fn repo_top_level(dir: str) -> option::Option[text::Text] {
+    if dir == "" { return option::Option[text::Text]::None; }
+    var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a.append(text::from_str("rev-parse"));
+    let _ = a.append(text::from_str("--show-toplevel"));
+    let out: process::Output = _git(dir, a);
+    if out.code != (0 as i32) { return option::Option[text::Text]::None; }
+    let top: str = out.stdout.view().trim();
+    if top == "" { return option::Option[text::Text]::None; }
+    return option::Option[text::Text]::Some(text::from_str(top));
+}
+
+fn create_worktree_in(repo_dir: str, base_root: str, label: str = "") -> result::Result[WorktreeInfo, text::Text] {
+    guard let option::Option::Some(top) = repo_top_level(repo_dir) else {
+        return result::Result[WorktreeInfo, text::Text]::Err(text::from_str("Selected folder is not a git repository."));
+    };
+    let _ = fs::create_dir_all(base_root);
+    let hex: text::Text = match crypto::random_hex(4 as usize) {
+        option::Option::Some(h) => h,
+        option::Option::None => text::from_str("wt"),
+    };
+    let slug: text::Text = sanitize_slug(label);
+    let tag: text::Text = if slug.is_empty() {
+        "run-${hex.view()}"
+    } else {
+        "${slug.view()}-${hex.view()}"
+    };
+    let repo_name: str = path::file_name(top.view());
+    let dir_name: text::Text = if repo_name == "" {
+        tag.clone()
+    } else {
+        "${repo_name}-${tag.view()}"
+    };
+    let wt_path: text::Text = path::join(base: base_root, child: dir_name.view());
+    let branch: text::Text = "desk420/${tag.view()}";
+
+    var a: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = a.append(text::from_str("worktree"));
+    let _ = a.append(text::from_str("add"));
+    let _ = a.append(text::from_str("-b"));
+    let _ = a.append(branch.clone());
+    let _ = a.append(wt_path.clone());
+    let _ = a.append(text::from_str("HEAD"));
+    let out: process::Output = _git(top.view(), a);
+    if out.code != (0 as i32) {
+        let msg: text::Text = if !out.stderr.view().trim().is_empty() {
+            text::from_str(out.stderr.view().trim())
+        } else {
+            text::from_str("git worktree add failed")
+        };
+        return result::Result[WorktreeInfo, text::Text]::Err(msg);
+    }
+    return result::Result[WorktreeInfo, text::Text]::Ok(WorktreeInfo {
+        path: wt_path,
+        branch: branch,
+        repo_root: top,
+    });
+}
+
+fn create_worktree(repo_dir: str, label: str = "") -> result::Result[WorktreeInfo, text::Text] {
+    let root: text::Text = worktrees_root();
+    return create_worktree_in(repo_dir, root.view(), label: label);
+}
+
+fn remove_worktree(wt_path: str) -> result::Result[bool, text::Text] {
+    if !is_worktree_path(wt_path) {
+        return result::Result[bool, text::Text]::Err(text::from_str("Refused: path is not a Desk420 worktree."));
+    }
+    var common_a: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = common_a.append(text::from_str("rev-parse"));
+    let _ = common_a.append(text::from_str("--git-common-dir"));
+    let co: process::Output = _git(wt_path, common_a);
+    var git_host: text::Text = text::from_str(wt_path);
+    if co.code == (0 as i32) {
+        let gdir: str = co.stdout.view().trim();
+        let par: str = path::parent(gdir);
+        if par != "" {
+            git_host = text::from_str(par);
+        }
+    }
+    var rm_a: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = rm_a.append(text::from_str("worktree"));
+    let _ = rm_a.append(text::from_str("remove"));
+    let _ = rm_a.append(text::from_str("--force"));
+    let _ = rm_a.append(text::from_str(wt_path));
+    let out: process::Output = _git(git_host.view(), rm_a);
+    if out.code != (0 as i32) {
+        let msg: text::Text = if !out.stderr.view().trim().is_empty() {
+            text::from_str(out.stderr.view().trim())
+        } else {
+            text::from_str("git worktree remove failed")
+        };
+        return result::Result[bool, text::Text]::Err(msg);
+    }
+    return result::Result[bool, text::Text]::Ok(true);
+}
+
+#[test]
+fn worktree_create_and_remove_round_trip() {
+    assert sanitize_slug("Fix Auth Bug!").equals("fix-auth-bug");
+    assert sanitize_slug("   ").equals("");
+
+    let base_repo: str = "/tmp/desk420-wt-test-repo";
+    let wt_root: str = "/tmp/desk420-worktrees";
+    let _ = process::run(["/bin/rm", "-rf", base_repo, wt_root]);
+    let _ = fs::create_dir_all(base_repo);
+    let _ = process::run(["/usr/bin/git", "-C", base_repo, "init"]);
+    let _ = fs::write_string("${base_repo}/README.md", "hi\n");
+    let _ = process::run(["/usr/bin/git", "-C", base_repo, "add", "."]);
+    let _ = process::run([
+        "/usr/bin/git", "-C", base_repo,
+        "-c", "user.name=Test",
+        "-c", "user.email=test@example.com",
+        "commit", "-m", "init",
+    ]);
+
+    match create_worktree_in(base_repo, wt_root, label: "Feature One") {
+        result::Result::Ok(info) => {
+            assert is_worktree_path(info.path.view());
+            assert info.branch.view().has_prefix("desk420/feature-one-");
+            assert fs::exists(info.path.view());
+            match remove_worktree(info.path.view()) {
+                result::Result::Ok(ok) => { assert ok; }
+                result::Result::Err(_) => { assert false; }
+            }
+            assert !fs::exists(info.path.view());
+        }
+        result::Result::Err(_) => {
+            assert false;
+        }
+    }
+    let _ = process::run(["/bin/rm", "-rf", base_repo, wt_root]);
+}

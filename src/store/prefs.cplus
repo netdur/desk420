@@ -157,6 +157,79 @@ impl BrowserPref {
     }
 }
 
+enum EditorPref {
+    System,
+    Cursor,
+    VSCode,
+    Zed,
+    Xcode,
+    Finder,
+}
+
+impl EditorPref {
+    fn to_index(this) -> i64 {
+        return match this {
+            EditorPref::System => 0 as i64,
+            EditorPref::Cursor => 1 as i64,
+            EditorPref::VSCode => 2 as i64,
+            EditorPref::Zed => 3 as i64,
+            EditorPref::Xcode => 4 as i64,
+            EditorPref::Finder => 5 as i64,
+        };
+    }
+
+    fn from_index(i: i64) -> EditorPref {
+        if i == (1 as i64) { return EditorPref::Cursor; }
+        if i == (2 as i64) { return EditorPref::VSCode; }
+        if i == (3 as i64) { return EditorPref::Zed; }
+        if i == (4 as i64) { return EditorPref::Xcode; }
+        if i == (5 as i64) { return EditorPref::Finder; }
+        return EditorPref::System;
+    }
+
+    fn word(this) -> str {
+        return match this {
+            EditorPref::System => "system",
+            EditorPref::Cursor => "cursor",
+            EditorPref::VSCode => "vscode",
+            EditorPref::Zed => "zed",
+            EditorPref::Xcode => "xcode",
+            EditorPref::Finder => "finder",
+        };
+    }
+
+    fn from_word(w: str) -> EditorPref {
+        if w == "cursor" { return EditorPref::Cursor; }
+        if w == "vscode" { return EditorPref::VSCode; }
+        if w == "zed" { return EditorPref::Zed; }
+        if w == "xcode" { return EditorPref::Xcode; }
+        if w == "finder" { return EditorPref::Finder; }
+        return EditorPref::System;
+    }
+
+    fn label(this) -> str {
+        return match this {
+            EditorPref::System => "System default",
+            EditorPref::Cursor => "Cursor",
+            EditorPref::VSCode => "Visual Studio Code",
+            EditorPref::Zed => "Zed",
+            EditorPref::Xcode => "Xcode",
+            EditorPref::Finder => "Finder",
+        };
+    }
+
+    fn macos_app_name(this) -> str {
+        return match this {
+            EditorPref::System => "",
+            EditorPref::Cursor => "Cursor",
+            EditorPref::VSCode => "Visual Studio Code",
+            EditorPref::Zed => "Zed",
+            EditorPref::Xcode => "Xcode",
+            EditorPref::Finder => "Finder",
+        };
+    }
+}
+
 enum SendKeyPref {
     Return,
     CmdReturn,
@@ -227,9 +300,11 @@ impl AgentAccessPref {
 static _LIVE: bool = false;
 static _APPEARANCE: AppearancePref = #zero::[AppearancePref]();   // System — the first variant
 static _BROWSER: BrowserPref = #zero::[BrowserPref]();            // System — the first variant
+static _EDITOR: EditorPref = #zero::[EditorPref]();               // System — the first variant
 static _SEND_KEY: SendKeyPref = #zero::[SendKeyPref]();           // Return — the first variant
 static _EXPAND_THINKING: bool = false;
 static _AGENT_ACCESS: AgentAccessPref = #zero::[AgentAccessPref](); // initialized in _ensure() -> Ask by default
+static _CUSTOM_ALLOWLIST: text::Text = #zero::[text::Text]();
 static _PATH: text::Text = #zero::[text::Text]();
 
 fn _desk420_dir() -> text::Text {
@@ -252,9 +327,11 @@ fn browser_launcher_path() -> text::Text {
 struct Prefs {
     appearance: AppearancePref,
     browser: BrowserPref,
+    editor: EditorPref,
     send_key: SendKeyPref,
     expand_thinking: bool,
     agent_access: AgentAccessPref,
+    custom_allowlist: text::Text,
 }
 
 impl Prefs {
@@ -262,9 +339,11 @@ impl Prefs {
         return Prefs {
             appearance: AppearancePref::System,
             browser: BrowserPref::System,
+            editor: EditorPref::System,
             send_key: SendKeyPref::Return,
             expand_thinking: false,
             agent_access: AgentAccessPref::Ask,
+            custom_allowlist: text::from_str(""),
         };
     }
 }
@@ -277,9 +356,11 @@ fn parse_prefs(raw: str) -> Prefs {
     return Prefs {
         appearance: AppearancePref::from_word(root.field_str("appearance", "").view()),
         browser: BrowserPref::from_word(root.field_str("browser", "").view()),
+        editor: EditorPref::from_word(root.field_str("editor", "").view()),
         send_key: SendKeyPref::from_word(root.field_str("send_key", "").view()),
         expand_thinking: root.field_bool("expand_thinking", false),
         agent_access: AgentAccessPref::from_word(root.field_str("agent_access", "").view()),
+        custom_allowlist: root.field_str("custom_allowlist", ""),
     };
 }
 
@@ -291,9 +372,11 @@ fn _ensure() {
     let loaded: Prefs = parse_prefs(raw.view());
     _APPEARANCE = loaded.appearance;
     _BROWSER = loaded.browser;
+    _EDITOR = loaded.editor;
     _SEND_KEY = loaded.send_key;
     _EXPAND_THINKING = loaded.expand_thinking;
     _AGENT_ACCESS = loaded.agent_access;
+    _CUSTOM_ALLOWLIST = loaded.custom_allowlist;
 }
 
 fn _read(p: str) -> text::Text {
@@ -303,21 +386,89 @@ fn _read(p: str) -> text::Text {
     };
 }
 
-fn render(a: AppearancePref, b: BrowserPref = BrowserPref::System, sk: SendKeyPref = SendKeyPref::Return, expand_think: bool = false, access: AgentAccessPref = AgentAccessPref::Ask) -> text::Text {
+fn render(a: AppearancePref, b: BrowserPref = BrowserPref::System, sk: SendKeyPref = SendKeyPref::Return, expand_think: bool = false, access: AgentAccessPref = AgentAccessPref::Ask, ed: EditorPref = EditorPref::System, extra_allow: str = "") -> text::Text {
     var m: vec::Vec[json::Member] = vec::new::[json::Member]();
     let _ = m.append(json::Member::new("appearance", json::Value::text(a.word())));
     let _ = m.append(json::Member::new("browser", json::Value::text(b.word())));
+    let _ = m.append(json::Member::new("editor", json::Value::text(ed.word())));
     let _ = m.append(json::Member::new("send_key", json::Value::text(sk.word())));
     let _ = m.append(json::Member::new("expand_thinking", json::Value::boolean(expand_think)));
     let _ = m.append(json::Member::new("agent_access", json::Value::text(access.word())));
+    let _ = m.append(json::Member::new("custom_allowlist", json::Value::text(extra_allow)));
     return json::Value::object(m).to_text();
 }
 
 fn _save() {
     let dir: str = path::parent(_PATH.view());
     if dir != "" { let _ = fs::create_dir_all(dir); }
-    let body: text::Text = render(_APPEARANCE, _BROWSER, _SEND_KEY, _EXPAND_THINKING, _AGENT_ACCESS);
+    let body: text::Text = render(_APPEARANCE, _BROWSER, _SEND_KEY, _EXPAND_THINKING, _AGENT_ACCESS, _EDITOR, _CUSTOM_ALLOWLIST.view());
     let _ = fs::write_string(_PATH.view(), body.view());
+}
+
+fn custom_allowlist() -> text::Text {
+    _ensure();
+    return _CUSTOM_ALLOWLIST.clone();
+}
+
+fn set_custom_allowlist(raw: str) {
+    _ensure();
+    _CUSTOM_ALLOWLIST = text::from_str(raw.trim());
+    _save();
+}
+
+// Match a shell-metacharacter-free command against comma-separated user rules.
+// Each rule matches either an exact command or a prefix followed by a space
+// (e.g. rule "cargo test" allows "cargo test" and "cargo test --lib", never "cargo test2").
+fn matches_extra_allowlist(trimmed_cmd: str, raw_rules: str) -> bool {
+    if trimmed_cmd == "" || raw_rules.trim() == "" { return false; }
+    let rules: vec::Vec[str] = raw_rules.split(separator: ",");
+    var i: usize = 0 as usize;
+    while i < rules.count() {
+        if let option::Option::Some(r) = rules.at(i) {
+            let rule: str = r.trim();
+            if rule != "" {
+                if trimmed_cmd == rule { return true; }
+                let pref: text::Text = "${rule} ";
+                if trimmed_cmd.has_prefix(pref.view()) { return true; }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return false;
+}
+
+fn editor() -> EditorPref {
+    _ensure();
+    return _EDITOR;
+}
+
+fn set_editor(ed: EditorPref) {
+    _ensure();
+    _EDITOR = ed;
+    _save();
+}
+
+fn open_in_editor(target_path: str) {
+    if target_path == "" { return; }
+    _ensure();
+    let app: str = _EDITOR.macos_app_name();
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("/usr/bin/open"));
+    if app != "" {
+        let _ = argv.append(text::from_str("-a"));
+        let _ = argv.append(text::from_str(app));
+    }
+    let _ = argv.append(text::from_str(target_path));
+    let _ = process::spawn(argv);
+}
+
+fn reveal_in_finder(target_path: str) {
+    if target_path == "" { return; }
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("/usr/bin/open"));
+    let _ = argv.append(text::from_str("-R"));
+    let _ = argv.append(text::from_str(target_path));
+    let _ = process::spawn(argv);
 }
 
 fn agent_access() -> AgentAccessPref {
@@ -418,6 +569,23 @@ fn appearance_round_trips_and_defaults_to_system() {
     let l: text::Text = render(AppearancePref::Light);
     assert parse_prefs(l.view()).appearance == AppearancePref::Light;
     assert AppearancePref::from_index(AppearancePref::Dark.to_index()) == AppearancePref::Dark;
+}
+
+#[test]
+fn editor_and_extra_allowlist_round_trip() {
+    let raw: text::Text = render(
+        AppearancePref::System,
+        ed: EditorPref::Cursor,
+        extra_allow: "cpc check, cargo test",
+    );
+    let parsed: Prefs = parse_prefs(raw.view());
+    assert parsed.editor == EditorPref::Cursor;
+    assert parsed.custom_allowlist.equals("cpc check, cargo test");
+
+    assert matches_extra_allowlist("cpc check", "cpc check, cargo test");
+    assert matches_extra_allowlist("cargo test --lib", "cpc check, cargo test");
+    assert !matches_extra_allowlist("cargo test2", "cpc check, cargo test");
+    assert !matches_extra_allowlist("rm -rf /", "cpc check, cargo test");
 }
 
 #[test]

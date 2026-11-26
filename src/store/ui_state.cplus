@@ -1,0 +1,322 @@
+// src/store/ui_state.cplus — persistent UI layout & session memory across launches.
+//
+// Deliberately separate from `prefs.cplus` (`settings.json`):
+//   - settings.json is INTENT (user preferences chosen in Settings).
+//   - ui_state.json is MEMORY (where the window, splitters, panels, tabs, and
+//     last open conversation were left).
+//
+// Writes are debounced for continuous gestures (window resize, splitter drag)
+// and flushed immediately on discrete toggles and app background/close.
+// Corrupt or missing values degrade cleanly to safe defaults.
+
+import "facet/services" as services;
+import "json/json" as json;
+import "stdlib/env" as env;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+
+struct UiSnapshot {
+    has_window: bool,
+    window_x: f64,
+    window_y: f64,
+    window_w: f64,
+    window_h: f64,
+    sidebar_hidden: bool,
+    sidebar_width: f64,
+    panel_hidden: bool,
+    home_panel_width: f64,
+    conv_panel_width: f64,
+    inspector_tab: text::Text,
+    terminal_mode_shell: bool,
+    last_session_id: text::Text,
+    last_session_cwd: text::Text,
+    last_session_title: text::Text,
+}
+
+impl UiSnapshot {
+    fn defaults() -> UiSnapshot {
+        return UiSnapshot {
+            has_window: false,
+            window_x: 0.0f64,
+            window_y: 0.0f64,
+            window_w: 1360.0f64,
+            window_h: 860.0f64,
+            sidebar_hidden: false,
+            sidebar_width: 320.0f64,
+            panel_hidden: false,
+            home_panel_width: 340.0f64,
+            conv_panel_width: 360.0f64,
+            inspector_tab: text::from_str("run"),
+            terminal_mode_shell: true,
+            last_session_id: text::from_str(""),
+            last_session_cwd: text::from_str(""),
+            last_session_title: text::from_str(""),
+        };
+    }
+}
+
+fn _clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+fn _valid_tab(s: str) -> str {
+    if s == "files" || s == "browser" || s == "terminal" || s == "preview" {
+        return s;
+    }
+    return "run";
+}
+
+fn parse_ui_state(raw: str) -> UiSnapshot {
+    var out: UiSnapshot = UiSnapshot::defaults();
+    if raw == "" { return out; }
+    guard let result::Result::Ok(root) = json::Value::parse(source: raw) else {
+        return out;
+    };
+
+    let ww: f64 = root.field_number("window_w", 0.0f64);
+    let wh: f64 = root.field_number("window_h", 0.0f64);
+    if ww >= 600.0f64 && wh >= 400.0f64 && ww <= 10000.0f64 && wh <= 10000.0f64 {
+        out.has_window = true;
+        out.window_x = root.field_number("window_x", 0.0f64);
+        out.window_y = root.field_number("window_y", 0.0f64);
+        out.window_w = ww;
+        out.window_h = wh;
+    }
+
+    out.sidebar_hidden = root.field_bool("sidebar_hidden", false);
+    let sw: f64 = root.field_number("sidebar_width", 320.0f64);
+    out.sidebar_width = _clamp(sw, 240.0f64, 440.0f64);
+
+    out.panel_hidden = root.field_bool("panel_hidden", false);
+    let hpw: f64 = root.field_number("home_panel_width", 340.0f64);
+    out.home_panel_width = _clamp(hpw, 260.0f64, 720.0f64);
+    let cpw: f64 = root.field_number("conv_panel_width", 360.0f64);
+    out.conv_panel_width = _clamp(cpw, 260.0f64, 720.0f64);
+
+    let tab_raw: text::Text = root.field_str("inspector_tab", "run");
+    out.inspector_tab = text::from_str(_valid_tab(tab_raw.view()));
+    out.terminal_mode_shell = root.field_bool("terminal_mode_shell", true);
+    out.last_session_id = root.field_str("last_session_id", "");
+    out.last_session_cwd = root.field_str("last_session_cwd", "");
+    out.last_session_title = root.field_str("last_session_title", "");
+    return out;
+}
+
+fn render_ui_state(s: UiSnapshot) -> text::Text {
+    var m: vec::Vec[json::Member] = vec::new::[json::Member]();
+    if s.has_window {
+        let _ = m.append(json::Member::new("window_x", json::Value::number(s.window_x)));
+        let _ = m.append(json::Member::new("window_y", json::Value::number(s.window_y)));
+        let _ = m.append(json::Member::new("window_w", json::Value::number(s.window_w)));
+        let _ = m.append(json::Member::new("window_h", json::Value::number(s.window_h)));
+    }
+    let _ = m.append(json::Member::new("sidebar_hidden", json::Value::boolean(s.sidebar_hidden)));
+    let _ = m.append(json::Member::new("sidebar_width", json::Value::number(s.sidebar_width)));
+    let _ = m.append(json::Member::new("panel_hidden", json::Value::boolean(s.panel_hidden)));
+    let _ = m.append(json::Member::new("home_panel_width", json::Value::number(s.home_panel_width)));
+    let _ = m.append(json::Member::new("conv_panel_width", json::Value::number(s.conv_panel_width)));
+    let _ = m.append(json::Member::new("inspector_tab", json::Value::text(s.inspector_tab.view())));
+    let _ = m.append(json::Member::new("terminal_mode_shell", json::Value::boolean(s.terminal_mode_shell)));
+    let _ = m.append(json::Member::new("last_session_id", json::Value::text(s.last_session_id.view())));
+    let _ = m.append(json::Member::new("last_session_cwd", json::Value::text(s.last_session_cwd.view())));
+    let _ = m.append(json::Member::new("last_session_title", json::Value::text(s.last_session_title.view())));
+    return json::Value::object(m).to_text();
+}
+
+static _LIVE: bool = false;
+static _STATE: UiSnapshot = #zero::[UiSnapshot]();
+static _PATH: text::Text = #zero::[text::Text]();
+static _SAVE_TIMER: services::Cancellable = #zero::[services::Cancellable]();
+
+fn _default_path() -> text::Text {
+    if let option::Option::Some(home) = env::var("HOME") {
+        let dir: text::Text = path::join(base: home.view(), child: ".desk420");
+        return path::join(base: dir.view(), child: "ui_state.json");
+    }
+    return text::from_str("/tmp/desk420-ui-state.json");
+}
+
+fn _ensure() {
+    if _LIVE { return; }
+    _LIVE = true;
+    _PATH = _default_path();
+    let raw: text::Text = match fs::read_to_string(_PATH.view()) {
+        result::Result::Ok(t) => t,
+        _ => text::from_str(""),
+    };
+    _STATE = parse_ui_state(raw.view());
+    _SAVE_TIMER = services::Cancellable::none();
+}
+
+fn save_now() {
+    _ensure();
+    let dir: str = path::parent(_PATH.view());
+    if dir != "" { let _ = fs::create_dir_all(dir); }
+    let body: text::Text = render_ui_state(_STATE);
+    let _ = fs::write_string(_PATH.view(), body.view());
+}
+
+fn _on_save_timer(_ctx: *u8) {
+    save_now();
+}
+
+fn schedule_save() {
+    _ensure();
+    if services::has_main_hop() {
+        _SAVE_TIMER = services::after(0.35f64, _on_save_timer);
+    } else {
+        save_now();
+    }
+}
+
+// ---- readers ----------------------------------------------------------------
+
+fn has_window_frame() -> bool { _ensure(); return _STATE.has_window; }
+fn window_x() -> f64 { _ensure(); return _STATE.window_x; }
+fn window_y() -> f64 { _ensure(); return _STATE.window_y; }
+fn window_w() -> f64 { _ensure(); return _STATE.window_w; }
+fn window_h() -> f64 { _ensure(); return _STATE.window_h; }
+
+fn sidebar_hidden() -> bool { _ensure(); return _STATE.sidebar_hidden; }
+fn sidebar_width() -> f64 { _ensure(); return _STATE.sidebar_width; }
+fn panel_hidden() -> bool { _ensure(); return _STATE.panel_hidden; }
+
+fn panel_width(split_key: str, fallback: f64) -> f64 {
+    _ensure();
+    if split_key == "home:split" { return _STATE.home_panel_width; }
+    if split_key == "conv:split" { return _STATE.conv_panel_width; }
+    return fallback;
+}
+
+fn inspector_tab() -> text::Text { _ensure(); return _STATE.inspector_tab.clone(); }
+fn terminal_mode_shell() -> bool { _ensure(); return _STATE.terminal_mode_shell; }
+fn last_session_id() -> text::Text { _ensure(); return _STATE.last_session_id.clone(); }
+fn last_session_cwd() -> text::Text { _ensure(); return _STATE.last_session_cwd.clone(); }
+fn last_session_title() -> text::Text { _ensure(); return _STATE.last_session_title.clone(); }
+
+// ---- writers ----------------------------------------------------------------
+
+fn set_window_frame(x: f64, y: f64, w: f64, h: f64, immediate: bool = false) {
+    _ensure();
+    if w < 600.0f64 || h < 400.0f64 { return; }
+    _STATE.has_window = true;
+    _STATE.window_x = x;
+    _STATE.window_y = y;
+    _STATE.window_w = w;
+    _STATE.window_h = h;
+    if immediate { save_now(); } else { schedule_save(); }
+}
+
+fn set_sidebar_hidden(hidden: bool) {
+    _ensure();
+    if _STATE.sidebar_hidden == hidden { return; }
+    _STATE.sidebar_hidden = hidden;
+    save_now();
+}
+
+fn set_sidebar_width(w: f64) {
+    _ensure();
+    let clamped: f64 = _clamp(w, 240.0f64, 440.0f64);
+    let diff: f64 = clamped - _STATE.sidebar_width;
+    if diff < 0.5f64 && diff > -0.5f64 { return; }
+    _STATE.sidebar_width = clamped;
+    schedule_save();
+}
+
+fn set_panel_hidden(hidden: bool) {
+    _ensure();
+    if _STATE.panel_hidden == hidden { return; }
+    _STATE.panel_hidden = hidden;
+    save_now();
+}
+
+fn set_panel_width(split_key: str, w: f64) {
+    _ensure();
+    let clamped: f64 = _clamp(w, 260.0f64, 720.0f64);
+    if split_key == "home:split" {
+        let d: f64 = clamped - _STATE.home_panel_width;
+        if d < 0.5f64 && d > -0.5f64 { return; }
+        _STATE.home_panel_width = clamped;
+        schedule_save();
+    } else if split_key == "conv:split" {
+        let d: f64 = clamped - _STATE.conv_panel_width;
+        if d < 0.5f64 && d > -0.5f64 { return; }
+        _STATE.conv_panel_width = clamped;
+        schedule_save();
+    }
+}
+
+fn set_inspector_tab(slug: str) {
+    _ensure();
+    let clean: str = _valid_tab(slug);
+    if _STATE.inspector_tab.equals(clean) { return; }
+    _STATE.inspector_tab = text::from_str(clean);
+    save_now();
+}
+
+fn set_terminal_mode_shell(on_shell: bool) {
+    _ensure();
+    if _STATE.terminal_mode_shell == on_shell { return; }
+    _STATE.terminal_mode_shell = on_shell;
+    save_now();
+}
+
+fn set_last_session(sid: str, cwd: str, title: str = "") {
+    _ensure();
+    if _STATE.last_session_id.equals(sid) && _STATE.last_session_cwd.equals(cwd) {
+        if title == "" || _STATE.last_session_title.equals(title) {
+            return;
+        }
+    }
+    _STATE.last_session_id = text::from_str(sid);
+    _STATE.last_session_cwd = text::from_str(cwd);
+    _STATE.last_session_title = text::from_str(title);
+    save_now();
+}
+
+#[test]
+fn ui_state_round_trips_and_clamps_corrupt_values() {
+    var snap: UiSnapshot = UiSnapshot::defaults();
+    snap.has_window = true;
+    snap.window_x = 120.0f64;
+    snap.window_y = 80.0f64;
+    snap.window_w = 1440.0f64;
+    snap.window_h = 900.0f64;
+    snap.sidebar_hidden = true;
+    snap.sidebar_width = 290.0f64;
+    snap.panel_hidden = false;
+    snap.home_panel_width = 380.0f64;
+    snap.conv_panel_width = 410.0f64;
+    snap.inspector_tab = text::from_str("terminal");
+    snap.terminal_mode_shell = false;
+    snap.last_session_id = text::from_str("sess-42");
+    snap.last_session_cwd = text::from_str("/tmp/proj");
+    snap.last_session_title = text::from_str("Build app");
+
+    let encoded: text::Text = render_ui_state(snap);
+    let back: UiSnapshot = parse_ui_state(encoded.view());
+    assert back.has_window;
+    assert back.window_w > 1439.0f64 && back.window_w < 1441.0f64;
+    assert back.sidebar_hidden;
+    assert back.sidebar_width > 289.0f64 && back.sidebar_width < 291.0f64;
+    assert !back.panel_hidden;
+    assert back.conv_panel_width > 409.0f64 && back.conv_panel_width < 411.0f64;
+    assert back.inspector_tab.equals("terminal");
+    assert !back.terminal_mode_shell;
+    assert back.last_session_id.equals("sess-42");
+    assert back.last_session_cwd.equals("/tmp/proj");
+    assert back.last_session_title.equals("Build app");
+
+    // Corrupt or out-of-range values clamp safely rather than collapsing panes.
+    let bad: UiSnapshot = parse_ui_state("{\"window_w\":10,\"sidebar_width\":0,\"conv_panel_width\":99999,\"inspector_tab\":\"bogus\"}");
+    assert !bad.has_window;
+    assert bad.sidebar_width >= 240.0f64;
+    assert bad.conv_panel_width <= 720.0f64;
+    assert bad.inspector_tab.equals("run");
+}

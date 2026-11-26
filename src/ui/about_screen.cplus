@@ -20,7 +20,7 @@ import "stdlib/text" as text;
 import "../engine/runtime" as engine;
 import "./style" as style;
 
-const APP_VERSION: str = "0.1.1";
+const APP_VERSION: str = "0.1.3";
 
 struct AboutScreen {}
 

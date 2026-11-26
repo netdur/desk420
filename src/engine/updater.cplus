@@ -1,0 +1,246 @@
+// src/engine/updater.cplus — GitHub Releases update checker & safe debug diagnostics export.
+//
+// Queries GitHub Releases off the main thread using `http/http`, compares semver
+// cleanly against CURRENT_VERSION, and presents a native macOS sheet without
+// ever blocking the UI.
+
+import "facet/services" as services;
+import "facet_runtime/runtime" as runtime;
+import "http/http" as http;
+import "json/json" as json;
+import "stdlib/fs" as fs;
+import "stdlib/option" as option;
+import "stdlib/process" as process;
+import "stdlib/result" as result;
+import "stdlib/text" as text;
+import "stdlib/thread" as thread;
+import "stdlib/vec" as vec;
+
+import "../browser/mcp_server" as browser_mcp;
+import "../store/prefs" as prefs;
+import "../store/sessions" as sessions;
+import "./runtime" as engine;
+
+const CURRENT_VERSION: str = "0.1.3";
+const LATEST_RELEASE_API: str = "https://api.github.com/repos/netdur/desk420/releases/latest";
+const RELEASES_FALLBACK_URL: str = "https://github.com/netdur/desk420/releases";
+
+enum UpdateKind {
+    UpToDate,
+    Available,
+    Error,
+}
+
+struct UpdateCheckResult {
+    kind: UpdateKind,
+    latest_tag: text::Text,
+    url: text::Text,
+    detail: text::Text,
+}
+
+fn _strip_v(raw: str) -> str {
+    let t: str = raw.trim();
+    if t.has_prefix("v") || t.has_prefix("V") {
+        if let option::Option::Some(rest) = t.slice(from: 1 as usize, to: t.count()) {
+            return rest;
+        }
+    }
+    return t;
+}
+
+fn _parse_semver_part(parts: vec::Vec[str], idx: usize) -> i64 {
+    guard let option::Option::Some(raw) = parts.at(idx) else { return 0 as i64; };
+    var clean: str = raw;
+    if let option::Option::Some(dash) = raw.find("-") {
+        if let option::Option::Some(head) = raw.slice(from: 0 as usize, to: dash) {
+            clean = head;
+        }
+    }
+    return match clean.to_i64() {
+        option::Option::Some(v) => v,
+        option::Option::None => 0 as i64,
+    };
+}
+
+fn is_newer_version(current: str, candidate: str) -> bool {
+    let c_s: str = _strip_v(current);
+    let n_s: str = _strip_v(candidate);
+    if c_s == "" || n_s == "" { return false; }
+    let cp: vec::Vec[str] = c_s.split(separator: ".");
+    let np: vec::Vec[str] = n_s.split(separator: ".");
+    var i: usize = 0 as usize;
+    while i < (3 as usize) {
+        let cv: i64 = _parse_semver_part(cp, i);
+        let nv: i64 = _parse_semver_part(np, i);
+        if nv > cv { return true; }
+        if nv < cv { return false; }
+        i = i +% (1 as usize);
+    }
+    return false;
+}
+
+fn parse_latest_release_json(raw_json: str, current_ver: str = CURRENT_VERSION) -> UpdateCheckResult {
+    guard let result::Result::Ok(root) = json::Value::parse(source: raw_json) else {
+        return UpdateCheckResult {
+            kind: UpdateKind::Error,
+            latest_tag: text::from_str(""),
+            url: text::from_str(RELEASES_FALLBACK_URL),
+            detail: text::from_str("Could not parse GitHub release metadata."),
+        };
+    };
+    let tag: text::Text = root.field_str("tag_name", "");
+    let html_url: text::Text = root.field_str("html_url", RELEASES_FALLBACK_URL);
+    if tag.is_empty() {
+        return UpdateCheckResult {
+            kind: UpdateKind::Error,
+            latest_tag: text::from_str(""),
+            url: html_url,
+            detail: text::from_str("No published release found."),
+        };
+    }
+    if is_newer_version(current_ver, tag.view()) {
+        return UpdateCheckResult {
+            kind: UpdateKind::Available,
+            latest_tag: tag,
+            url: html_url,
+            detail: text::from_str(""),
+        };
+    }
+    return UpdateCheckResult {
+        kind: UpdateKind::UpToDate,
+        latest_tag: tag,
+        url: html_url,
+        detail: text::from_str(""),
+    };
+}
+
+fn check_latest_release_sync() -> UpdateCheckResult {
+    var req: http::Request = http::Request::new(LATEST_RELEASE_API, timeout_seconds: 8.0f64);
+    let _ = req.set_header("User-Agent", to: "Desk420/${CURRENT_VERSION}");
+    let _ = req.set_header("Accept", to: "application/vnd.github+json");
+    return match http::send(req) {
+        result::Result::Ok(resp) => {
+            if !resp.is_success() {
+                UpdateCheckResult {
+                    kind: UpdateKind::Error,
+                    latest_tag: text::from_str(""),
+                    url: text::from_str(RELEASES_FALLBACK_URL),
+                    detail: "GitHub returned HTTP ${resp.status}.",
+                }
+            } else {
+                let body: text::Text = resp.body_text();
+                parse_latest_release_json(body.view(), current_ver: CURRENT_VERSION)
+            }
+        }
+        result::Result::Err(err) => UpdateCheckResult {
+            kind: UpdateKind::Error,
+            latest_tag: text::from_str(""),
+            url: text::from_str(RELEASES_FALLBACK_URL),
+            detail: "Update check failed: ${err.message.view()}",
+        },
+    };
+}
+
+static _CHECKING: bool = false;
+static _PENDING_RES_LIVE: bool = false;
+static _PENDING_RES: UpdateCheckResult = #zero::[UpdateCheckResult]();
+
+fn _on_update_alert(index: i32, _ctx: *u8) {
+    engine::refocus_main_window();
+    if index == (0 as i32) && _PENDING_RES_LIVE && !_PENDING_RES.url.is_empty() {
+        prefs::open_url(_PENDING_RES.url.view());
+    }
+}
+
+fn _present_update_on_main(_ctx: *u8) {
+    _CHECKING = false;
+    if !_PENDING_RES_LIVE { return; }
+    match _PENDING_RES.kind {
+        UpdateKind::UpToDate => {
+            let msg: text::Text = "You are running Desk420 v${CURRENT_VERSION}, the latest version.";
+            runtime::alert("Desk420 is up to date", msg.view(), "OK");
+        }
+        UpdateKind::Available => {
+            let msg: text::Text = "Desk420 ${_PENDING_RES.latest_tag.view()} is available (you have v${CURRENT_VERSION}).\n\nHomebrew users can run: brew upgrade --cask desk420";
+            runtime::alert(
+                "Update available",
+                msg.view(),
+                "Open Release",
+                secondary: "Later",
+                on_answer: _on_update_alert,
+            );
+        }
+        UpdateKind::Error => {
+            runtime::alert("Could not check for updates", _PENDING_RES.detail.view(), "OK");
+        }
+    }
+}
+
+fn _check_worker(_arg: i32) -> i32 {
+    let res: UpdateCheckResult = check_latest_release_sync();
+    _PENDING_RES = res;
+    _PENDING_RES_LIVE = true;
+    if services::has_main_hop() {
+        services::run_on_main(_present_update_on_main, 0 as *u8);
+    }
+    return 0 as i32;
+}
+
+fn check_for_updates_async() {
+    if _CHECKING { return; }
+    _CHECKING = true;
+    let _h: thread::JoinHandle[i32] = thread::spawn_with::[i32, i32](0 as i32, _check_worker);
+}
+
+// Build a privacy-safe diagnostic summary (never includes tokens or transcripts).
+fn build_debug_diagnostics() -> text::Text {
+    var out: text::Text = text::new();
+    let _ = out.append("Desk420 Diagnostics\n");
+    let _ = out.append("===================\n");
+    let _ = out.append("Desk420 version: ${CURRENT_VERSION}\n");
+
+    var sw_args: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = sw_args.append(text::from_str("/usr/bin/sw_vers"));
+    let sw: process::Output = process::capture(sw_args);
+    if sw.code == (0 as i32) && !sw.stdout.view().trim().is_empty() {
+        let _ = out.append("${sw.stdout.view().trim()}\n");
+    }
+
+    let cli_p: text::Text = engine::cli_path();
+    let cli_v: text::Text = engine::cli_version();
+    let _ = out.append("Grok CLI path: ${cli_p.view()}\n");
+    let _ = out.append("Grok CLI version: ${cli_v.view()}\n");
+    let mcp_running: str = if browser_mcp::is_running() { "yes" } else { "no" };
+    let _ = out.append("Browser MCP running: ${mcp_running}\n");
+    let _ = out.append("Appearance: ${prefs::appearance().word()}\n");
+    let _ = out.append("Preferred browser: ${prefs::browser().word()}\n");
+    let _ = out.append("Preferred editor: ${prefs::editor().word()}\n");
+    let _ = out.append("External ACI access: ${prefs::agent_access().word()}\n");
+    let _ = out.append("Saved projects: ${sessions::all_project_folders().count()}\n");
+    let _ = out.append("Known conversations: ${sessions::visible_rows().count()}\n");
+    return out;
+}
+
+fn export_debug_diagnostics() {
+    let report: text::Text = build_debug_diagnostics();
+    if let option::Option::Some(dest) = runtime::choose_save_path(name: "desk420-diagnostics.txt", extension: "txt") {
+        let _ = fs::write_string(dest.view(), report.view());
+    }
+}
+
+#[test]
+fn semver_comparison_and_release_json_parsing_work() {
+    assert is_newer_version("0.1.2", "v0.1.3");
+    assert is_newer_version("0.1.2", "0.2.0");
+    assert is_newer_version("0.1.2", "1.0.0");
+    assert !is_newer_version("0.1.2", "v0.1.2");
+    assert !is_newer_version("0.1.2", "v0.1.1");
+    assert !is_newer_version("0.2.0", "v0.1.9");
+
+    let r1: UpdateCheckResult = parse_latest_release_json("{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://github.com/netdur/desk420/releases/tag/v0.2.0\"}", current_ver: "0.1.2");
+    assert r1.kind == UpdateKind::Available;
+    assert r1.latest_tag.equals("v0.2.0");
+
+    let r2: UpdateCheckResult = parse_latest_release_json("{\"tag_name\":\"v0.1.2\",\"html_url\":\"https://github.com/netdur/desk420/releases/tag/v0.1.2\"}", current_ver: "0.1.2");
+    assert r2.kind == UpdateKind::UpToDate;
+}

@@ -1,0 +1,312 @@
+// src/ui/terminal_pane.cplus — embedded interactive PTY terminal for the
+// conversation inspector's Terminal tab, alongside a toggle for Grok's command log.
+
+import "facet/elements" as ui;
+import "facet/facet" as core;
+import "facet/icons" as icons;
+import "facet/mount" as mount;
+import "facet/text_button" as text_button;
+import "facet/vocabulary" as vocab;
+import "flex_layout/flex_layout" as flex;
+import "stdlib/env" as env;
+import "stdlib/option" as option;
+import "stdlib/path" as path;
+import "stdlib/process" as process;
+import "stdlib/text" as text;
+import "stdlib/vec" as vec;
+import "terminal/widget" as terminal;
+
+import "../engine/runtime" as engine;
+import "../store/ui_state" as ui_state;
+import "./style" as style;
+
+fn shell_single_quote(s: str) -> text::Text {
+    var out: text::Text = text::from_str("'");
+    let n: usize = s.count();
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(b) = s.byte_at(i) {
+            if b == (39 as u8) {
+                let _ = out.append("'\\''");
+            } else {
+                if let option::Option::Some(ch) = s.slice(from: i, to: i +% (1 as usize)) {
+                    let _ = out.append(ch);
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    let _ = out.append("'");
+    return out;
+}
+
+fn _effective_project_cwd() -> text::Text {
+    let cwd: text::Text = engine::active_cwd();
+    if !cwd.is_empty() && !cwd.contains(".desk420/") {
+        return cwd;
+    }
+    if let option::Option::Some(home) = env::var("HOME") {
+        return home;
+    }
+    return text::from_str("/tmp");
+}
+
+fn _dir_badge(cwd: str) -> text::Text {
+    if cwd == "" { return text::from_str(""); }
+    let name: str = path::file_name(cwd);
+    if name != "" { return text::from_str(name); }
+    return text::from_str(cwd);
+}
+
+struct TerminalPane {
+    widgets: vec::Vec[terminal::Widget],
+    mode_shell: bool,
+    last_cwd: text::Text,
+    mounted: bool,
+}
+
+impl TerminalPane {
+    fn new() -> TerminalPane {
+        return TerminalPane {
+            widgets: vec::new::[terminal::Widget](),
+            mode_shell: ui_state::terminal_mode_shell(),
+            last_cwd: text::from_str(""),
+            mounted: false,
+        };
+    }
+
+    fn build_toolbar(ref this) -> core::Node {
+        return @ui {
+            hstack(key: "term:toolbar") {
+                text_button("Shell", key: "term:mode_shell",
+                font_size: 11.5f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::ink(),
+                bordered: false,
+                corner_radius: vocab::Corners::all(6.0f64),
+                on_click: this.on_mode_shell)
+                    .padding_edge(flex::Edge::Horizontal, 9.0f64)
+                    .padding_edge(flex::Edge::Vertical, 4.0f64)
+                    .set_background_color(style::chip())
+
+                text_button("Agent log", key: "term:mode_log",
+                font_size: 11.5f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::muted(),
+                bordered: false,
+                corner_radius: vocab::Corners::all(6.0f64),
+                on_click: this.on_mode_log)
+                    .padding_edge(flex::Edge::Horizontal, 9.0f64)
+                    .padding_edge(flex::Edge::Vertical, 4.0f64)
+
+                label("", key: "term:cwd_badge",
+                font_size: 11.0f64,
+                text_color: style::faint(),
+                line_break: vocab::LineBreak::TailTruncation,
+                max_lines: 1 as i64)
+                    .shrink(1.0f64)
+                    .padding_edge(flex::Edge::Left, 4.0f64)
+
+                spacer().grow(1.0f64)
+
+                hstack(key: "term:shell_actions") {
+                    text_button("^C", key: "term:interrupt",
+                    font_size: 11.0f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::muted(),
+                    bordered: false,
+                    corner_radius: vocab::Corners::all(5.0f64),
+                    on_click: this.on_interrupt)
+                        .padding_edge(flex::Edge::Horizontal, 6.0f64)
+                        .padding_edge(flex::Edge::Vertical, 3.0f64)
+                    text_button("Clear", key: "term:clear",
+                    font_size: 11.0f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::muted(),
+                    bordered: false,
+                    corner_radius: vocab::Corners::all(5.0f64),
+                    on_click: this.on_clear)
+                        .padding_edge(flex::Edge::Horizontal, 6.0f64)
+                        .padding_edge(flex::Edge::Vertical, 3.0f64)
+                    style::circle_icon(icons::folder, "term:sync_cwd",
+                    title: "cd to project folder",
+                    size: 22.0f64, icon_size: 13.5f64,
+                    color: style::muted(),
+                    on_click: this.on_sync_cwd)
+                    style::circle_icon(icons::open_in_new, "term:open_ext",
+                    title: "Open in Terminal.app",
+                    size: 22.0f64, icon_size: 13.5f64,
+                    color: style::muted(),
+                    on_click: this.on_open_external)
+                }
+                .align(flex::Align::Center)
+                    .gap(4.0f64)
+            }
+            .align(flex::Align::Center)
+                .gap(4.0f64)
+                .padding_edge(flex::Edge::Horizontal, 12.0f64)
+                .padding_edge(flex::Edge::Vertical, 7.0f64)
+                .shrink(0.0f64)
+        };
+    }
+
+    fn build_shell_body(ref this) -> core::Node {
+        let init_cwd: text::Text = _effective_project_cwd();
+        this.last_cwd = init_cwd.clone();
+        this.widgets.remove_all();
+
+        var pty_node: core::Node = @ui {
+            column(key: "term:pty_fallback") {
+                label("Interactive terminal could not start.",
+                font_size: 12.5f64,
+                text_color: style::faint())
+            }
+            .align(flex::Align::Center)
+                .justify(flex::Justify::Center)
+                .grow(1.0f64)
+                .shrink(1.0f64)
+        };
+
+        if terminal::supported() {
+            if let option::Option::Some(w) = terminal::start(
+                cwd: init_cwd.view(),
+                font_size: 12.5f64,
+                save_history: false,
+            ) {
+                pty_node = w.node(key: "term:pty").grow(1.0f64).shrink(1.0f64);
+                let _ = this.widgets.append(w);
+            }
+        }
+
+        return @ui {
+            column(key: "term:shell_box") {
+                pty_node
+            }
+            .grow(1.0f64)
+                .shrink(1.0f64)
+                .padding_edge(flex::Edge::Horizontal, 6.0f64)
+                .padding_edge(flex::Edge::Vertical, 4.0f64)
+        };
+    }
+
+    fn arm(ref this) {
+        this.mounted = true;
+        this._sync_ui();
+    }
+
+    fn disarm(ref this) {
+        this.mounted = false;
+        if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+            (*wp).stop();
+        }
+        this.widgets.remove_all();
+    }
+
+    fn _sync_ui(ref this) {
+        if !this.mounted { return; }
+        let on_shell: bool = this.mode_shell;
+        if let option::Option::Some(n) = mount::find("term:mode_shell") {
+            core::set_background_color(n, if on_shell { style::chip() } else { vocab::Color::clear() });
+        }
+        if let option::Option::Some(n) = mount::find("term:mode_log") {
+            core::set_background_color(n, if !on_shell { style::chip() } else { vocab::Color::clear() });
+        }
+        if let option::Option::Some(tb) = text_button::find("term:mode_shell") {
+            let _tb: text_button::TextButton = tb.set_text_color(if on_shell { style::ink() } else { style::muted() });
+        }
+        if let option::Option::Some(tb) = text_button::find("term:mode_log") {
+            let _tb: text_button::TextButton = tb.set_text_color(if !on_shell { style::ink() } else { style::muted() });
+        }
+        style::show("term:shell_box", on_shell);
+        style::show("term:log_box", !on_shell);
+        style::show("term:shell_actions", on_shell && this.widgets.count() > (0 as usize));
+
+        let badge: text::Text = _dir_badge(this.last_cwd.view());
+        style::set_label("term:cwd_badge", badge.view());
+    }
+
+    fn _cd_to(ref this, target_cwd: str) {
+        if target_cwd == "" { return; }
+        this.last_cwd = text::from_str(target_cwd);
+        if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+            if (*wp).is_running() && !(*wp).alternate_screen() {
+                let q: text::Text = shell_single_quote(target_cwd);
+                let cmd: text::Text = "cd ${q.view()}";
+                let _id: u64 = (*wp).run(cmd.view());
+            }
+        }
+        this._sync_ui();
+    }
+
+    fn sync_project_cwd(ref this, cwd: str) {
+        if cwd == "" || cwd.contains(".desk420/") { return; }
+        if this.last_cwd.equals(cwd) { return; }
+        this._cd_to(cwd);
+    }
+
+    fn on_tab_shown(ref this) {
+        this.sync_project_cwd(engine::active_cwd().view());
+        this._sync_ui();
+        if this.mode_shell {
+            if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+                let _f: bool = (*wp).focus();
+            }
+        }
+    }
+
+    fn on_mode_shell(ref this, _sender: *u8) {
+        this.mode_shell = true;
+        ui_state::set_terminal_mode_shell(true);
+        this._sync_ui();
+        if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+            let _f: bool = (*wp).focus();
+        }
+    }
+
+    fn on_mode_log(ref this, _sender: *u8) {
+        this.mode_shell = false;
+        ui_state::set_terminal_mode_shell(false);
+        this._sync_ui();
+    }
+
+    fn on_interrupt(ref this, _sender: *u8) {
+        if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+            (*wp).interrupt();
+            let _f: bool = (*wp).focus();
+        }
+    }
+
+    fn on_clear(ref this, _sender: *u8) {
+        if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+            (*wp).clear();
+            let _f: bool = (*wp).focus();
+        }
+    }
+
+    fn on_sync_cwd(ref this, _sender: *u8) -> bool {
+        let cwd: text::Text = _effective_project_cwd();
+        this._cd_to(cwd.view());
+        if let option::Option::Some(wp) = this.widgets.at_ptr(0 as usize) {
+            let _f: bool = (*wp).focus();
+        }
+        return true;
+    }
+
+    fn on_open_external(ref this, _sender: *u8) -> bool {
+        let cwd: text::Text = _effective_project_cwd();
+        var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+        let _ = argv.append(text::from_str("/usr/bin/open"));
+        let _ = argv.append(text::from_str("-a"));
+        let _ = argv.append(text::from_str("Terminal"));
+        let _ = argv.append(cwd);
+        let _ = process::spawn(argv);
+        return true;
+    }
+}
+
+#[test]
+fn shell_single_quote_escapes_apostrophes_and_metacharacters() {
+    assert shell_single_quote("/Users/alice/my repo").equals("'/Users/alice/my repo'");
+    assert shell_single_quote("it's $(rm -rf /)").equals("'it'\\''s $(rm -rf /)'");
+    assert shell_single_quote("").equals("''");
+}

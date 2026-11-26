@@ -67,6 +67,7 @@ struct ProjectItem {
 }
 
 const EV_HOME_SLASH: str = "desk420.home.slash";
+const EV_HOME_PASTE_IMAGE: str = "desk420.home.paste_image";
 
 fn _option_of_kind(opts: vec::Vec[types::PermissionOption], allow: bool) -> text::Text {
     var i: usize = 0 as usize;
@@ -98,6 +99,7 @@ struct HomeView {
     status_sub: events::SignalSubscription[engine::EngineStateEvent],
     account_sub: events::SignalSubscription[account::AccountChange],
     slash_sub: events::Subscription,
+    paste_img_sub: events::Subscription,
 }
 
 impl HomeView {
@@ -116,6 +118,7 @@ impl HomeView {
             status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
             account_sub: events::SignalSubscription[account::AccountChange]::none(),
             slash_sub: events::Subscription::none(),
+            paste_img_sub: events::Subscription::none(),
         };
     }
 
@@ -478,6 +481,10 @@ impl HomeView {
         return true;
     }
 
+    fn on_paste_image_event(ref this, _ev: str) {
+        this.files.paste_clipboard_image();
+    }
+
     fn on_remove_attachment(ref this, sender: *u8) -> bool {
         this.files.remove_from_sender(sender);
         return true;
@@ -809,6 +816,7 @@ impl HomeView: component::Lifecycle {
         this.status_sub = engine::watch_status(this.on_status_changed);
         this.account_sub = account::watch(this.on_account_changed);
         this.slash_sub = events::on(EV_HOME_SLASH, this.on_slash_event);
+        this.paste_img_sub = events::on(EV_HOME_PASTE_IMAGE, this.on_paste_image_event);
         if let option::Option::Some(l) = m_list::find("home:needs") {
             let _l: m_list::List = l
                 .set_selection_mode(vocab::SelectionMode::None)
@@ -833,4 +841,8 @@ impl HomeView: component::Lifecycle {
 
 fn open_slash_commands() {
     events::emit(EV_HOME_SLASH);
+}
+
+fn paste_clipboard_image() {
+    events::emit(EV_HOME_PASTE_IMAGE);
 }

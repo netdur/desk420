@@ -33,6 +33,7 @@ import "facet/vocabulary" as vocab;
 import "facet_runtime/runtime" as runtime;
 import "flex_layout/flex_layout" as flex;
 import "json/json" as json;
+import "stdlib/fs" as fs;
 import "stdlib/math" as _;
 import "stdlib/option" as option;
 import "stdlib/path" as path;
@@ -44,12 +45,15 @@ import "stdlib/vec" as vec;
 import "../acp/types" as types;
 import "../acp/wire" as wire;
 import "../engine/runtime" as engine;
+import "../engine/worktree" as worktree;
 import "../markdown/parser" as md;
+import "../markdown/syntax" as syntax;
 import "../store/account" as account;
 import "../store/conversation" as conversation;
 import "../store/file_tree" as file_tree;
 import "../store/prefs" as prefs;
 import "../store/sessions" as sessions;
+import "../store/ui_state" as ui_state;
 import "./attachments" as attachments;
 import "./browser_pane" as browser_pane;
 import "./composer_popup" as composer_popup;
@@ -57,6 +61,7 @@ import "./panels" as panels;
 import "./pickers" as pickers;
 import "./plan_bar" as plan_bar;
 import "./style" as style;
+import "./terminal_pane" as terminal_pane;
 
 // ───────────────────────────── transcript row model ─────────────────────────────
 
@@ -109,6 +114,14 @@ impl InspectorTab {
             InspectorTab::Terminal => "terminal",
             InspectorTab::Preview => "preview",
         };
+    }
+
+    fn from_slug(s: str) -> InspectorTab {
+        if s == "files" { return InspectorTab::Files; }
+        if s == "browser" { return InspectorTab::Browser; }
+        if s == "terminal" { return InspectorTab::Terminal; }
+        if s == "preview" { return InspectorTab::Preview; }
+        return InspectorTab::Run;
     }
 }
 
@@ -217,10 +230,45 @@ fn _build_diff_spans(raw: str) -> vocab::Spans {
     return spans;
 }
 
+static _PENDING_DISCARD_FILE_LIVE: bool = false;
+static _PENDING_DISCARD_FILE: text::Text = #zero::[text::Text]();
+
 fn _on_git_discard_alert(index: i32, _ctx: *u8) {
     engine::refocus_main_window();
     if index == (0 as i32) {
         engine::git_discard_all();
+    }
+}
+
+static _PENDING_REMOVE_WT_LIVE: bool = false;
+static _PENDING_REMOVE_WT: text::Text = #zero::[text::Text]();
+
+fn _on_remove_worktree_alert(index: i32, _ctx: *u8) {
+    engine::refocus_main_window();
+    if !_PENDING_REMOVE_WT_LIVE { return; }
+    let wt: text::Text = _PENDING_REMOVE_WT.clone();
+    _PENDING_REMOVE_WT = text::from_str("");
+    _PENDING_REMOVE_WT_LIVE = false;
+    if index != (0 as i32) || wt.is_empty() { return; }
+    match worktree::remove_worktree(wt.view()) {
+        result::Result::Ok(_) => {
+            sessions::remove_project(wt.view());
+            engine::new_chat(cwd: "");
+        }
+        result::Result::Err(err) => {
+            runtime::alert("Could not remove worktree", err.view(), "OK");
+        }
+    }
+}
+
+fn _on_git_discard_file_alert(index: i32, _ctx: *u8) {
+    engine::refocus_main_window();
+    if !_PENDING_DISCARD_FILE_LIVE { return; }
+    let rel: text::Text = _PENDING_DISCARD_FILE.clone();
+    _PENDING_DISCARD_FILE = text::from_str("");
+    _PENDING_DISCARD_FILE_LIVE = false;
+    if index == (0 as i32) && !rel.is_empty() {
+        engine::git_discard_file(rel.view());
     }
 }
 
@@ -830,6 +878,10 @@ struct ChatScreen {
     rows: obs_vec::ObsVec[DisplayRow],
     steps: obs_vec::ObsVec[Step],
     file_entries: obs_vec::ObsVec[file_tree::TreeEntry],
+    git_file_rows: obs_vec::ObsVec[engine::GitFileChange],
+    git_files_epoch: u64,
+    preview_file_rel: text::Text,
+    preview_file_abs: text::Text,
     expanded_dirs: string_set::StringSet,
     file_tree_cwd: text::Text,
     file_tree_epoch: u64,
@@ -849,6 +901,7 @@ struct ChatScreen {
     popup: composer_popup::ComposerPopup,
     files: attachments::Attachments,
     browser: browser_pane::BrowserPane,
+    terminal: terminal_pane::TerminalPane,
     plan: plan_bar::PlanBar,
     panel: panels::TrailingPanel,
     copied_code_key: text::Text,
@@ -865,6 +918,8 @@ struct ChatScreen {
     status_sub: events::SignalSubscription[engine::EngineStateEvent],
     browser_tab_sub: events::Subscription,
     slash_sub: events::Subscription,
+    paste_img_sub: events::Subscription,
+    select_tab_sub: events::Subscription,
 }
 
 impl ChatScreen {
@@ -873,6 +928,10 @@ impl ChatScreen {
             rows: obs_vec::ObsVec[DisplayRow]::new(),
             steps: obs_vec::ObsVec[Step]::new(),
             file_entries: obs_vec::ObsVec[file_tree::TreeEntry]::new(),
+            git_file_rows: obs_vec::ObsVec[engine::GitFileChange]::new(),
+            git_files_epoch: 0 as u64,
+            preview_file_rel: text::from_str(""),
+            preview_file_abs: text::from_str(""),
             expanded_dirs: string_set::new(),
             file_tree_cwd: text::from_str(""),
             file_tree_epoch: 0 as u64,
@@ -896,6 +955,7 @@ impl ChatScreen {
             popup: composer_popup::ComposerPopup::new("chat", "chat:composer", stage_key: "conv:stage"),
             files: attachments::Attachments::new("chat", stage_key: "conv:stage", floating: true),
             browser: browser_pane::BrowserPane::new(),
+            terminal: terminal_pane::TerminalPane::new(),
             plan: plan_bar::PlanBar::new(stage_key: "conv:stage"),
             panel: panels::TrailingPanel::new("conv:split", 360.0f64),
             copied_code_key: text::from_str(""),
@@ -907,11 +967,13 @@ impl ChatScreen {
             preview_chunks: obs_vec::ObsVec[TextChunk]::new(),
             term_epoch: 0 as u64,
             preview_epoch: 0 as u64,
-            tab: InspectorTab::Run,
+            tab: InspectorTab::from_slug(ui_state::inspector_tab().view()),
             store_sub: events::SignalSubscription[conversation::StoreChange]::none(),
             status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
             browser_tab_sub: events::Subscription::none(),
             slash_sub: events::Subscription::none(),
+            paste_img_sub: events::Subscription::none(),
+            select_tab_sub: events::Subscription::none(),
         };
     }
 
@@ -1428,6 +1490,7 @@ impl ChatScreen {
             RowKind::AgentCode => {
                 let copy_key: text::Text = "chat:code_copy:${index}";
                 let header_txt: str = if lang_txt.is_empty() { "code" } else { lang_txt.view() };
+                let code_spans: vocab::Spans = syntax::highlight_code(body_txt.view(), lang_txt.view(), CODE_SIZE);
                 @ui {
                     column(key: outer_key.view()) {
                         column {
@@ -1454,7 +1517,8 @@ impl ChatScreen {
                             text_color: style::ink(),
                             line_break: vocab::LineBreak::WordWrap,
                             vertical_align: vocab::TextAlign::Start,
-                            selectable: true)
+                            selectable: true,
+                            formatted_text: code_spans)
                                 .width_percent(100.0f64)
                                 .height(0.0f64)
                                 .grow(1.0f64)
@@ -2023,6 +2087,75 @@ impl ChatScreen {
         services::run_on_main(this._apply_pending_ref);
     }
 
+    fn _open_file_preview(ref this, rel_path: str) {
+        let cwd: text::Text = engine::active_cwd();
+        if cwd.is_empty() || rel_path == "" { return; }
+        let full: text::Text = path::join(base: cwd.view(), child: rel_path);
+        this.preview_file_rel = text::from_str(rel_path);
+        this.preview_file_abs = full.clone();
+        style::set_label("files:preview_name", rel_path);
+        var body: text::Text = text::from_str("");
+        match fs::read_to_string(full.view()) {
+            result::Result::Ok(txt) => {
+                if txt.count() > (16000 as usize) {
+                    if let option::Option::Some(sl) = txt.view().slice(from: 0 as usize, to: 16000 as usize) {
+                        body = "${sl}\n… (preview truncated at 16 KB)";
+                    }
+                } else {
+                    body = txt;
+                }
+            }
+            result::Result::Err(_) => {
+                body = text::from_str("(Binary or unreadable file — use Open in Editor)");
+            }
+        }
+        let ext: str = path::extension(rel_path);
+        let spans: vocab::Spans = syntax::highlight_code(body.view(), ext, 12.0f64);
+        if let option::Option::Some(lbl) = label::find("files:preview_code") {
+            let _l: label::Label = lbl.set_text(body.view()).set_formatted_text(spans);
+        }
+        style::show("files:preview_box", true);
+        style::show("files:tree", false);
+    }
+
+    fn on_file_preview_close(ref this, _sender: *u8) -> bool {
+        this.preview_file_rel = text::from_str("");
+        this.preview_file_abs = text::from_str("");
+        style::show("files:preview_box", false);
+        style::show("files:tree", this.file_entries.count() > (0 as usize));
+        return true;
+    }
+
+    fn on_file_preview_ref(ref this, _sender: *u8) -> bool {
+        if !this.preview_file_rel.is_empty() {
+            this._insert_composer_ref(this.preview_file_rel.view(), false);
+        }
+        return true;
+    }
+
+    fn on_file_preview_open_editor(ref this, _sender: *u8) -> bool {
+        if !this.preview_file_abs.is_empty() {
+            prefs::open_in_editor(this.preview_file_abs.view());
+        }
+        return true;
+    }
+
+    fn on_files_open_editor(ref this, _sender: *u8) -> bool {
+        let cwd: text::Text = engine::active_cwd();
+        if !cwd.is_empty() && !cwd.contains(".desk420/chats") {
+            prefs::open_in_editor(cwd.view());
+        }
+        return true;
+    }
+
+    fn on_files_reveal(ref this, _sender: *u8) -> bool {
+        let cwd: text::Text = engine::active_cwd();
+        if !cwd.is_empty() && !cwd.contains(".desk420/chats") {
+            prefs::reveal_in_finder(cwd.view());
+        }
+        return true;
+    }
+
     fn on_file_row_tapped(ref this, sender: *u8) -> bool {
         guard let option::Option::Some(idx) = component::item_index_of(sender) else {
             return false;
@@ -2034,7 +2167,7 @@ impl ChatScreen {
             this._toggle_dir_expanded(rel.view());
             this._sync_file_tree(force: true);
         } else {
-            this._insert_composer_ref(rel.view(), false);
+            this._open_file_preview(rel.view());
         }
         return true;
     }
@@ -2118,9 +2251,181 @@ impl ChatScreen {
         style::set_label("preview:git_status", g_act.view());
         style::show("preview:git_status", !g_act.is_empty());
         let cwd: text::Text = engine::active_cwd();
-        let has_repo_cwd: bool = !cwd.is_empty() && !cwd.contains(".desk420/");
+        let has_repo_cwd: bool = !cwd.is_empty() && !cwd.contains(".desk420/chats");
         style::show("preview:git_toolbar", has_repo_cwd);
         style::show("preview:commit_bar", has_repo_cwd);
+
+        let br: text::Text = engine::git_branch();
+        style::set_label("preview:branch_badge", br.view());
+        style::show("preview:branch_badge", has_repo_cwd && !br.is_empty());
+        style::show("preview:rm_worktree", has_repo_cwd && worktree::is_worktree_path(cwd.view()));
+
+        let filter_p: text::Text = engine::git_filter_path();
+        if !filter_p.is_empty() {
+            style::set_label("preview:filter_label", "Diff: ${filter_p.view()}");
+        }
+        style::show("preview:filter_bar", has_repo_cwd && !filter_p.is_empty());
+
+        let gfiles: vec::Vec[engine::GitFileChange] = engine::git_files();
+        let gcount: usize = gfiles.count();
+        this.git_files_epoch = this.git_files_epoch +% (1 as u64);
+        let fv: *vec::Vec[engine::GitFileChange] = this.git_file_rows.as_vec_ptr();
+        (*fv).remove_all();
+        var gi: usize = 0 as usize;
+        while gi < gcount {
+            if let option::Option::Some(fp) = gfiles.at_ptr(gi) {
+                let _ = (*fv).append((*fp).clone());
+            }
+            gi = gi +% (1 as usize);
+        }
+        this.git_file_rows.note_reload();
+        let show_files: bool = has_repo_cwd && gcount > (0 as usize);
+        style::show("preview:files_list", show_files);
+        if show_files {
+            if let option::Option::Some(fn_node) = mount::find("preview:files_list") {
+                let want_h: f64 = ((gcount as f64) * 28.0f64).clamp(28.0f64, 140.0f64);
+                core::set_height(fn_node, want_h);
+            }
+        }
+    }
+
+    fn git_file_row_height(ref this, _index: usize, _width: f64) -> f64 {
+        return 28.0f64;
+    }
+
+    fn build_git_file_row(ref this, index: usize) -> core::Node {
+        let g: u64 = this.git_files_epoch;
+        let outer_key: text::Text = "preview:gf:${g}:${index}";
+        guard let option::Option::Some(fp) = this.git_file_rows.at_ptr(index) else {
+            return @ui { column(key: outer_key.view()) {} };
+        };
+        let st: text::Text = (*fp).status.clone();
+        let p: text::Text = (*fp).path.clone();
+        let is_staged: bool = (*fp).staged;
+        let is_unstaged: bool = (*fp).unstaged;
+        let st_col: vocab::Color = if st.equals("D") {
+            style::danger()
+        } else if st.equals("A") || st.equals("?") {
+            style::ok_green()
+        } else {
+            style::lime_text()
+        };
+        let pick_key: text::Text = "preview:gf_pick:${index}";
+        let toggle_key: text::Text = "preview:gf_tog:${index}";
+        let disc_key: text::Text = "preview:gf_disc:${index}";
+        let tog_lbl: str = if is_staged && !is_unstaged { "Unstage" } else { "Stage" };
+        return @ui {
+            hstack(key: outer_key.view()) {
+                hstack(key: pick_key.view()) {
+                    label(st.view(),
+                    font_family: ftheme::MONOSPACE,
+                    font_size: 11.0f64,
+                    font_weight: vocab::FontWeight::Bold,
+                    text_color: st_col)
+                        .width(16.0f64)
+                        .shrink(0.0f64)
+                        .set_input_transparent(true)
+                    label(p.view(),
+                    font_family: ftheme::MONOSPACE,
+                    font_size: 11.5f64,
+                    text_color: style::ink(),
+                    line_break: vocab::LineBreak::TailTruncation,
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                        .set_input_transparent(true)
+                }
+                .grow(1.0f64)
+                    .shrink(1.0f64)
+                    .min_width(0.0f64)
+                    .height(26.0f64)
+                    .align(flex::Align::Center)
+                    .gap(4.0f64)
+                    .gesture(on_click: this.on_git_file_pick)
+
+                text_button(tog_lbl, key: toggle_key.view(),
+                font_size: 10.5f64,
+                font_weight: vocab::FontWeight::Medium,
+                text_color: style::muted(),
+                bordered: false,
+                on_click: this.on_git_file_toggle_stage)
+                    .shrink(0.0f64)
+
+                if is_unstaged && !st.equals("?") {
+                    style::circle_icon(icons::close, disc_key.view(),
+                    title: "Discard file changes",
+                    size: 20.0f64, icon_size: 12.0f64,
+                    color: style::danger(),
+                    on_click: this.on_git_file_discard)
+                }
+            }
+            .height(28.0f64)
+                .align(flex::Align::Center)
+                .gap(4.0f64)
+                .padding_edge(flex::Edge::Horizontal, 12.0f64)
+        };
+    }
+
+    fn on_git_file_pick(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return false; };
+        guard let option::Option::Some(fp) = this.git_file_rows.at_ptr(idx) else { return false; };
+        engine::git_set_filter_file((*fp).path.view());
+        return true;
+    }
+
+    fn on_git_file_clear_filter(ref this, _sender: *u8) {
+        engine::git_set_filter_file("");
+    }
+
+    fn on_git_file_toggle_stage(ref this, sender: *u8) {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return; };
+        guard let option::Option::Some(fp) = this.git_file_rows.at_ptr(idx) else { return; };
+        let rel: text::Text = (*fp).path.clone();
+        if (*fp).staged && !(*fp).unstaged {
+            engine::git_unstage_file(rel.view());
+        } else {
+            engine::git_stage_file(rel.view());
+        }
+    }
+
+    fn on_git_file_discard(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(idx) = component::item_index_of(sender) else { return false; };
+        guard let option::Option::Some(fp) = this.git_file_rows.at_ptr(idx) else { return false; };
+        let rel: text::Text = (*fp).path.clone();
+        _PENDING_DISCARD_FILE = rel.clone();
+        _PENDING_DISCARD_FILE_LIVE = true;
+        let msg: text::Text = "Discard unstaged changes in \"${rel.view()}\"? This cannot be undone.";
+        runtime::alert(
+            "Discard file changes?",
+            msg.view(),
+            "Discard",
+            secondary: "Cancel",
+            on_answer: _on_git_discard_file_alert,
+        );
+        return true;
+    }
+
+    fn on_git_push(ref this, _sender: *u8) {
+        engine::git_push();
+    }
+
+    fn on_git_pr(ref this, _sender: *u8) {
+        engine::git_create_pr();
+    }
+
+    fn on_remove_worktree(ref this, _sender: *u8) {
+        let cwd: text::Text = engine::active_cwd();
+        if !worktree::is_worktree_path(cwd.view()) { return; }
+        _PENDING_REMOVE_WT = cwd.clone();
+        _PENDING_REMOVE_WT_LIVE = true;
+        runtime::alert(
+            "Remove git worktree?",
+            "This deletes the isolated worktree directory on disk and removes it from your sidebar. Your branch remains in the main repository.",
+            "Remove Worktree",
+            secondary: "Cancel",
+            on_answer: _on_remove_worktree_alert,
+        );
     }
 
     fn term_chunk_height(ref this, index: usize, width: f64) -> f64 {
@@ -2571,12 +2876,18 @@ impl ChatScreen {
             this.tab = InspectorTab::Browser;
             this.browser.sync();
         }
-        if v == "conv:tab:terminal" { this.tab = InspectorTab::Terminal; }
+        if v == "conv:tab:terminal" {
+            this.tab = InspectorTab::Terminal;
+        }
         if v == "conv:tab:preview" {
             this.tab = InspectorTab::Preview;
             engine::refresh_git_status();
         }
+        ui_state::set_inspector_tab(this.tab.slug());
         this._sync_tabs();
+        if v == "conv:tab:terminal" {
+            this.terminal.on_tab_shown();
+        }
         return true;
     }
 
@@ -3037,13 +3348,23 @@ impl ChatScreen: component::Component {
 
                     column(key: "conv:pane:files") {
                         hstack {
-                            label("Click a file or + to reference in prompt",
+                            label("Click to preview, + to reference",
                             font_size: 12.0f64,
                             text_color: style::faint(),
                             line_break: vocab::LineBreak::TailTruncation,
                             max_lines: 1 as i64)
                                 .grow(1.0f64)
                                 .shrink(1.0f64)
+                            style::circle_icon(icons::open_in_new, "files:open_editor",
+                            title: "Open project in editor",
+                            size: 24.0f64, icon_size: 14.5f64,
+                            color: style::muted(),
+                            on_click: this.on_files_open_editor)
+                            style::circle_icon(icons::folder_open, "files:reveal",
+                            title: "Reveal in Finder",
+                            size: 24.0f64, icon_size: 14.5f64,
+                            color: style::muted(),
+                            on_click: this.on_files_reveal)
                             style::circle_icon(icons::refresh, "files:refresh",
                             title: "Refresh files",
                             size: 24.0f64, icon_size: 15.0f64,
@@ -3051,10 +3372,61 @@ impl ChatScreen: component::Component {
                             on_click: this.on_files_refresh)
                         }
                         .align(flex::Align::Center)
-                            .gap(6.0f64)
-                            .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                            .gap(4.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
                             .padding_edge(flex::Edge::Top, 10.0f64)
                             .padding_edge(flex::Edge::Bottom, 6.0f64)
+                        column(key: "files:preview_box") {
+                            hstack {
+                                label("", key: "files:preview_name",
+                                font_family: ftheme::MONOSPACE,
+                                font_size: 11.5f64,
+                                font_weight: vocab::FontWeight::Medium,
+                                text_color: style::ink(),
+                                line_break: vocab::LineBreak::TailTruncation,
+                                max_lines: 1 as i64)
+                                    .grow(1.0f64)
+                                    .shrink(1.0f64)
+                                    .min_width(0.0f64)
+                                style::circle_icon(icons::add, "files:preview_ref",
+                                title: "Reference in prompt",
+                                size: 22.0f64, icon_size: 14.0f64,
+                                color: style::muted(),
+                                on_click: this.on_file_preview_ref)
+                                style::circle_icon(icons::open_in_new, "files:preview_open",
+                                title: "Open in editor",
+                                size: 22.0f64, icon_size: 13.5f64,
+                                color: style::muted(),
+                                on_click: this.on_file_preview_open_editor)
+                                style::circle_icon(icons::close, "files:preview_close",
+                                title: "Close preview",
+                                size: 22.0f64, icon_size: 13.5f64,
+                                color: style::muted(),
+                                on_click: this.on_file_preview_close)
+                            }
+                            .align(flex::Align::Center)
+                                .gap(4.0f64)
+                                .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                                .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                .set_background_color(style::chip())
+                                .shrink(0.0f64)
+                            scroll(key: "files:preview_scroll") {
+                                label("", key: "files:preview_code",
+                                font_family: ftheme::MONOSPACE,
+                                font_size: 12.0f64,
+                                font_scales: false,
+                                line_height: 17.5f64,
+                                text_color: style::ink(),
+                                line_break: vocab::LineBreak::WordWrap,
+                                vertical_align: vocab::TextAlign::Start,
+                                selectable: true)
+                                    .padding(14.0f64)
+                            }
+                            .grow(1.0f64)
+                                .shrink(1.0f64)
+                        }
+                        .grow(1.0f64)
+                            .shrink(1.0f64)
                         this._empty_note("files:empty", "No project folder is linked to this run.")
                         relist(this.file_entries,
                         key: "files:tree",
@@ -3073,13 +3445,20 @@ impl ChatScreen: component::Component {
                         .shrink(1.0f64)
 
                     column(key: "conv:pane:terminal") {
-                        this._empty_note("terminal:empty", "Commands Grok runs, and their output, show here.")
-                        relist(this.term_chunks,
-                        key: "terminal:list",
-                        builder: this.build_term_chunk,
-                        uneven_rows: true,
-                        row_height_at: this.term_chunk_height)
-                            .grow(1.0f64)
+                        this.terminal.build_toolbar()
+                        style::rule()
+                        this.terminal.build_shell_body()
+                        column(key: "term:log_box") {
+                            this._empty_note("terminal:empty", "Commands Grok runs, and their output, show here.")
+                            relist(this.term_chunks,
+                            key: "terminal:list",
+                            builder: this.build_term_chunk,
+                            uneven_rows: true,
+                            row_height_at: this.term_chunk_height)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                        }
+                        .grow(1.0f64)
                             .shrink(1.0f64)
                     }
                     .grow(1.0f64)
@@ -3087,22 +3466,49 @@ impl ChatScreen: component::Component {
 
                     column(key: "conv:pane:preview") {
                         hstack(key: "preview:git_toolbar") {
+                            label("", key: "preview:branch_badge",
+                            font_family: ftheme::MONOSPACE,
+                            font_size: 11.0f64,
+                            font_weight: vocab::FontWeight::Semibold,
+                            text_color: style::lime_text(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                                .max_width(96.0f64)
+                                .shrink(1.0f64)
                             text_button("Stage all", key: "preview:stage_all",
-                            font_size: 11.5f64,
+                            font_size: 11.0f64,
                             font_weight: vocab::FontWeight::Medium,
                             text_color: style::ink(),
                             bordered: false,
                             corner_radius: vocab::Corners::all(6.0f64),
                             on_click: this.on_git_stage)
-                                .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                                .padding_edge(flex::Edge::Horizontal, 7.0f64)
                                 .padding_edge(flex::Edge::Vertical, 4.0f64)
                                 .set_background_color(style::chip())
                             text_button("Discard", key: "preview:discard_all",
-                            font_size: 11.5f64,
+                            font_size: 11.0f64,
                             font_weight: vocab::FontWeight::Medium,
                             text_color: style::danger(),
                             bordered: false,
                             on_click: this.on_git_discard)
+                            text_button("Push", key: "preview:push",
+                            font_size: 11.0f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::muted(),
+                            bordered: false,
+                            on_click: this.on_git_push)
+                            text_button("PR", key: "preview:pr",
+                            font_size: 11.0f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::muted(),
+                            bordered: false,
+                            on_click: this.on_git_pr)
+                            text_button("Drop WT", key: "preview:rm_worktree",
+                            font_size: 11.0f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::danger(),
+                            bordered: false,
+                            on_click: this.on_remove_worktree)
                             spacer().grow(1.0f64)
                             style::circle_icon(icons::refresh, "preview:refresh",
                             title: "Refresh git diff",
@@ -3111,8 +3517,8 @@ impl ChatScreen: component::Component {
                             on_click: this.on_git_refresh)
                         }
                         .align(flex::Align::Center)
-                            .gap(8.0f64)
-                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                            .gap(6.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 12.0f64)
                             .padding_edge(flex::Edge::Vertical, 8.0f64)
                             .shrink(0.0f64)
 
@@ -3150,6 +3556,36 @@ impl ChatScreen: component::Component {
                             .padding_edge(flex::Edge::Bottom, 6.0f64)
                             .shrink(0.0f64)
 
+                        relist(this.git_file_rows,
+                        key: "preview:files_list",
+                        builder: this.build_git_file_row,
+                        row_height_at: this.git_file_row_height)
+                            .height(112.0f64)
+                            .shrink(0.0f64)
+
+                        hstack(key: "preview:filter_bar") {
+                            label("", key: "preview:filter_label",
+                            font_family: ftheme::MONOSPACE,
+                            font_size: 11.0f64,
+                            text_color: style::muted(),
+                            line_break: vocab::LineBreak::TailTruncation,
+                            max_lines: 1 as i64)
+                                .grow(1.0f64)
+                                .shrink(1.0f64)
+                                .min_width(0.0f64)
+                            text_button("Show all", key: "preview:filter_clear",
+                            font_size: 11.0f64,
+                            font_weight: vocab::FontWeight::Medium,
+                            text_color: style::lime_text(),
+                            bordered: false,
+                            on_click: this.on_git_file_clear_filter)
+                        }
+                        .align(flex::Align::Center)
+                            .gap(6.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 14.0f64)
+                            .padding_edge(flex::Edge::Vertical, 4.0f64)
+                            .shrink(0.0f64)
+
                         style::rule()
 
                         this._empty_note("preview:empty", "File changes in this run show here.")
@@ -3175,6 +3611,41 @@ impl ChatScreen: component::Component {
 }
 
 const EV_CHAT_SLASH: str = "desk420.chat.slash";
+const EV_CHAT_PASTE_IMAGE: str = "desk420.chat.paste_image";
+const EV_CHAT_SELECT_TAB: str = "desk420.chat.select_tab";
+
+static _WANT_TAB_SLUG: str = "";
+
+impl ChatScreen {
+    fn on_paste_image_event(ref this, _ev: str) {
+        this.files.paste_clipboard_image();
+    }
+
+    fn on_select_tab_event(ref this, _ev: str) {
+        let slug: str = _WANT_TAB_SLUG;
+        if slug == "" { return; }
+        panels::show_panel();
+        if slug == "run" {
+            this.tab = InspectorTab::Run;
+        } else if slug == "files" {
+            this.tab = InspectorTab::Files;
+            this._sync_file_tree(force: true);
+        } else if slug == "browser" {
+            this.tab = InspectorTab::Browser;
+            this.browser.sync();
+        } else if slug == "terminal" {
+            this.tab = InspectorTab::Terminal;
+        } else if slug == "preview" {
+            this.tab = InspectorTab::Preview;
+            engine::refresh_git_status();
+        }
+        ui_state::set_inspector_tab(this.tab.slug());
+        this._sync_tabs();
+        if slug == "terminal" {
+            this.terminal.on_tab_shown();
+        }
+    }
+}
 
 impl ChatScreen: component::Lifecycle {
     fn on_attach(ref this, why: component::Attach) {
@@ -3184,6 +3655,8 @@ impl ChatScreen: component::Lifecycle {
         this.status_sub = engine::watch_status(this.on_status_changed);
         this.browser_tab_sub = events::on(browser_pane::EV_SHOW_BROWSER_TAB, this.on_show_browser_tab);
         this.slash_sub = events::on(EV_CHAT_SLASH, this.on_slash_event);
+        this.paste_img_sub = events::on(EV_CHAT_PASTE_IMAGE, this.on_paste_image_event);
+        this.select_tab_sub = events::on(EV_CHAT_SELECT_TAB, this.on_select_tab_event);
 
         this.panel.arm();
         panels::sync_panel("conv:split", "conv:panel");
@@ -3192,8 +3665,12 @@ impl ChatScreen: component::Lifecycle {
         style::show("chat:loading_box", false);
         style::show("chat:error_box", false);
         style::show("chat:empty_box", false);
+        style::show("files:preview_box", false);
+        style::show("preview:files_list", false);
+        style::show("preview:filter_bar", false);
         this.files.sync();
         this.browser.arm();
+        this.terminal.arm();
         this._sync_tabs();
         this._sync_pickers();
         this._sync_transcript();
@@ -3202,12 +3679,22 @@ impl ChatScreen: component::Lifecycle {
     fn on_detach(ref this, why: component::Detach) {
         if why == component::Detach::Unmount {
             this.browser.disarm();
+            this.terminal.disarm();
         }
     }
 }
 
 fn open_slash_commands() {
     events::emit(EV_CHAT_SLASH);
+}
+
+fn paste_clipboard_image() {
+    events::emit(EV_CHAT_PASTE_IMAGE);
+}
+
+fn select_tab(slug: str) {
+    _WANT_TAB_SLUG = text::intern(slug);
+    events::emit(EV_CHAT_SELECT_TAB);
 }
 
 #[test]

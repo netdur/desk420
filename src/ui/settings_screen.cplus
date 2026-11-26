@@ -15,17 +15,21 @@ import "facet/icons" as icons;
 import "facet/popup" as m_popup;
 import "facet/screen" as screen;
 import "facet/text_button" as text_button;
+import "facet/text_field" as text_field;
 import "facet/theme" as ftheme;
 import "facet/vocabulary" as vocab;
 import "facet/window_chrome" as window_chrome;
 import "flex_layout/flex_layout" as flex;
 import "notifications/notifications" as notifications;
 import "permissions/permissions" as permissions;
+import "stdlib/fs" as fs;
 import "stdlib/option" as option;
+import "stdlib/path" as path;
 import "stdlib/text" as text;
 
 import "../agent_consent" as agent_consent;
 import "../engine/runtime" as engine;
+import "../engine/updater" as updater;
 import "../store/account" as account;
 import "../store/prefs" as prefs;
 import "./quick_ask" as quick_ask;
@@ -154,6 +158,15 @@ impl SettingsScreen {
         if let option::Option::Some(bp) = m_popup::find("settings:browser") {
             let _bp: m_popup::Popup = bp.set_selected_index(prefs::browser().to_index());
         }
+        if let option::Option::Some(ep) = m_popup::find("settings:editor") {
+            let _ep: m_popup::Popup = ep.set_selected_index(prefs::editor().to_index());
+        }
+        if let option::Option::Some(al) = text_field::find("settings:allowlist") {
+            if !al.is_focused() {
+                let cur_al: text::Text = prefs::custom_allowlist();
+                let _al: text_field::TextField = al.set_text(cur_al.view());
+            }
+        }
         if let option::Option::Some(sk) = m_popup::find("settings:send_key") {
             let _sk: m_popup::Popup = sk.set_selected_index(prefs::send_key().to_index());
         }
@@ -236,6 +249,42 @@ impl SettingsScreen {
         prefs::set_browser(pick);
     }
 
+    fn on_editor_changed(ref this, _sender: *u8) {
+        guard let option::Option::Some(ep) = m_popup::find("settings:editor") else { return; };
+        let pick: prefs::EditorPref = prefs::EditorPref::from_index(ep.selected_index());
+        prefs::set_editor(pick);
+    }
+
+    fn on_save_allowlist(ref this, _sender: *u8) {
+        guard let option::Option::Some(al) = text_field::find("settings:allowlist") else { return; };
+        let raw: text::Text = text::from_str(al.text());
+        prefs::set_custom_allowlist(raw.view());
+    }
+
+    fn on_open_project_rules(ref this, _sender: *u8) {
+        let cwd: text::Text = engine::active_cwd();
+        if cwd.is_empty() || cwd.contains(".desk420/chats") { return; }
+        let agents_md: text::Text = path::join(base: cwd.view(), child: "AGENTS.md");
+        if fs::exists(agents_md.view()) {
+            prefs::open_in_editor(agents_md.view());
+            return;
+        }
+        let grok_md: text::Text = path::join(base: cwd.view(), child: "GROK.md");
+        if fs::exists(grok_md.view()) {
+            prefs::open_in_editor(grok_md.view());
+            return;
+        }
+        prefs::open_in_editor(cwd.view());
+    }
+
+    fn on_check_updates(ref this, _sender: *u8) {
+        updater::check_for_updates_async();
+    }
+
+    fn on_export_diagnostics(ref this, _sender: *u8) {
+        updater::export_debug_diagnostics();
+    }
+
     fn on_send_key_changed(ref this, _sender: *u8) {
         guard let option::Option::Some(sk) = m_popup::find("settings:send_key") else { return; };
         prefs::set_send_key(prefs::SendKeyPref::from_index(sk.selected_index()));
@@ -299,6 +348,14 @@ impl SettingsScreen: component::Component {
         let _ = browser_items.add(prefs::BrowserPref::Brave.label());
         let _ = browser_items.add(prefs::BrowserPref::Edge.label());
         let _ = browser_items.add(prefs::BrowserPref::Zen.label());
+
+        var editor_items: vocab::TextList = vocab::TextList::new();
+        let _ = editor_items.add(prefs::EditorPref::System.label());
+        let _ = editor_items.add(prefs::EditorPref::Cursor.label());
+        let _ = editor_items.add(prefs::EditorPref::VSCode.label());
+        let _ = editor_items.add(prefs::EditorPref::Zed.label());
+        let _ = editor_items.add(prefs::EditorPref::Xcode.label());
+        let _ = editor_items.add(prefs::EditorPref::Finder.label());
 
         var send_key_items: vocab::TextList = vocab::TextList::new();
         let _ = send_key_items.add("Return");
@@ -464,13 +521,50 @@ impl SettingsScreen: component::Component {
                                 .align(flex::Align::Stretch)
                             })
 
-                            _section("PERMISSIONS", "settings:permissions_card", this._popup_row(
-                                "Default approval mode",
-                                "Choose whether Grok asks before running tools",
-                                "settings:mode",
-                                mode_items,
-                                this.on_mode_changed,
-                            ))
+                            _section("PERMISSIONS", "settings:permissions_card", @ui {
+                                column {
+                                    this._popup_row(
+                                        "Approval mode",
+                                        "Applies to the active conversation (Ask, Auto-approve, or Custom read-only allowlist)",
+                                        "settings:mode",
+                                        mode_items,
+                                        this.on_mode_changed,
+                                    )
+                                    style::rule()
+                                    column {
+                                        _setting_copy(
+                                            "Custom mode extra commands",
+                                            "Comma-separated prefixes allowed in Custom mode without shell metacharacters (e.g. cpc check, cargo test)",
+                                        )
+                                        hstack {
+                                            text_field("", key: "settings:allowlist",
+                                            font_family: ftheme::MONOSPACE,
+                                            font_size: 12.0f64,
+                                            placeholder: "e.g. cpc check, cargo test, npm test",
+                                            on_submit: this.on_save_allowlist)
+                                                .grow(1.0f64)
+                                                .shrink(1.0f64)
+                                                .height(26.0f64)
+                                            text_button("Save", key: "settings:allowlist_save",
+                                            font_size: 12.0f64,
+                                            font_weight: vocab::FontWeight::Medium,
+                                            text_color: style::ink(),
+                                            bordered: false,
+                                            corner_radius: vocab::Corners::all(6.0f64),
+                                            on_click: this.on_save_allowlist)
+                                                .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                                .padding_edge(flex::Edge::Vertical, 4.0f64)
+                                                .set_background_color(style::chip())
+                                                .shrink(0.0f64)
+                                        }
+                                        .align(flex::Align::Center)
+                                            .gap(8.0f64)
+                                    }
+                                    .gap(8.0f64)
+                                        .padding(14.0f64)
+                                }
+                                .align(flex::Align::Stretch)
+                            })
 
                             _section("AGENT ACCESS", "settings:access_card", this._popup_row(
                                 "External MCP access",
@@ -522,6 +616,44 @@ impl SettingsScreen: component::Component {
                                 .padding(14.0f64)
                                     .align(flex::Align::Stretch)
                             })
+
+                            _section("PROJECT & DIAGNOSTICS", "settings:diag_card", @ui {
+                                hstack {
+                                    text_button("Open AGENTS.md", key: "settings:open_rules",
+                                    font_size: 12.0f64,
+                                    font_weight: vocab::FontWeight::Medium,
+                                    text_color: style::ink(),
+                                    bordered: false,
+                                    corner_radius: vocab::Corners::all(7.0f64),
+                                    on_click: this.on_open_project_rules)
+                                        .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                        .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                        .set_background_color(style::chip())
+                                    text_button("Check for Updates…", key: "settings:check_updates",
+                                    font_size: 12.0f64,
+                                    font_weight: vocab::FontWeight::Medium,
+                                    text_color: style::ink(),
+                                    bordered: false,
+                                    corner_radius: vocab::Corners::all(7.0f64),
+                                    on_click: this.on_check_updates)
+                                        .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                        .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                        .set_background_color(style::chip())
+                                    spacer().grow(1.0f64)
+                                    text_button("Export Logs…", key: "settings:export_logs",
+                                    font_size: 12.0f64,
+                                    font_weight: vocab::FontWeight::Medium,
+                                    text_color: style::muted(),
+                                    bordered: false,
+                                    corner_radius: vocab::Corners::all(7.0f64),
+                                    on_click: this.on_export_diagnostics)
+                                        .padding_edge(flex::Edge::Horizontal, 10.0f64)
+                                        .padding_edge(flex::Edge::Vertical, 6.0f64)
+                                }
+                                .align(flex::Align::Center)
+                                    .gap(8.0f64)
+                                    .padding(14.0f64)
+                            })
                         }
                         .width_percent(100.0f64)
                             .gap(18.0f64)
@@ -543,13 +675,26 @@ impl SettingsScreen: component::Component {
                                 this.on_appearance_changed,
                             ))
 
-                            _section("BROWSER", "settings:browser_card", this._popup_row(
-                                "Default browser",
-                                "Browser used for Grok sign-in and external links",
-                                "settings:browser",
-                                browser_items,
-                                this.on_browser_changed,
-                            ))
+                            _section("BROWSER & EDITOR", "settings:browser_card", @ui {
+                                column {
+                                    this._popup_row(
+                                        "Default browser",
+                                        "Browser used for Grok sign-in and external links",
+                                        "settings:browser",
+                                        browser_items,
+                                        this.on_browser_changed,
+                                    )
+                                    style::rule()
+                                    this._popup_row(
+                                        "Preferred editor",
+                                        "Application launched by Open in Editor buttons",
+                                        "settings:editor",
+                                        editor_items,
+                                        this.on_editor_changed,
+                                    )
+                                }
+                                .align(flex::Align::Stretch)
+                            })
 
                             _section("COMPOSER & TRANSCRIPT", "settings:composer_card", @ui {
                                 column {

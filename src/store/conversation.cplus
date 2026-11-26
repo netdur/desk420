@@ -1366,6 +1366,49 @@ fn last_answer_text(session_id: str) -> text::Text {
     return out;
 }
 
+fn export_markdown(session_id: str) -> text::Text {
+    _ensure_global();
+    guard let option::Option::Some(sidx) = _STORE.find_session_index(session_id) else {
+        return text::from_str("");
+    };
+    guard let option::Option::Some(sp) = _STORE.sessions.at_ptr(sidx) else {
+        return text::from_str("");
+    };
+    var out: text::Text = text::new();
+    let title: str = if (*sp).title.is_empty() { "Desk420 Conversation" } else { (*sp).title.view() };
+    let _ = out.append("# ${title}\n");
+    if !(*sp).cwd.is_empty() && !(*sp).cwd.contains(".desk420/") {
+        let _ = out.append("\n_Project: `${(*sp).cwd.view()}`_\n");
+    }
+    var i: usize = 0 as usize;
+    while i < (*sp).blocks.count() {
+        if let option::Option::Some(bp) = (*sp).blocks.at_ptr(i) {
+            let k: BlockKind = (*bp).kind();
+            if k == BlockKind::UserText {
+                let body: text::Text = (*bp).text_body();
+                if !body.is_empty() {
+                    let _ = out.append("\n## You\n\n${body.view()}\n");
+                }
+            } else if k == BlockKind::AgentText {
+                let body: text::Text = (*bp).text_body();
+                if !body.is_empty() {
+                    let _ = out.append("\n## Grok\n\n${body.view()}\n");
+                }
+            } else if k == BlockKind::ToolCall {
+                if let option::Option::Some(tb) = (*bp).clone_tool_block() {
+                    let tlabel: str = if tb.title.is_empty() { "Tool" } else { tb.title.view() };
+                    let _ = out.append("\n> **${tlabel}**\n");
+                    if !tb.output_text.is_empty() {
+                        let _ = out.append("\n```text\n${tb.output_text.view()}\n```\n");
+                    }
+                }
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return out;
+}
+
 // ───────────────────────────── tests ─────────────────────────────
 
 fn _replay_fixture_into_store(ref store: ConversationStore, fixture_path: str) -> usize {
@@ -1568,4 +1611,20 @@ fn batch_emits_notification_for_every_modified_session() {
     // Both session 0 and session 1 must be notified, with duplicates coalesced.
     assert _BATCH_TEST_COUNT == (2 as usize);
     assert _BATCH_TEST_MASK == (3 as u64);
+}
+
+#[test]
+fn export_markdown_formats_turns_and_title() {
+    begin_turn("exp-1", "Show hello");
+    set_session_title("exp-1", "Hello Session");
+    apply_update(types::SessionUpdateEnvelope {
+        session_id: text::from_str("exp-1"),
+        update: types::SessionUpdate::AgentMessageChunk(text::from_str("Hello from Grok!")),
+    });
+    let md_out: text::Text = export_markdown("exp-1");
+    assert md_out.contains("# Hello Session");
+    assert md_out.contains("## You");
+    assert md_out.contains("Show hello");
+    assert md_out.contains("## Grok");
+    assert md_out.contains("Hello from Grok!");
 }

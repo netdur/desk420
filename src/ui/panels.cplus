@@ -19,6 +19,8 @@ import "facet/split" as m_split;
 import "stdlib/option" as option;
 import "stdlib/text" as text;
 
+import "../store/ui_state" as ui_state;
+
 const SIDEBAR_W: f64 = 320.0f64;
 const SIDEBAR_MIN: f64 = 240.0f64;
 const SIDEBAR_MAX: f64 = 440.0f64;
@@ -26,11 +28,20 @@ const PANEL_MIN: f64 = 260.0f64;
 const CENTRE_MIN: f64 = 460.0f64;
 const DIVIDER: f64 = 1.0f64;
 
+static _INIT: bool = false;
 static _SIDEBAR_HIDDEN: bool = false;
 static _PANEL_HIDDEN: bool = false;
 
-fn sidebar_hidden() -> bool { return _SIDEBAR_HIDDEN; }
-fn panel_hidden() -> bool { return _PANEL_HIDDEN; }
+fn _ensure_state() {
+    if _INIT { return; }
+    _INIT = true;
+    _SIDEBAR_HIDDEN = ui_state::sidebar_hidden();
+    _PANEL_HIDDEN = ui_state::panel_hidden();
+}
+
+fn sidebar_hidden() -> bool { _ensure_state(); return _SIDEBAR_HIDDEN; }
+fn panel_hidden() -> bool { _ensure_state(); return _PANEL_HIDDEN; }
+fn initial_sidebar_width() -> f64 { return ui_state::sidebar_width(); }
 
 fn _set_pane(split_key: str, pane_key: str, pane: m_split::Pane, hidden: bool) {
     guard let option::Option::Some(sp) = m_split::find(split_key) else { return; };
@@ -43,24 +54,52 @@ fn _set_pane(split_key: str, pane_key: str, pane: m_split::Pane, hidden: bool) {
     }
 }
 
+fn _on_sidebar_split_moved(_sender: *u8, _ctx: *u8) {
+    guard let option::Option::Some(sp) = m_split::find("main:split") else { return; };
+    if sp.is_collapsed(m_split::Pane::Leading) { return; }
+    let pos: f64 = sp.position();
+    if pos >= SIDEBAR_MIN && pos <= SIDEBAR_MAX {
+        ui_state::set_sidebar_width(pos);
+    }
+}
+
+fn arm_sidebar() {
+    _ensure_state();
+    if let option::Option::Some(sp) = m_split::find("main:split") {
+        let _s: m_split::Split = sp.set_on_move(_on_sidebar_split_moved);
+        if _SIDEBAR_HIDDEN {
+            _set_pane("main:split", "side:pane", m_split::Pane::Leading, true);
+        } else {
+            let saved_w: f64 = ui_state::sidebar_width();
+            let _p: m_split::Split = sp.set_position(saved_w);
+        }
+    }
+}
+
 fn toggle_sidebar() {
+    _ensure_state();
     _SIDEBAR_HIDDEN = !_SIDEBAR_HIDDEN;
+    ui_state::set_sidebar_hidden(_SIDEBAR_HIDDEN);
     _set_pane("main:split", "side:pane", m_split::Pane::Leading, _SIDEBAR_HIDDEN);
 }
 
 fn show_sidebar() {
+    _ensure_state();
     if _SIDEBAR_HIDDEN {
         toggle_sidebar();
     }
 }
 
 fn toggle_panel() {
+    _ensure_state();
     _PANEL_HIDDEN = !_PANEL_HIDDEN;
+    ui_state::set_panel_hidden(_PANEL_HIDDEN);
     _set_pane("home:split", "home:panel", m_split::Pane::Trailing, _PANEL_HIDDEN);
     _set_pane("conv:split", "conv:panel", m_split::Pane::Trailing, _PANEL_HIDDEN);
 }
 
 fn show_panel() {
+    _ensure_state();
     if _PANEL_HIDDEN {
         toggle_panel();
     }
@@ -68,6 +107,7 @@ fn show_panel() {
 
 // Bring a freshly mounted inspector in line with the shared hidden state.
 fn sync_panel(split_key: str, pane_key: str) {
+    _ensure_state();
     if _PANEL_HIDDEN {
         _set_pane(split_key, pane_key, m_split::Pane::Trailing, true);
     }
@@ -91,7 +131,7 @@ impl TrailingPanel {
     fn new(split_key: str, width: f64) -> TrailingPanel {
         return TrailingPanel {
             split_key: text::from_str(split_key),
-            width: width,
+            width: ui_state::panel_width(split_key, width),
             placed_total: 0.0f64,
             watch: services::Cancellable::none(),
         };
@@ -119,7 +159,10 @@ impl TrailingPanel {
             return;
         }
         let w: f64 = total - sp.position() - DIVIDER;
-        if w >= PANEL_MIN { this.width = w; }
+        if w >= PANEL_MIN {
+            this.width = w;
+            ui_state::set_panel_width(this.split_key.view(), w);
+        }
     }
 
     // The split changed size (window resize, sidebar shown or hidden): keep

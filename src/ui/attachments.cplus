@@ -18,9 +18,12 @@ import "facet/vocabulary" as vocab;
 import "facet_runtime/runtime" as runtime;
 import "flex_layout/flex_layout" as flex;
 import "stdlib/base64" as base64;
+import "stdlib/crypto" as crypto;
+import "stdlib/env" as env;
 import "stdlib/fs" as fs;
 import "stdlib/option" as option;
 import "stdlib/path" as path;
+import "stdlib/process" as process;
 import "stdlib/result" as result;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
@@ -100,6 +103,110 @@ fn _load_one_attachment(file_path: str) -> option::Option[types::Attachment] {
     return option::Option[types::Attachment]::None;
 }
 
+fn _pasted_images_dir() -> text::Text {
+    if let option::Option::Some(home) = env::var("HOME") {
+        let d: text::Text = path::join(base: home.view(), child: ".desk420/pasted");
+        let _ = fs::create_dir_all(d.view());
+        return d;
+    }
+    let fallback: text::Text = text::from_str("/tmp/desk420-pasted");
+    let _ = fs::create_dir_all(fallback.view());
+    return fallback;
+}
+
+// Extract an image from the macOS clipboard into a PNG file and load it as an Attachment.
+fn _read_clipboard_image_file() -> option::Option[text::Text] {
+    let dir: text::Text = _pasted_images_dir();
+    let tag: text::Text = match crypto::random_hex(6 as usize) {
+        option::Option::Some(h) => h,
+        option::Option::None => text::from_str("clip"),
+    };
+    let png_path: text::Text = path::join(base: dir.view(), child: "paste-${tag.view()}.png");
+    let tiff_path: text::Text = path::join(base: dir.view(), child: "paste-${tag.view()}.tiff");
+
+    // 1. Try direct PNG pasteboard representation (`«class PNGf»`).
+    var png_args: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = png_args.append(text::from_str("/usr/bin/osascript"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("on run argv"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("set outPath to POSIX file (item 1 of argv)"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("set imgData to the clipboard as «class PNGf»"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("set f to open for access outPath with write permission"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("set eof f to 0"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("write imgData to f"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("close access f"));
+    let _ = png_args.append(text::from_str("-e"));
+    let _ = png_args.append(text::from_str("end run"));
+    let _ = png_args.append(text::from_str("--"));
+    let _ = png_args.append(png_path.clone());
+    let r1: process::Output = process::capture(png_args);
+    if r1.code == (0 as i32) && fs::exists(png_path.view()) {
+        return option::Option[text::Text]::Some(png_path);
+    }
+
+    // 2. Fallback: TIFF pasteboard representation, converted to PNG via sips.
+    var tif_args: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = tif_args.append(text::from_str("/usr/bin/osascript"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("on run argv"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("set outPath to POSIX file (item 1 of argv)"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("set imgData to the clipboard as TIFF picture"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("set f to open for access outPath with write permission"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("set eof f to 0"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("write imgData to f"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("close access f"));
+    let _ = tif_args.append(text::from_str("-e"));
+    let _ = tif_args.append(text::from_str("end run"));
+    let _ = tif_args.append(text::from_str("--"));
+    let _ = tif_args.append(tiff_path.clone());
+    let r2: process::Output = process::capture(tif_args);
+    if r2.code == (0 as i32) && fs::exists(tiff_path.view()) {
+        var sips_args: vec::Vec[text::Text] = vec::new::[text::Text]();
+        let _ = sips_args.append(text::from_str("/usr/bin/sips"));
+        let _ = sips_args.append(text::from_str("-s"));
+        let _ = sips_args.append(text::from_str("format"));
+        let _ = sips_args.append(text::from_str("png"));
+        let _ = sips_args.append(tiff_path.clone());
+        let _ = sips_args.append(text::from_str("--out"));
+        let _ = sips_args.append(png_path.clone());
+        let r3: process::Output = process::capture(sips_args);
+        let _ = fs::remove_file(tiff_path.view());
+        if r3.code == (0 as i32) && fs::exists(png_path.view()) {
+            return option::Option[text::Text]::Some(png_path);
+        }
+    }
+    return option::Option[text::Text]::None;
+}
+
+struct _PasteImageJob {
+    loaded: vec::Vec[types::Attachment],
+}
+
+impl _PasteImageJob: services::Job {
+    fn run(ref this) {
+        this.loaded.remove_all();
+        if let option::Option::Some(p) = _read_clipboard_image_file() {
+            if let option::Option::Some(att) = _load_one_attachment(p.view()) {
+                let _ = this.loaded.append(att);
+            }
+        }
+    }
+
+    fn apply(ref this) {}
+}
+
 struct _LoadAttachmentsJob {
     paths: vec::Vec[text::Text],
     loaded: vec::Vec[types::Attachment],
@@ -126,6 +233,7 @@ struct Attachments {
     items: vec::Vec[types::Attachment],
     queued_paths: vec::Vec[text::Text],
     load_job: _LoadAttachmentsJob,
+    paste_job: _PasteImageJob,
     prefix: text::Text,
     stage_key: text::Text,
     floating: bool,
@@ -139,6 +247,9 @@ impl Attachments {
             queued_paths: vec::new::[text::Text](),
             load_job: _LoadAttachmentsJob {
                 paths: vec::new::[text::Text](),
+                loaded: vec::new::[types::Attachment](),
+            },
+            paste_job: _PasteImageJob {
                 loaded: vec::new::[types::Attachment](),
             },
             prefix: text::from_str(prefix),
@@ -214,6 +325,24 @@ impl Attachments {
         guard let option::Option::Some(file_path) = runtime::choose_file() else { return; };
         let _ = this.queued_paths.append(file_path);
         this._kick_load_job();
+    }
+
+    // Grab an image from the macOS clipboard off the main thread and attach it.
+    fn paste_clipboard_image(ref this) {
+        let _ = services::run_job(this.paste_job, then: this.on_paste_image_done);
+    }
+
+    fn on_paste_image_done(ref this) {
+        var added: bool = false;
+        for att in this.paste_job.loaded.drain() {
+            if !this._has_path(att.path.view()) {
+                let _ = this.items.append(att);
+                added = true;
+            }
+        }
+        if added {
+            this.sync();
+        }
     }
 
     fn remove_at(ref this, index: usize) {
