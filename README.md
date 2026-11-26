@@ -1,22 +1,16 @@
 # Desk420
 
-A native macOS desktop client for **Grok**, written in **C+** on **facet**.
+A fast, native macOS desktop app for **Grok Build** (`grok`).
 
-Desk420 drives the `grok` CLI directly over the **Agent Client Protocol (ACP)** on stdio and presents a native AppKit interface—no Electron, no web wrapper, and no direct reads of `~/.grok/auth.json`.
+Desk420 gives you a dedicated macOS workspace around the Grok CLI—projects, approvals, diffs, an isolated browser, Quick Ask from anywhere, and native notifications—in a ~5 MB native app with no Electron or web wrapper.
 
-## Features
+## Install
 
-- **Native macOS UI on `facet` / AppKit** — Light, Dark, and System appearances, split-pane layout, virtualized transcripts, and zero-lag window resizing.
-- **Multi-project workspace** — Group conversations by project folder, pin or archive runs, jump with `⌘1`–`⌘9`, search with `⌘K`, and start runs in any folder (`⌘O`).
-- **Interactive approvals & per-message rewind** — Approve or deny tool calls inline (or right from the Home view), switch between `Ask`, `Auto-approve`, and `Custom` modes, and rewind chat and/or files to any earlier prompt.
-- **Built-in WebKit browser + MCP bridge (`desk420-browser`)** — Multi-tab non-persistent `WKWebView` exposed to Grok over an authenticated loopback HTTP MCP server with user take-over and per-origin approval prompts for non-localhost URLs.
-- **Inspector tabs** — Live **Run** timeline, lazy **Files** tree (`@` prompt references), **Browser**, **Terminal** output, and **Changes** (colorized git diff with Stage / Discard / Commit).
-- **Desktop shell** — Floating **Quick Ask** HUD (`⌥Space`), menu-bar status item with recent runs & approval count, Dock badge, native macOS notifications, and `desk420://` deep links.
-- **Agent-Controlled Interface (ACI)** — Built-in local MCP surface (`src/app.cplus`) with optional consent gating so external agents can inspect or drive the UI.
+Requires **macOS 13 (Ventura) or later** on Apple Silicon.
 
-## Install with Homebrew (macOS Apple Silicon)
+### Homebrew (recommended)
 
-This repository doubles as a Homebrew tap via [Casks/desk420.rb](Casks/desk420.rb) (which also installs the `grok-build` CLI automatically):
+This repository works directly as a Homebrew tap and installs the `grok` CLI (`grok-build`) alongside Desk420:
 
 ```bash
 brew tap netdur/desk420 https://github.com/netdur/desk420.git
@@ -30,120 +24,63 @@ To update later:
 brew upgrade --cask desk420
 ```
 
-> **Note:** Prebuilt releases are currently ad-hoc signed. If macOS Gatekeeper blocks the first launch, clear the quarantine attribute with:
-> `xattr -dr com.apple.quarantine /Applications/Desk420.app`
+### Direct Download
 
-## Prerequisites (Building from Source)
+Download the latest `.dmg` from [GitHub Releases](https://github.com/netdur/desk420/releases/latest) and drag **Desk420.app** into Applications.
 
-- **macOS 13.0+** (Apple Silicon or Intel)
-- **C+ toolchain (`cpc`)** built from [`netdur/cplus`](https://github.com/netdur/cplus) (`main`)
-  - Ensure `cpc` is on `PATH` (or symlinked as `./cpc` at the repo root) and `vendor/` resolves to your C+ `vendor/` directory.
-- **[Grok CLI](https://x.ai)** (`grok`) installed on your Mac (or installable directly from Desk420's onboarding screen).
+> **First launch note:** Desk420 is currently ad-hoc signed (not Apple-notarized). If macOS Gatekeeper blocks the first launch, run:
+>
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/Desk420.app
+> ```
 
-## Building & Testing
+## What Desk420 Does
 
-```bash
-# Clone the repository
-git clone https://github.com/netdur/desk420.git
-cd desk420
-
-# Type-check, build, and run all unit & ACP fixture tests
-cpc check
-cpc build
-cpc test
-```
-
-Format all C+ source files:
-
-```bash
-cpc fmt
-```
-
-### Packaging a macOS `.app` / `.dmg`
-
-```bash
-./scripts/package_macos.sh                  # debug target/debug/Desk420.app
-./scripts/package_macos.sh --release        # release target/release/Desk420.app
-./scripts/package_macos.sh --release --dmg  # release .app + target/release/Desk420.dmg
-```
-
-To regenerate the macOS icon (`assets/AppIcon.icns`) using Python stdlib + macOS `sips`/`iconutil`:
-
-```bash
-python3 scripts/make_icon.py
-```
+- **Multi-project workspace** — Group conversations by project folder, pin active runs, archive old ones, jump with `⌘1`–`⌘9`, and search across all conversations with `⌘K`.
+- **Inline approvals & modes** — Approve or deny tool calls right inside the conversation or from the Home screen, and switch between **Ask**, **Auto-approve**, and **Custom** approval modes at any time.
+- **Per-message rewind** — Roll back to any earlier prompt in a thread with your choice of **Chat & files**, **Chat only**, or **Files only**.
+- **Five-tab workspace inspector** — Keep context beside your chat without leaving the window:
+  - **Run** — Live timeline of tool activity and edits
+  - **Files** — Browse project files and insert `@` mentions directly into your prompt
+  - **Browser** — Built-in isolated browser that Grok can open and preview localhost apps in, with instant user take-over and per-site approval prompts for external URLs
+  - **Terminal** — Live command output from the active run
+  - **Changes** — Colorized git diff with Stage, Discard, and Commit controls
+- **Smart composer** — `@` file mentions, `/` slash commands, drag-and-drop files and images, model and reasoning-effort pickers, collapsible thinking notes, and a live plan checklist.
+- **Always one shortcut away** — Summon the floating **Quick Ask** bar with `⌥Space` from any app, check recent runs and pending approvals from the menu bar, and get native macOS notifications and Dock badges when a run finishes or needs approval.
+- **Usage & connection at a glance** — See your active Grok CLI version, plan tier, weekly usage, and context window meter directly in the app.
+- **Light, Dark, and System themes** — Adapts cleanly to your macOS appearance.
 
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
 | --- | --- |
-| `⌥Space` | Toggle global Quick Ask floating HUD |
+| `⌥Space` | Toggle Quick Ask from any app |
 | `⌘N` | New run |
 | `⌘O` | Add project folder |
 | `⌘K` | Search conversations |
 | `⌘,` | Open Settings |
 | `⌘1`–`⌘9` | Jump to conversation 1–9 |
-| `⌘/` | Open slash commands in composer |
+| `⌘/` | Slash commands |
 | `⌘.` | Stop active run |
 | `⌘⇧Z` | Rewind last turn |
-| `⌘\` / `⌘⇧\` | Toggle sidebar / right inspector panel |
+| `⌘\` / `⌘⇧\` | Toggle sidebar / right inspector |
 
 ## Deep Links (`desk420://`)
 
-Desk420 registers the `desk420://` URL scheme in [macos/Info.plist](macos/Info.plist):
-
 - `desk420://chat/<session-id>` — Open an existing conversation
-- `desk420://new?cwd=<path>&prompt=<text>` — Start a new run (with optional working directory and prefilled prompt)
+- `desk420://new?cwd=<path>&prompt=<text>` — Start a new run with an optional folder and prefilled prompt
 - `desk420://browser?url=<url>` — Open a URL in the built-in Browser tab
 
-## Architecture
+## Privacy & Security
 
-```text
-src/
-├── main.cplus              macOS entry point
-├── app.cplus               App lifecycle, menus, status item, Quick Ask hotkey, ACI MCP surface
-├── agent_consent.cplus     External ACI agent consent dialog & policy
-├── acp/
-│   ├── wire.cplus          JSON-RPC 2.0 envelope encoder/decoder
-│   ├── types.cplus         Typed ACP protocol messages & defensive decoders
-│   └── client.cplus        Stdio child-process ACP client & request correlation
-├── engine/
-│   ├── locate.cplus        Grok CLI locator & version parser
-│   ├── supervisor.cplus    Child process lifecycle & restart supervisor
-│   └── runtime.cplus       Single background worker thread & main-thread state store
-├── store/
-│   ├── conversation.cplus  Session blocks, streaming updates, turn & load state
-│   ├── sessions.cplus      Sidebar rows, projects, pins, archives, search hits
-│   ├── account.cplus       Identity, plan tier, usage quota, context meter
-│   ├── prefs.cplus         ~/.desk420/settings.json loader/saver
-│   └── file_tree.cplus     Lazy project directory walker & @-reference formatter
-├── markdown/
-│   └── parser.cplus        Streaming block & inline markdown parser
-├── browser/
-│   └── mcp_server.cplus    Loopback HTTP MCP server (desk420-browser) & URL safety policy
-└── ui/
-    ├── style.cplus         Adaptive semantic palette & shared facet node helpers
-    ├── main_screen.cplus   Root window shell, toolbar, onboarding, sidebar/content split
-    ├── sidebar.cplus       Needs-you cards, pinned runs, grouped projects, account footer
-    ├── home_view.cplus     Home composer, approval cards, 2-column project grid, usage panel
-    ├── chat_screen.cplus   Virtualized transcript, composer, Run/Files/Browser/Terminal/Changes tabs
-    ├── browser_pane.cplus  Multi-tab WebKit pane & origin approval bar
-    ├── composer_popup.cplus Background-scanned @ mention and / slash command picker
-    ├── attachments.cplus   Async file/image attachment loader & drag-and-drop strip
-    ├── plan_bar.cplus      Collapsible ACP plan checklist bar
-    ├── pickers.cplus       Shared Model / Effort / Approvals / Project picker logic
-    ├── panels.cplus        Split-pane collapse/expand coordination
-    ├── settings_screen.cplus Native facet/tabs Settings window (Grok & UI tabs)
-    ├── quick_ask.cplus     Global floating Quick Ask panel
-    └── about_screen.cplus  About Desk420 window
-```
+- **Your Grok login stays in `grok`** — Desk420 talks to the local `grok` CLI over stdio and never reads `~/.grok/auth.json` or stores your tokens.
+- **Isolated built-in browser** — Uses a separate non-persistent session so it never touches your Safari cookies, logins, or history.
+- **Safe browser boundaries** — Localhost previews work automatically; external sites prompt for your approval first, and local file access is confined to the active project folder.
 
-## Contributing & Security
+See [SECURITY.md](SECURITY.md) for full details and vulnerability reporting.
 
-- Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for C+ / `facet` conventions and development workflow.
-- To report a security issue, see [SECURITY.md](SECURITY.md).
-- Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
+## Contributing & Releases
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+- Building from source and contribution guidelines: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Release history: [CHANGELOG.md](CHANGELOG.md)
+- License: MIT — see [LICENSE](LICENSE)
