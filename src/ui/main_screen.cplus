@@ -254,9 +254,16 @@ impl MainScreen {
 
     // ---- title-bar action handlers ------------------------------------------
 
-    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
-        this._sync_mode();
-        this._sync_bar();
+    fn on_status_changed(ref this, ev: engine::EngineStateEvent) {
+        let ch: engine::EngineChange = ev.change;
+        if ch == engine::EngineChange::All
+            || ch == engine::EngineChange::Status
+            || ch == engine::EngineChange::Session {
+            this._sync_mode();
+            this._sync_bar();
+        } else if ch == engine::EngineChange::Turn || ch == engine::EngineChange::Config {
+            this._sync_bar();
+        }
     }
 
     fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) {
@@ -334,7 +341,13 @@ impl MainScreen {
         } else if idx == ACT_FEEDBACK {
             this._prefill("/feedback ");
         } else if idx == ACT_DELETE {
-            if !sid.is_empty() { engine::delete_session(sid.view(), cwd.view()); }
+            if !sid.is_empty() {
+                var title: text::Text = text::from_str("");
+                if let option::Option::Some(lbl) = m_label::find("conv:title") {
+                    title = text::from_str(lbl.text());
+                }
+                engine::confirm_delete_session(sid.view(), cwd.view(), title: title.view());
+            }
         }
     }
 

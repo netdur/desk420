@@ -108,7 +108,7 @@ fn _menu_delete_active(_sender: *u8, _ctx: *u8) {
     let sid: text::Text = engine::active_session_id();
     if sid.is_empty() { return; }
     let cwd: text::Text = engine::active_cwd();
-    engine::delete_session(sid.view(), cwd.view());
+    engine::confirm_delete_session(sid.view(), cwd.view());
 }
 
 fn _menu_copy_last_answer(_sender: *u8, _ctx: *u8) {

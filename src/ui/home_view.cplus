@@ -338,6 +338,7 @@ impl HomeView {
         let latest: text::Text = (*it).latest_title.clone();
         let name_key: text::Text = "home:project:${index}";
         let tile_key: text::Text = "home:project_tile:${index}";
+        let wrap_key: text::Text = "home:project_wrap:${index}";
         let status_col: vocab::Color = if (*it).needs_you { style::ink() } else { style::muted() };
         let is_left: bool = (index % (2 as usize)) == (0 as usize);
         let pad_l: f64 = if is_left { 0.0f64 } else { 6.0f64 };
@@ -374,8 +375,11 @@ impl HomeView {
                 .padding_edge(flex::Edge::Vertical, 18.0f64)
                 .set_input_transparent(true)
         };
+        // Keyed so facet_appkit gives the tile root a view; a keyless viewless
+        // child under a multi-column `collection` triggers a `touch_all`
+        // feedback loop in `arrange_columns` + `mount::sync_subtree`.
         return @ui {
-            column {
+            column(key: wrap_key.view()) {
                 style::card_box(tile_key.view(), body, radius: 14.0f64)
                     .grow(1.0f64)
                     .min_width(0.0f64)
@@ -571,14 +575,24 @@ impl HomeView {
     }
 
     fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) {
+        if !engine::active_session_id().is_empty() { return; }
         this._sync_lists();
         this.project_paths = pickers::fill_project("home:cwd");
     }
 
-    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
-        this._sync_lists();
-        this._sync_pickers();
-        this._sync_engine();
+    fn on_status_changed(ref this, ev: engine::EngineStateEvent) {
+        if !engine::active_session_id().is_empty() { return; }
+        let ch: engine::EngineChange = ev.change;
+        if ch == engine::EngineChange::All || ch == engine::EngineChange::Session {
+            this._sync_lists();
+            this._sync_pickers();
+            this._sync_engine();
+        } else if ch == engine::EngineChange::Status || ch == engine::EngineChange::Config {
+            this._sync_pickers();
+            this._sync_engine();
+        } else if ch == engine::EngineChange::Turn {
+            this._sync_lists();
+        }
     }
 
     fn on_account_changed(ref this, _ev: account::AccountChange) {

@@ -42,7 +42,7 @@ Download the latest `.dmg` from [GitHub Releases](https://github.com/netdur/desk
 - **Five-tab workspace inspector** — Keep context beside your chat without leaving the window:
   - **Run** — Live timeline of tool activity and edits
   - **Files** — Browse project files and insert `@` mentions directly into your prompt
-  - **Browser** — Built-in isolated browser that Grok can open and preview localhost apps in, with instant user take-over and per-site approval prompts for external URLs
+  - **Browser** — Built-in isolated browser that Grok can open and inspect web pages or localhost apps in, with instant user take-over
   - **Terminal** — Live command output from the active run
   - **Changes** — Colorized git diff with Stage, Discard, and Commit controls
 - **Smart composer** — `@` file mentions, `/` slash commands, drag-and-drop files and images, model and reasoning-effort pickers, collapsible thinking notes, and a live plan checklist.
@@ -75,7 +75,7 @@ Download the latest `.dmg` from [GitHub Releases](https://github.com/netdur/desk
 
 - **Your Grok login stays in `grok`** — Desk420 talks to the local `grok` CLI over stdio and never reads `~/.grok/auth.json` or stores your tokens.
 - **Isolated built-in browser** — Uses a separate non-persistent session so it never touches your Safari cookies, logins, or history.
-- **Safe browser boundaries** — Localhost previews work automatically; external sites prompt for your approval first, and local file access is confined to the active project folder.
+- **Safe browser boundaries** — Blocks dangerous URL schemes (`javascript:`, `data:`) and confines `file://` URLs strictly to the active project folder.
 
 See [SECURITY.md](SECURITY.md) for full details and vulnerability reporting.
 

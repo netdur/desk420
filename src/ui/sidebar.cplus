@@ -13,14 +13,17 @@ import "facet/facet" as core;
 import "facet/gestures" as gestures;
 import "facet/icons" as icons;
 import "facet/list" as m_list;
+import "facet/text_button" as m_text_button;
 import "facet/text_field" as text_field;
 import "facet/vocabulary" as vocab;
 import "facet_runtime/runtime" as runtime;
 import "flex_layout/flex_layout" as flex;
 import "stdlib/option" as option;
+import "stdlib/string_set" as string_set;
 import "stdlib/text" as text;
 import "stdlib/vec" as vec;
 
+import "../acp/types" as types;
 import "../engine/runtime" as engine;
 import "../store/account" as account;
 import "../store/sessions" as sessions;
@@ -117,14 +120,109 @@ fn _sort_groups_newest_first(take src: vec::Vec[_FolderGroup]) -> vec::Vec[_Fold
     return out;
 }
 
+enum _PendingDeleteKind {
+    None,
+    SingleProject,
+    Bulk,
+}
+
+struct _PendingDelete {
+    kind: _PendingDeleteKind,
+    cwd: text::Text,
+    targets: vec::Vec[engine::DeleteTarget],
+    folders: vec::Vec[text::Text],
+}
+
+static _PENDING_LIVE: bool = false;
+static _PENDING: _PendingDelete = #zero::[_PendingDelete]();
+static _CONFIRM_LIVE: bool = false;
+static _CONFIRM_SIG: events::Signal[bool] = #zero::[events::Signal[bool]]();
+
+fn _ensure_confirm_sig() {
+    if !_CONFIRM_LIVE {
+        _CONFIRM_SIG = events::Signal[bool]::new();
+        _CONFIRM_LIVE = true;
+    }
+}
+
+fn _clear_pending_delete() {
+    _PENDING = _PendingDelete {
+        kind: _PendingDeleteKind::None,
+        cwd: text::from_str(""),
+        targets: vec::new::[engine::DeleteTarget](),
+        folders: vec::new::[text::Text](),
+    };
+    _PENDING_LIVE = true;
+}
+
+fn _on_delete_alert(index: i32, _ctx: *u8) {
+    engine::refocus_main_window();
+    if !_PENDING_LIVE { return; }
+    let kind: _PendingDeleteKind = _PENDING.kind;
+    let cwd: text::Text = _PENDING.cwd.clone();
+    var targets: vec::Vec[engine::DeleteTarget] = vec::new::[engine::DeleteTarget]();
+    var ti: usize = 0 as usize;
+    while ti < _PENDING.targets.count() {
+        if let option::Option::Some(tp) = _PENDING.targets.at_ptr(ti) {
+            let _ = targets.append(engine::DeleteTarget {
+                session_id: (*tp).session_id.clone(),
+                cwd: (*tp).cwd.clone(),
+            });
+        }
+        ti = ti +% (1 as usize);
+    }
+    var folders: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var fi: usize = 0 as usize;
+    while fi < _PENDING.folders.count() {
+        if let option::Option::Some(fp) = _PENDING.folders.at_ptr(fi) {
+            let _ = folders.append((*fp).clone());
+        }
+        fi = fi +% (1 as usize);
+    }
+    _clear_pending_delete();
+    if index != (0 as i32) { return; }
+
+    match kind {
+        _PendingDeleteKind::SingleProject => {
+            if targets.count() > (0 as usize) {
+                engine::delete_sessions(targets);
+            }
+            if !cwd.is_empty() && !cwd.equals("__general__") {
+                sessions::remove_project(cwd.view());
+            }
+        }
+        _PendingDeleteKind::Bulk => {
+            if targets.count() > (0 as usize) {
+                engine::delete_sessions(targets);
+            }
+            var ri: usize = 0 as usize;
+            while ri < folders.count() {
+                if let option::Option::Some(fp) = folders.at_ptr(ri) {
+                    if !(*fp).is_empty() && !(*fp).equals("__general__") {
+                        sessions::remove_project((*fp).view());
+                    }
+                }
+                ri = ri +% (1 as usize);
+            }
+            _ensure_confirm_sig();
+            _CONFIRM_SIG.emit(true);
+        }
+        _PendingDeleteKind::None => {}
+    }
+}
+
 struct Sidebar {
     items: vec::Vec[SideItem],
     collapsed_folders: vec::Vec[text::Text],
     hovered: i64, // -1 = none
     account_pop_open: bool,
+    select_mode: bool,
+    selected_sids: string_set::StringSet,
+    selected_folders: string_set::StringSet,
     sessions_sub: events::SignalSubscription[sessions::SessionsChange],
     status_sub: events::SignalSubscription[engine::EngineStateEvent],
     account_sub: events::SignalSubscription[account::AccountChange],
+    confirm_sub: events::SignalSubscription[bool],
 }
 
 impl Sidebar {
@@ -134,9 +232,13 @@ impl Sidebar {
             collapsed_folders: vec::new::[text::Text](),
             hovered: -1 as i64,
             account_pop_open: false,
+            select_mode: false,
+            selected_sids: string_set::new(),
+            selected_folders: string_set::new(),
             sessions_sub: events::SignalSubscription[sessions::SessionsChange]::none(),
             status_sub: events::SignalSubscription[engine::EngineStateEvent]::none(),
             account_sub: events::SignalSubscription[account::AccountChange]::none(),
+            confirm_sub: events::SignalSubscription[bool]::none(),
         };
     }
 
@@ -223,6 +325,7 @@ impl Sidebar {
     }
 
     fn _sync(ref this) {
+        let prev_count: usize = this.items.count();
         let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
         this.items.remove_all();
 
@@ -358,9 +461,91 @@ impl Sidebar {
             k = k +% (1 as usize);
         }
 
-        if this.hovered >= (this.items.count() as i64) { this.hovered = -1 as i64; }
+        if this.items.count() != prev_count || this.hovered >= (this.items.count() as i64) {
+            this.hovered = -1 as i64;
+        }
+        if this.select_mode && this.items.count() == (0 as usize) {
+            this.select_mode = false;
+            this.selected_sids.clear();
+            this.selected_folders.clear();
+        }
+        this._sync_select_bar();
         if let option::Option::Some(l) = m_list::find("side:list") {
             let _l: m_list::List = l.set_count(this.items.count());
+        }
+    }
+
+    fn _is_folder_selected(this, folder_key: str) -> bool {
+        if folder_key == "__general__" {
+            let list: vec::Vec[types::SessionSummary] = sessions::sessions_in_project("__general__");
+            if list.count() == (0 as usize) { return false; }
+            var i: usize = 0 as usize;
+            while i < list.count() {
+                if let option::Option::Some(sp) = list.at_ptr(i) {
+                    if !this.selected_sids.contains((*sp).session_id.view()) { return false; }
+                }
+                i = i +% (1 as usize);
+            }
+            return true;
+        }
+        return this.selected_folders.contains(folder_key);
+    }
+
+    fn _selected_total(this) -> usize {
+        // Count selected conversations plus any selected empty folders.
+        var total: usize = this.selected_sids.count();
+        let cap: usize = this.selected_folders.slot_capacity();
+        var i: usize = 0 as usize;
+        while i < cap {
+            if let option::Option::Some(fp) = this.selected_folders.element_ptr_at_slot(i) {
+                if sessions::count_in_project((*fp).view()) == (0 as usize) {
+                    total = total +% (1 as usize);
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return total;
+    }
+
+    fn _all_selected(this) -> bool {
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        let folders: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+        if rows.count() == (0 as usize) && folders.count() == (0 as usize) { return false; }
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                if !this.selected_sids.contains((*rp).session_id.view()) { return false; }
+            }
+            i = i +% (1 as usize);
+        }
+        var fi: usize = 0 as usize;
+        while fi < folders.count() {
+            if let option::Option::Some(fp) = folders.at_ptr(fi) {
+                if !this.selected_folders.contains((*fp).path.view()) { return false; }
+            }
+            fi = fi +% (1 as usize);
+        }
+        return true;
+    }
+
+    fn _sync_select_bar(this) {
+        style::show("side:select_bar", this.select_mode);
+        if !this.select_mode { return; }
+        let n: usize = this._selected_total();
+        if n == (0 as usize) {
+            style::set_label("side:sel_count", "Select items");
+        } else {
+            let txt: text::Text = "${n} selected";
+            style::set_label("side:sel_count", txt.view());
+        }
+        if let option::Option::Some(ab) = m_text_button::find("side:sel_all") {
+            let _ab: m_text_button::TextButton = ab.set_title(if this._all_selected() { "None" } else { "All" });
+        }
+        if let option::Option::Some(db) = m_text_button::find("side:sel_delete") {
+            let has_any: bool = n > (0 as usize);
+            let _db: m_text_button::TextButton = db
+                .set_enabled(has_any)
+                .set_text_color(if has_any { style::danger() } else { style::faint() });
         }
     }
 
@@ -450,15 +635,16 @@ impl Sidebar {
                     text_color: style::muted(),
                     max_lines: 1 as i64)
                         .grow(1.0f64)
-                    icon_button(key: "side:search_btn",
-                    bordered: false,
-                    symbol: icons::search,
+                    style::circle_icon(icons::checklist, "side:select_btn",
+                    title: "Select conversations & projects to delete",
+                    size: 24.0f64, icon_size: 16.0f64,
+                    color: if this.select_mode { style::lime() } else { style::muted() },
+                    on_click: this.on_toggle_select)
+                    style::circle_icon(icons::search, "side:search_btn",
+                    title: "Search conversations (⌘K)",
+                    size: 24.0f64, icon_size: 16.0f64,
                     color: style::muted(),
-                    on_clicked: this.on_search_open)
-                        .width(24.0f64)
-                        .height(24.0f64)
-                        .shrink(0.0f64)
-                        .set_tooltip("Search conversations (⌘K)")
+                    on_click: this.on_search_open)
                     text_button("+ Add", key: "side:add_project",
                     font_size: 11.5f64,
                     font_weight: vocab::FontWeight::Medium,
@@ -474,7 +660,7 @@ impl Sidebar {
                 }
                 .height(HEADER_H)
                     .align(flex::Align::End)
-                    .gap(2.0f64)
+                    .gap(4.0f64)
                     .padding_edge(flex::Edge::Horizontal, 8.0f64)
                     .padding_edge(flex::Edge::Bottom, 4.0f64)
             },
@@ -483,12 +669,30 @@ impl Sidebar {
                 let fkey: text::Text = (*it).folder_key.clone();
                 let is_general: bool = fkey.equals("__general__");
                 let icon_id: u32 = if is_general { icons::chat_bubble_outline } else { icons::folder };
-                let hover_bg: vocab::Color = if is_hovered { vocab::Color::ink(0.04f64) } else { vocab::Color::clear() };
+                let sel_mode: bool = this.select_mode;
+                let f_checked: bool = sel_mode && this._is_folder_selected(fkey.view());
+                let show_del: bool = !sel_mode && !is_general && is_hovered;
+                let del_key: text::Text = "side:del_folder:${index}";
+                let hover_bg: vocab::Color = if f_checked {
+                    style::chip()
+                } else if is_hovered {
+                    vocab::Color::ink(0.04f64)
+                } else {
+                    vocab::Color::clear()
+                };
                 @ui {
                     column {
                         hstack {
+                            if sel_mode {
+                                symbol(if f_checked { icons::check_box } else { icons::check_box_outline_blank },
+                                size: 15.5f64,
+                                color: if f_checked { style::lime() } else { style::muted() })
+                                    .shrink(0.0f64)
+                                    .set_input_transparent(true)
+                            }
                             symbol(icon_id, size: 15.0f64, color: style::muted())
                                 .shrink(0.0f64)
+                                .set_input_transparent(true)
                             label(fname.view(), key: row_key.view(),
                             font_size: 13.5f64,
                             font_weight: vocab::FontWeight::Medium,
@@ -497,6 +701,14 @@ impl Sidebar {
                             max_lines: 1 as i64)
                                 .grow(1.0f64)
                                 .shrink(1.0f64)
+                                .set_input_transparent(true)
+                            if show_del {
+                                style::circle_icon(icons::delete_outline, del_key.view(),
+                                title: "Remove project from Desk420",
+                                size: 22.0f64, icon_size: 15.0f64,
+                                color: style::muted(),
+                                on_click: this.on_delete_folder_clicked)
+                            }
                         }
                         .height(28.0f64)
                             .align(flex::Align::Center)
@@ -504,7 +716,6 @@ impl Sidebar {
                             .padding_edge(flex::Edge::Horizontal, 8.0f64)
                             .set_background_color(hover_bg)
                             .set_corner_radius(vocab::Corners::all(8.0f64))
-                            .set_input_transparent(true)
                     }
                     .height(FOLDER_H)
                         .justify(flex::Justify::End)
@@ -563,14 +774,20 @@ impl Sidebar {
                 let is_unread: bool = st == sessions::TaskState::Unread;
                 let show_dot: bool = is_failed || is_unread;
                 let dot_col: vocab::Color = if is_failed { style::danger() } else { style::lime() };
-                let bg: vocab::Color = if is_active {
+                let sel_mode: bool = this.select_mode;
+                let r_checked: bool = sel_mode && this.selected_sids.contains((*it).row.session_id.view());
+                let show_del: bool = !sel_mode && is_hovered;
+                let del_key: text::Text = "side:del_row:${index}";
+                let bg: vocab::Color = if r_checked || is_active {
                     style::chip()
                 } else if is_hovered {
                     vocab::Color::ink(0.05f64)
                 } else {
                     vocab::Color::clear()
                 };
-                let rim: vocab::Color = if is_active {
+                let rim: vocab::Color = if r_checked {
+                    style::lime()
+                } else if is_active {
                     style::hairline()
                 } else {
                     vocab::Color::clear()
@@ -581,11 +798,19 @@ impl Sidebar {
                     vocab::FontWeight::Regular
                 };
                 let left_pad: f64 = if (*it).indented { 24.0f64 } else { 10.0f64 };
-                let has_time: bool = !time_txt.is_empty();
+                let has_time: bool = !time_txt.is_empty() && !show_del;
                 let inner: core::Node = @ui {
                     hstack {
-                        if show_dot {
+                        if sel_mode {
+                            symbol(if r_checked { icons::check_box } else { icons::check_box_outline_blank },
+                            size: 15.5f64,
+                            color: if r_checked { style::lime() } else { style::muted() })
+                                .shrink(0.0f64)
+                                .set_input_transparent(true)
+                        }
+                        if !sel_mode && show_dot {
                             style::dot(6.0f64, dot_col)
+                                .set_input_transparent(true)
                         }
                         label(title.view(), key: row_key.view(),
                         font_size: 14.0f64,
@@ -596,11 +821,13 @@ impl Sidebar {
                             .grow(1.0f64)
                             .shrink(1.0f64)
                             .min_width(0.0f64)
-                        if is_generating {
+                            .set_input_transparent(true)
+                        if is_generating && !show_del {
                             spinner(style::lime(), running: true)
                                 .width(14.0f64)
                                 .height(14.0f64)
                                 .shrink(0.0f64)
+                                .set_input_transparent(true)
                         }
                         if has_time {
                             label(time_txt.view(),
@@ -608,6 +835,14 @@ impl Sidebar {
                             text_color: style::muted(),
                             max_lines: 1 as i64)
                                 .shrink(0.0f64)
+                                .set_input_transparent(true)
+                        }
+                        if show_del {
+                            style::circle_icon(icons::delete_outline, del_key.view(),
+                            title: "Delete conversation",
+                            size: 22.0f64, icon_size: 15.0f64,
+                            color: style::muted(),
+                            on_click: this.on_delete_row_clicked)
                         }
                     }
                     .height(34.0f64)
@@ -615,7 +850,6 @@ impl Sidebar {
                         .gap(8.0f64)
                         .padding_edge(flex::Edge::Left, left_pad)
                         .padding_edge(flex::Edge::Right, 10.0f64)
-                        .set_input_transparent(true)
                 };
                 @ui {
                     column {
@@ -625,7 +859,6 @@ impl Sidebar {
                         .height(34.0f64)
                             .set_background_color(bg)
                             .set_corner_radius(vocab::Corners::all(10.0f64))
-                            .set_input_transparent(true)
                     }
                     .height(ROW_H)
                         .justify(flex::Justify::Center)
@@ -673,16 +906,282 @@ impl Sidebar {
             ItemKind::ProjectsHeader => { return; }
             ItemKind::Folder => {
                 let fk: text::Text = (*it).folder_key.clone();
-                this._toggle_collapsed(fk.view());
-                this._sync();
+                if this.select_mode {
+                    this._toggle_folder_selected(fk.view());
+                } else {
+                    this._toggle_collapsed(fk.view());
+                    this._sync();
+                }
                 return;
             }
             _ => {}
         }
         let sid: text::Text = (*it).row.session_id.clone();
         let cwd: text::Text = (*it).row.cwd.clone();
+        if this.select_mode {
+            this._toggle_sid_selected(sid.view(), cwd.view());
+            return;
+        }
         let title: text::Text = (*it).row.title.clone();
         engine::load_session(sid.view(), cwd.view(), title: title.view());
+    }
+
+    fn _toggle_folder_selected(ref this, folder_key: str) {
+        let was_sel: bool = this._is_folder_selected(folder_key);
+        let list: vec::Vec[types::SessionSummary] = sessions::sessions_in_project(folder_key);
+        if was_sel {
+            let _ = this.selected_folders.remove(folder_key);
+            var i: usize = 0 as usize;
+            while i < list.count() {
+                if let option::Option::Some(sp) = list.at_ptr(i) {
+                    let _ = this.selected_sids.remove((*sp).session_id.view());
+                }
+                i = i +% (1 as usize);
+            }
+        } else {
+            if folder_key != "__general__" {
+                let _ = this.selected_folders.insert(text::from_str(folder_key));
+            }
+            var i: usize = 0 as usize;
+            while i < list.count() {
+                if let option::Option::Some(sp) = list.at_ptr(i) {
+                    let _ = this.selected_sids.insert((*sp).session_id.clone());
+                }
+                i = i +% (1 as usize);
+            }
+        }
+        this._sync();
+    }
+
+    fn _toggle_sid_selected(ref this, sid: str, cwd: str) {
+        if sid.is_empty() { return; }
+        if this.selected_sids.contains(sid) {
+            let _ = this.selected_sids.remove(sid);
+            if !cwd.is_empty() {
+                let _ = this.selected_folders.remove(cwd);
+            }
+        } else {
+            let _ = this.selected_sids.insert(text::from_str(sid));
+        }
+        this._sync();
+    }
+
+    fn on_toggle_select(ref this, _sender: *u8) -> bool {
+        this.select_mode = !this.select_mode;
+        this.selected_sids.clear();
+        this.selected_folders.clear();
+        this._sync();
+        return true;
+    }
+
+    fn on_exit_select(ref this, _sender: *u8) {
+        this.select_mode = false;
+        this.selected_sids.clear();
+        this.selected_folders.clear();
+        this._sync();
+    }
+
+    fn on_select_all_toggle(ref this, _sender: *u8) {
+        if this._all_selected() {
+            this.selected_sids.clear();
+            this.selected_folders.clear();
+        } else {
+            let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+            var i: usize = 0 as usize;
+            while i < rows.count() {
+                if let option::Option::Some(rp) = rows.at_ptr(i) {
+                    let _ = this.selected_sids.insert((*rp).session_id.clone());
+                }
+                i = i +% (1 as usize);
+            }
+            let folders: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+            var fi: usize = 0 as usize;
+            while fi < folders.count() {
+                if let option::Option::Some(fp) = folders.at_ptr(fi) {
+                    let _ = this.selected_folders.insert((*fp).path.clone());
+                }
+                fi = fi +% (1 as usize);
+            }
+        }
+        this._sync();
+    }
+
+    fn _clear_hover(ref this) {
+        let prev: i64 = this.hovered;
+        this.hovered = -1 as i64;
+        if prev >= (0 as i64) && (prev as usize) < this.items.count() {
+            if let option::Option::Some(l) = m_list::find("side:list") {
+                let _l: m_list::List = l.invalidate_row(at: prev as usize);
+            }
+        }
+    }
+
+    fn on_delete_row_clicked(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return true; };
+        guard let option::Option::Some(it) = this.items.at_ptr(at) else { return true; };
+        let sid: text::Text = (*it).row.session_id.clone();
+        if sid.is_empty() { return true; }
+        let cwd: text::Text = (*it).row.cwd.clone();
+        let title: text::Text = (*it).row.title.clone();
+        this._clear_hover();
+        engine::confirm_delete_session(sid.view(), cwd.view(), title: title.view());
+        return true;
+    }
+
+    fn on_delete_folder_clicked(ref this, sender: *u8) -> bool {
+        guard let option::Option::Some(at) = component::item_index_of(sender) else { return true; };
+        guard let option::Option::Some(it) = this.items.at_ptr(at) else { return true; };
+        let fkey: text::Text = (*it).folder_key.clone();
+        let fname: text::Text = (*it).header.clone();
+        if fkey.is_empty() || fkey.equals("__general__") { return true; }
+
+        let list: vec::Vec[types::SessionSummary] = sessions::sessions_in_project(fkey.view());
+        let n: usize = list.count();
+        var targets: vec::Vec[engine::DeleteTarget] = vec::new::[engine::DeleteTarget]();
+        var i: usize = 0 as usize;
+        while i < n {
+            if let option::Option::Some(sp) = list.at_ptr(i) {
+                let _ = targets.append(engine::DeleteTarget {
+                    session_id: (*sp).session_id.clone(),
+                    cwd: (*sp).cwd.clone(),
+                });
+            }
+            i = i +% (1 as usize);
+        }
+        this._clear_hover();
+        _PENDING = _PendingDelete {
+            kind: _PendingDeleteKind::SingleProject,
+            cwd: fkey,
+            targets: targets,
+            folders: vec::new::[text::Text](),
+        };
+        _PENDING_LIVE = true;
+        let title_txt: text::Text = "Remove \"${fname.view()}\" from Desk420?";
+        let msg: text::Text = if n == (0 as usize) {
+            text::from_str("This removes the project folder from Desk420. Your files on disk will not be touched.")
+        } else if n == (1 as usize) {
+            text::from_str("This deletes 1 conversation from Grok and removes the project from Desk420. Your files on disk will not be touched.")
+        } else {
+            "This deletes ${n} conversations from Grok and removes the project from Desk420. Your files on disk will not be touched."
+        };
+        runtime::alert(title_txt.view(), msg.view(), "Remove",
+        secondary: "Cancel", on_answer: _on_delete_alert);
+        return true;
+    }
+
+    fn on_delete_selected(ref this, _sender: *u8) {
+        var targets: vec::Vec[engine::DeleteTarget] = vec::new::[engine::DeleteTarget]();
+        var seen_sids: string_set::StringSet = string_set::new();
+
+        // 1. Collect every selected conversation.
+        let rows: vec::Vec[sessions::SidebarRow] = sessions::visible_rows();
+        var i: usize = 0 as usize;
+        while i < rows.count() {
+            if let option::Option::Some(rp) = rows.at_ptr(i) {
+                let sid_v: str = (*rp).session_id.view();
+                if this.selected_sids.contains(sid_v) && !seen_sids.contains(sid_v) {
+                    let _ = seen_sids.insert((*rp).session_id.clone());
+                    let _ = targets.append(engine::DeleteTarget {
+                        session_id: (*rp).session_id.clone(),
+                        cwd: (*rp).cwd.clone(),
+                    });
+                }
+            }
+            i = i +% (1 as usize);
+        }
+
+        // 2. Collect every selected folder (plus any sessions inside it).
+        var folders: vec::Vec[text::Text] = vec::new::[text::Text]();
+        var seen_folders: string_set::StringSet = string_set::new();
+        let fcap: usize = this.selected_folders.slot_capacity();
+        var fi: usize = 0 as usize;
+        while fi < fcap {
+            if let option::Option::Some(fp) = this.selected_folders.element_ptr_at_slot(fi) {
+                let fv: str = (*fp).view();
+                if !fv.is_empty() && fv != "__general__" && !seen_folders.contains(fv) {
+                    let _ = seen_folders.insert((*fp).clone());
+                    let _ = folders.append((*fp).clone());
+                    let flist: vec::Vec[types::SessionSummary] = sessions::sessions_in_project(fv);
+                    var si: usize = 0 as usize;
+                    while si < flist.count() {
+                        if let option::Option::Some(sp) = flist.at_ptr(si) {
+                            if !seen_sids.contains((*sp).session_id.view()) {
+                                let _ = seen_sids.insert((*sp).session_id.clone());
+                                let _ = targets.append(engine::DeleteTarget {
+                                    session_id: (*sp).session_id.clone(),
+                                    cwd: (*sp).cwd.clone(),
+                                });
+                            }
+                        }
+                        si = si +% (1 as usize);
+                    }
+                }
+            }
+            fi = fi +% (1 as usize);
+        }
+
+        // 3. Also auto-remove saved projects whose every remaining conversation is being deleted.
+        let all_f: vec::Vec[sessions::ProjectEntry] = sessions::all_project_folders();
+        var ai: usize = 0 as usize;
+        while ai < all_f.count() {
+            if let option::Option::Some(ap) = all_f.at_ptr(ai) {
+                let fv: str = (*ap).path.view();
+                if !seen_folders.contains(fv) && sessions::has_saved_project(fv) {
+                    let flist: vec::Vec[types::SessionSummary] = sessions::sessions_in_project(fv);
+                    if flist.count() > (0 as usize) {
+                        var all_gone: bool = true;
+                        var si: usize = 0 as usize;
+                        while si < flist.count() {
+                            if let option::Option::Some(sp) = flist.at_ptr(si) {
+                                if !seen_sids.contains((*sp).session_id.view()) {
+                                    all_gone = false;
+                                    break;
+                                }
+                            }
+                            si = si +% (1 as usize);
+                        }
+                        if all_gone {
+                            let _ = seen_folders.insert((*ap).path.clone());
+                            let _ = folders.append((*ap).path.clone());
+                        }
+                    }
+                }
+            }
+            ai = ai +% (1 as usize);
+        }
+
+        let sc: usize = targets.count();
+        let fc: usize = folders.count();
+        if sc == (0 as usize) && fc == (0 as usize) { return; }
+
+        this._clear_hover();
+        _PENDING = _PendingDelete {
+            kind: _PendingDeleteKind::Bulk,
+            cwd: text::from_str(""),
+            targets: targets,
+            folders: folders,
+        };
+        _PENDING_LIVE = true;
+
+        let title_txt: text::Text = if fc > (0 as usize) && sc > (0 as usize) {
+            "Remove ${fc} project(s) and delete ${sc} conversation(s)?"
+        } else if fc > (0 as usize) {
+            "Remove ${fc} project(s) from Desk420?"
+        } else if sc == (1 as usize) {
+            text::from_str("Delete 1 conversation?")
+        } else {
+            "Delete ${sc} conversations?"
+        };
+        let msg: str = "Selected conversations will be permanently deleted from Grok and selected projects removed from Desk420. Your files on disk will not be touched.";
+        runtime::alert(title_txt.view(), msg, "Delete",
+        secondary: "Cancel", on_answer: _on_delete_alert);
+    }
+
+    fn on_bulk_confirmed(ref this, _done: bool) {
+        this.select_mode = false;
+        this.selected_sids.clear();
+        this.selected_folders.clear();
+        this._sync();
     }
 
     fn on_add_project(ref this, _sender: *u8) {
@@ -733,8 +1232,9 @@ impl Sidebar {
         engine::search_sessions("");
     }
 
-    fn on_search_open(ref this, _sender: *u8) {
+    fn on_search_open(ref this, _sender: *u8) -> bool {
         open_search();
+        return true;
     }
 
     fn on_search_changed(ref this, _sender: *u8) {
@@ -771,7 +1271,18 @@ impl Sidebar {
     }
 
     fn on_sessions_changed(ref this, _ev: sessions::SessionsChange) { this._sync(); }
-    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) { this._sync(); }
+
+    fn on_status_changed(ref this, ev: engine::EngineStateEvent) {
+        let ch: engine::EngineChange = ev.change;
+        if ch == engine::EngineChange::All
+            || ch == engine::EngineChange::Session
+            || ch == engine::EngineChange::Status
+            || ch == engine::EngineChange::Turn
+            || ch == engine::EngineChange::Clock {
+            this._sync();
+        }
+    }
+
     fn on_account_changed(ref this, _ev: account::AccountChange) { this._sync_account(); }
 }
 
@@ -812,6 +1323,45 @@ impl Sidebar: component::Component {
                     .align(flex::Align::Center)
                     .gap(6.0f64)
                     .padding_edge(flex::Edge::Horizontal, 8.0f64)
+                    .set_background_color(style::chip())
+                    .set_corner_radius(vocab::Corners::all(8.0f64))
+
+                hstack(key: "side:select_bar") {
+                    label("Select items", key: "side:sel_count",
+                    font_size: 12.0f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    max_lines: 1 as i64)
+                        .grow(1.0f64)
+                        .shrink(1.0f64)
+                        .min_width(0.0f64)
+                    text_button("All", key: "side:sel_all",
+                    font_size: 11.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::muted(),
+                    bordered: false,
+                    on_click: this.on_select_all_toggle)
+                        .shrink(0.0f64)
+                    text_button("Delete", key: "side:sel_delete",
+                    font_size: 11.5f64,
+                    font_weight: vocab::FontWeight::Semibold,
+                    text_color: style::danger(),
+                    bordered: false,
+                    on_click: this.on_delete_selected)
+                        .shrink(0.0f64)
+                    text_button("Done", key: "side:sel_done",
+                    font_size: 11.5f64,
+                    font_weight: vocab::FontWeight::Medium,
+                    text_color: style::ink(),
+                    bordered: false,
+                    on_click: this.on_exit_select)
+                        .shrink(0.0f64)
+                }
+                .height(32.0f64)
+                    .shrink(0.0f64)
+                    .align(flex::Align::Center)
+                    .gap(8.0f64)
+                    .padding_edge(flex::Edge::Horizontal, 10.0f64)
                     .set_background_color(style::chip())
                     .set_corner_radius(vocab::Corners::all(8.0f64))
 
@@ -945,6 +1495,8 @@ impl Sidebar: component::Lifecycle {
         this.sessions_sub = sessions::watch(this.on_sessions_changed);
         this.status_sub = engine::watch_status(this.on_status_changed);
         this.account_sub = account::watch(this.on_account_changed);
+        _ensure_confirm_sig();
+        this.confirm_sub = _CONFIRM_SIG.on(this.on_bulk_confirmed);
         if let option::Option::Some(l) = m_list::find("side:list") {
             let _l: m_list::List = l
                 .set_uneven_rows(true)
@@ -955,6 +1507,7 @@ impl Sidebar: component::Lifecycle {
                 .set_count(0 as usize);
         }
         style::show("side:search_bar", false);
+        style::show("side:select_bar", false);
         this._sync();
         this._sync_account();
     }

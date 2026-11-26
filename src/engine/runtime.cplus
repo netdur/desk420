@@ -7,6 +7,7 @@
 // `services::CoalescedHop`).
 
 import "events/events" as events;
+import "facet/application" as facet_app;
 import "facet/services" as services;
 import "facet_runtime/runtime" as f_runtime;
 import "json/json" as json;
@@ -108,6 +109,11 @@ const BILLING_FOCUS_MIN_SECS: i64 = 60 as i64;
 const BILLING_IDLE_SECS: i64 = 300 as i64;
 const CLOCK_TICK_SECS: i64 = 60 as i64;
 
+struct DeleteTarget {
+    session_id: text::Text,
+    cwd: text::Text,
+}
+
 enum _EngineCmd {
     Start,
     Retry,
@@ -121,6 +127,7 @@ enum _EngineCmd {
     SetActiveSession(text::Text, text::Text),        // session_id, cwd (cache hit)
     RenameSession(text::Text, text::Text),  // session_id, title
     DeleteSession(text::Text, text::Text),  // session_id, cwd
+    DeleteSessions(vec::Vec[DeleteTarget]), // batch delete
     SearchSessions(text::Text),             // query
     SetConfigOption(text::Text, text::Text), // config_id, value
     SetApprovalMode(ApprovalMode),
@@ -1308,6 +1315,26 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                     }
                     _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
                 }
+                _EngineCmd::DeleteSessions(items) => {
+                    var di: usize = 0 as usize;
+                    while di < items.count() {
+                        if let option::Option::Some(tp) = items.at_ptr(di) {
+                            let sid: text::Text = (*tp).session_id.clone();
+                            let cwd: text::Text = (*tp).cwd.clone();
+                            if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
+                                if let option::Option::Some(pd) = (*sp).send_request("_x.ai/session/delete", types::params_session_delete(sid.view(), cwd.view())) {
+                                    let _ = pd.wait_timeout(3000 as i64);
+                                }
+                            }
+                            if current_sid.equals(sid.view()) {
+                                current_sid = text::from_str("");
+                            }
+                            _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
+                        }
+                        di = di +% (1 as usize);
+                    }
+                    _fetch_session_list(sups, ui_tx);
+                }
                 _EngineCmd::SearchSessions(query) => {
                     let trimmed: str = query.view().trim();
                     if !trimmed.is_empty() {
@@ -1701,8 +1728,94 @@ fn reload_session(session_id: str, cwd: str, title: str = "") {
 fn rename_session(session_id: str, title: str) {
     _send_cmd(_EngineCmd::RenameSession(text::from_str(session_id), text::from_str(title)));
 }
+struct _PendingSessionDelete {
+    active: bool,
+    sid: text::Text,
+    cwd: text::Text,
+    offer_remove_project: bool,
+}
+
+static _PENDING_DEL_LIVE: bool = false;
+static _PENDING_DEL: _PendingSessionDelete = #zero::[_PendingSessionDelete]();
+
+fn _refocus_main_cb(_ctx: *u8) {
+    let _ = facet_app::activate_window("main");
+}
+
+fn refocus_main_window() {
+    let _ = facet_app::activate_window("main");
+    if services::has_main_hop() {
+        services::run_on_main(_refocus_main_cb, 0 as *u8);
+    }
+}
+
+fn _on_confirm_delete_session(index: i32, _ctx: *u8) {
+    refocus_main_window();
+    if !_PENDING_DEL_LIVE || !_PENDING_DEL.active { return; }
+    let sid: text::Text = _PENDING_DEL.sid.clone();
+    let cwd: text::Text = _PENDING_DEL.cwd.clone();
+    let offer_proj: bool = _PENDING_DEL.offer_remove_project;
+    _PENDING_DEL.active = false;
+    _PENDING_DEL.sid = text::from_str("");
+    _PENDING_DEL.cwd = text::from_str("");
+    _PENDING_DEL.offer_remove_project = false;
+
+    if offer_proj {
+        // 0 = Delete & remove project, 1 = Delete conversation only, 2 = Cancel
+        if index == (0 as i32) {
+            if !sid.is_empty() { delete_session(sid.view(), cwd.view()); }
+            if !cwd.is_empty() { sessions::remove_project(cwd.view()); }
+        } else if index == (1 as i32) {
+            if !sid.is_empty() { delete_session(sid.view(), cwd.view()); }
+        }
+    } else {
+        // 0 = Delete, 1 = Cancel
+        if index == (0 as i32) && !sid.is_empty() {
+            delete_session(sid.view(), cwd.view());
+        }
+    }
+}
+
 fn delete_session(session_id: str, cwd: str) {
     _send_cmd(_EngineCmd::DeleteSession(text::from_str(session_id), text::from_str(cwd)));
+}
+
+// Single confirmation sheet for deleting a conversation from Grok.
+// If it is the last conversation in a saved project folder, offers
+// "Delete & remove project" right in the same dialog (never a second dialog).
+fn confirm_delete_session(session_id: str, cwd: str, title: str = "") {
+    if session_id.is_empty() { return; }
+    let offer_proj: bool = !cwd.is_empty()
+        && sessions::has_saved_project(cwd)
+        && sessions::count_in_project(cwd) <= (1 as usize);
+    _PENDING_DEL = _PendingSessionDelete {
+        active: true,
+        sid: text::from_str(session_id),
+        cwd: text::from_str(cwd),
+        offer_remove_project: offer_proj,
+    };
+    _PENDING_DEL_LIVE = true;
+
+    let display_title: str = if title.is_empty() { "This conversation" } else { title };
+    if offer_proj {
+        let folder: text::Text = sessions::folder_label(cwd);
+        let msg: text::Text = "\"${display_title}\" is the last conversation in \"${folder.view()}\". Your project files on disk will not be touched.";
+        var opts: vec::Vec[text::Text] = vec::new::[text::Text]();
+        let _ = opts.append(text::from_str("Delete & remove project"));
+        let _ = opts.append(text::from_str("Delete conversation only"));
+        let _ = opts.append(text::from_str("Cancel"));
+        f_runtime::choose("Delete conversation?", msg.view(), opts,
+        on_answer: _on_confirm_delete_session);
+    } else {
+        let msg: text::Text = "\"${display_title}\" will be deleted from Grok. Your project files on disk will not be touched.";
+        f_runtime::alert("Delete conversation?", msg.view(), "Delete",
+        secondary: "Cancel", on_answer: _on_confirm_delete_session);
+    }
+}
+
+fn delete_sessions(take items: vec::Vec[DeleteTarget]) {
+    if items.count() == (0 as usize) { return; }
+    _send_cmd(_EngineCmd::DeleteSessions(items));
 }
 fn search_sessions(query: str) {
     sessions::set_search_query(query);

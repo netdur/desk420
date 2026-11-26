@@ -98,13 +98,11 @@ fn check_url_policy(raw_url: str, cwd: str, auto_approve: bool) -> text::Text {
     if !u.is_web() || u.host.is_empty() {
         return text::from_str("Refused: only http://, https://, and project-local file:// URLs are supported.");
     }
-    if _is_loopback_host(u.host) {
-        return text::from_str("");
-    }
-    if auto_approve {
-        return text::from_str("");
-    }
-    return text::from_str("Origin blocked in Ask mode (localhost and 127.0.0.1 are always allowed). Switch Approvals to Auto-approve or open this URL directly in the Browser tab.");
+    // The built-in browser runs in an isolated non-persistent WKWebsiteDataStore
+    // (no Safari cookies or logins), so all standard http(s) URLs are allowed.
+    let _allow_auto: bool = auto_approve;
+    let _loopback: bool = _is_loopback_host(u.host);
+    return text::from_str("");
 }
 
 // ───────────────────────────── JS scripts ─────────────────────────────
@@ -813,7 +811,7 @@ fn handle_jsonrpc(raw: str) -> option::Option[text::Text] {
         let _ = caps.append(json::Member::new("tools", json::Value::object(vec::new::[json::Member]())));
         var info: vec::Vec[json::Member] = vec::new::[json::Member]();
         let _ = info.append(json::Member::new("name", json::Value::text("desk420-browser")));
-        let _ = info.append(json::Member::new("version", json::Value::text("0.1.0")));
+        let _ = info.append(json::Member::new("version", json::Value::text("0.1.1")));
         var r: vec::Vec[json::Member] = vec::new::[json::Member]();
         let _ = r.append(json::Member::new("protocolVersion", json::Value::text(proto.view())));
         let _ = r.append(json::Member::new("capabilities", json::Value::object(caps)));
@@ -1084,21 +1082,22 @@ fn acp_mcp_server_entry() -> option::Option[json::Value] {
 // ───────────────────────────── tests ─────────────────────────────
 
 #[test]
-fn url_policy_allows_localhost_blocks_external_in_ask_and_confines_file_urls() {
+fn url_policy_allows_web_and_confines_file_urls() {
     assert check_url_policy("http://localhost:3000", "/repo", false).is_empty();
     assert check_url_policy("http://127.0.0.1:8080/app", "/repo", false).is_empty();
     assert check_url_policy("http://[::1]:3000/app", "/repo", false).is_empty();
-    assert !check_url_policy("http://localhost.evil.com", "/repo", false).is_empty();
-    assert !check_url_policy("http://localhost@evil.com/x", "/repo", false).is_empty();
+    assert check_url_policy("https://finance.yahoo.com/quote/ANT/", "/repo", false).is_empty();
+    assert check_url_policy("https://example.com", "/repo", false).is_empty();
+    assert check_url_policy("https://example.com", "/repo", true).is_empty();
     assert extract_origin("https://Example.COM:8443/path?a=1").equals("https://example.com:8443");
     assert extract_origin("http://127.0.0.1:3000/app#top").equals("http://127.0.0.1:3000");
     assert extract_origin("http://[::1]:3000/app").equals("http://[::1]:3000");
-    assert !check_url_policy("https://example.com", "/repo", false).is_empty();
-    assert check_url_policy("https://example.com", "/repo", true).is_empty();
     assert check_url_policy("file:///repo/index.html", "/repo", false).is_empty();
     assert !check_url_policy("file:///etc/passwd", "/repo", true).is_empty();
     assert !check_url_policy("file:///repo/../etc/passwd", "/repo", true).is_empty();
     assert !check_url_policy("javascript:alert(1)", "/repo", true).is_empty();
+    assert !check_url_policy("data:text/html,hi", "/repo", true).is_empty();
+    assert !check_url_policy("ftp://example.com/file", "/repo", true).is_empty();
 }
 
 #[test]

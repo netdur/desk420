@@ -351,6 +351,75 @@ impl SessionsStore {
         this._emit();
     }
 
+    fn has_saved_project(this, folder_path: str) -> bool {
+        let trimmed: str = folder_path.trim();
+        if trimmed.is_empty() { return false; }
+        var i: usize = 0 as usize;
+        while i < this.projects.count() {
+            if let option::Option::Some(pp) = this.projects.at_ptr(i) {
+                if (*pp).path.equals(trimmed) { return true; }
+            }
+            i = i +% (1 as usize);
+        }
+        return false;
+    }
+
+    fn remove_project(ref this, folder_path: str) {
+        let trimmed: str = folder_path.trim();
+        if trimmed.is_empty() { return; }
+        var removed: bool = false;
+        var i: usize = 0 as usize;
+        while i < this.projects.count() {
+            var hit: bool = false;
+            if let option::Option::Some(pp) = this.projects.at_ptr(i) {
+                if (*pp).path.equals(trimmed) { hit = true; }
+            }
+            if hit {
+                let _ = this.projects.remove(at: i);
+                removed = true;
+            } else {
+                i = i +% (1 as usize);
+            }
+        }
+        if this.selected_project.equals(trimmed) {
+            this.selected_project = text::from_str("");
+            removed = true;
+        }
+        if this.filter_project.equals(trimmed) {
+            this.filter_project = text::from_str("");
+            removed = true;
+        }
+        if removed {
+            this._save_prefs();
+            this._emit();
+        }
+    }
+
+    fn sessions_in_project(this, folder_path: str) -> vec::Vec[types::SessionSummary] {
+        var out: vec::Vec[types::SessionSummary] = vec::new::[types::SessionSummary]();
+        let is_gen: bool = folder_path == "__general__";
+        var i: usize = 0 as usize;
+        while i < this.sessions.count() {
+            if let option::Option::Some(sp) = this.sessions.at_ptr(i) {
+                let sid: str = (*sp).session_id.view();
+                if !this.archived.contains(sid) {
+                    let cwd_v: str = (*sp).cwd.view();
+                    let row_gen: bool = cwd_v.is_empty() || cwd_v.contains(".desk420/") || cwd_v.contains("desk420-scratch");
+                    let matches: bool = if is_gen { row_gen } else { !row_gen && cwd_v == folder_path };
+                    if matches {
+                        let _ = out.append((*sp).clone());
+                    }
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return out;
+    }
+
+    fn count_in_project(this, folder_path: str) -> usize {
+        return this.sessions_in_project(folder_path).count();
+    }
+
     fn toggle_pin(ref this, session_id: str) {
         if !this.pinned.remove(session_id) {
             let _ = this.pinned.insert(text::from_str(session_id));
@@ -678,6 +747,30 @@ fn add_project(folder_path: str) {
     _SESS.add_project(folder_path);
 }
 
+fn has_saved_project(folder_path: str) -> bool {
+    _ensure();
+    return _SESS.has_saved_project(folder_path);
+}
+
+fn remove_project(folder_path: str) {
+    _ensure();
+    _SESS.remove_project(folder_path);
+}
+
+fn sessions_in_project(folder_path: str) -> vec::Vec[types::SessionSummary] {
+    _ensure();
+    return _SESS.sessions_in_project(folder_path);
+}
+
+fn count_in_project(folder_path: str) -> usize {
+    _ensure();
+    return _SESS.count_in_project(folder_path);
+}
+
+fn folder_label(cwd: str) -> text::Text {
+    return _folder_label(cwd);
+}
+
 fn all_project_folders() -> vec::Vec[ProjectEntry] {
     _ensure();
     var out: vec::Vec[ProjectEntry] = vec::new::[ProjectEntry]();
@@ -695,18 +788,20 @@ fn all_project_folders() -> vec::Vec[ProjectEntry] {
         i = i +% (1 as usize);
     }
 
-    // 2. Non-scratch folders discovered from Grok's session list
+    // 2. Non-scratch folders discovered from Grok's non-archived session list
     i = 0 as usize;
     while i < _SESS.sessions.count() {
         if let option::Option::Some(sp) = _SESS.sessions.at_ptr(i) {
-            let cwd_v: str = (*sp).cwd.view();
-            if cwd_v != "" && !cwd_v.contains(".desk420/") && !cwd_v.contains("desk420-scratch") {
-                if !seen.contains(cwd_v) {
-                    let _ = seen.insert((*sp).cwd.clone());
-                    let _ = out.append(ProjectEntry {
-                        path: (*sp).cwd.clone(),
-                        name: _folder_label(cwd_v),
-                    });
+            if !_SESS.archived.contains((*sp).session_id.view()) {
+                let cwd_v: str = (*sp).cwd.view();
+                if cwd_v != "" && !cwd_v.contains(".desk420/") && !cwd_v.contains("desk420-scratch") {
+                    if !seen.contains(cwd_v) {
+                        let _ = seen.insert((*sp).cwd.clone());
+                        let _ = out.append(ProjectEntry {
+                            path: (*sp).cwd.clone(),
+                            name: _folder_label(cwd_v),
+                        });
+                    }
                 }
             }
         }
@@ -887,4 +982,46 @@ fn visible_rows_sorts_newest_to_oldest_within_buckets() {
     assert (*r0).session_id.equals("newest");
     assert (*r1).session_id.equals("mid");
     assert (*r2).session_id.equals("old");
+}
+
+#[test]
+fn remove_project_and_sessions_in_project_work_and_persist() {
+    let p: str = "/tmp/desk420-remove-proj-test.json";
+    let _ = fs::remove_file(p);
+
+    var ss: SessionsStore = SessionsStore::new(prefs_path: p);
+    ss.add_project("/work/alpha");
+    ss.add_project("/work/beta");
+    ss.set_selected_project("/work/alpha");
+
+    var list: vec::Vec[types::SessionSummary] = vec::new::[types::SessionSummary]();
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("s1"),
+        cwd: text::from_str("/work/alpha"),
+        title: text::from_str("One"),
+        updated_at: text::from_str("2026-11-24T10:00:00Z"),
+    });
+    let _ = list.append(types::SessionSummary {
+        session_id: text::from_str("s2"),
+        cwd: text::from_str("/work/beta"),
+        title: text::from_str("Two"),
+        updated_at: text::from_str("2026-11-24T11:00:00Z"),
+    });
+    ss.set_sessions(list);
+
+    assert ss.has_saved_project("/work/alpha");
+    assert ss.count_in_project("/work/alpha") == (1 as usize);
+    assert ss.sessions_in_project("/work/beta").count() == (1 as usize);
+
+    ss.remove_project("/work/alpha");
+    assert !ss.has_saved_project("/work/alpha");
+    assert ss.has_saved_project("/work/beta");
+    assert ss.selected_project.is_empty();
+
+    var ss2: SessionsStore = SessionsStore::new(prefs_path: p);
+    ss2.load_prefs();
+    assert !ss2.has_saved_project("/work/alpha");
+    assert ss2.has_saved_project("/work/beta");
+
+    let _ = fs::remove_file(p);
 }

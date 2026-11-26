@@ -65,6 +65,7 @@ enum RowKind {
     UserMessage,
     AgentProse,
     AgentCode,
+    AgentTable,
     ApprovalCard,
     BrowserCard,
     OpenUrlChip,
@@ -179,6 +180,8 @@ const BODY_LINE: f64 = 23.0f64;
 const HEADING_SIZE: f64 = 18.0f64;
 const CODE_SIZE: f64 = 13.0f64;
 const CODE_LINE: f64 = 19.0f64;
+const TABLE_SIZE: f64 = 13.0f64;
+const TABLE_LINE: f64 = 19.0f64;
 const COMPOSER_MIN_H: f64 = 44.0f64;
 const COMPOSER_MAX_H: f64 = 160.0f64;
 const SIDE_TEXT_CAP: usize = 24000 as usize;
@@ -503,6 +506,175 @@ fn _flatten_prose_plain(src: str) -> text::Text {
     return out;
 }
 
+fn _table_align(a: md::TableAlign) -> vocab::TextAlign {
+    return match a {
+        md::TableAlign::Left => vocab::TextAlign::Start,
+        md::TableAlign::Center => vocab::TextAlign::Center,
+        md::TableAlign::Right => vocab::TextAlign::End,
+    };
+}
+
+fn _measure_table_height(raw: str, avail: f64) -> f64 {
+    let tbl: md::ParsedTable = md::parse_table(raw);
+    let cols: usize = tbl.headers.count();
+    if cols == (0 as usize) { return 36.0f64; }
+    let table_w: f64 = if avail > 80.0f64 { avail - 10.0f64 } else { 200.0f64 };
+    let raw_col_w: f64 = (table_w / (cols as f64)) - 16.0f64;
+    let col_w: f64 = if raw_col_w > 40.0f64 { raw_col_w } else { 40.0f64 };
+
+    // Header row height
+    var hdr_h: f64 = TABLE_LINE;
+    var ci: usize = 0 as usize;
+    while ci < cols {
+        if let option::Option::Some(hp) = tbl.headers.at_ptr(ci) {
+            let plain: text::Text = _plain_inline_text((*hp).view());
+            if !plain.is_empty() {
+                let h: f64 = text_metrics::measure_height(
+                    plain.view(), col_w,
+                    font_size: TABLE_SIZE, font_scales: false, line_height: TABLE_LINE,
+                );
+                if h > hdr_h { hdr_h = h; }
+            }
+        }
+        ci = ci +% (1 as usize);
+    }
+    var total: f64 = hdr_h + 18.0f64;
+
+    // Body rows
+    var ri: usize = 0 as usize;
+    while ri < tbl.rows.count() {
+        var rh: f64 = TABLE_LINE;
+        if let option::Option::Some(rp) = tbl.rows.at_ptr(ri) {
+            var cj: usize = 0 as usize;
+            while cj < (*rp).count() {
+                if let option::Option::Some(cp) = (*rp).at_ptr(cj) {
+                    let plain: text::Text = _plain_inline_text((*cp).view());
+                    if !plain.is_empty() {
+                        let h: f64 = text_metrics::measure_height(
+                            plain.view(), col_w,
+                            font_size: TABLE_SIZE, font_scales: false, line_height: TABLE_LINE,
+                        );
+                        if h > rh { rh = h; }
+                    }
+                }
+                cj = cj +% (1 as usize);
+            }
+        }
+        total = total + 1.0f64 + rh + 18.0f64;
+        ri = ri +% (1 as usize);
+    }
+    return total + 24.0f64;
+}
+
+fn _table_cell_node(cell_src: str, align: md::TableAlign, is_header: bool) -> core::Node {
+    var spans: vocab::Spans = vocab::Spans::new();
+    let fsize: f64 = if is_header { 12.5f64 } else { TABLE_SIZE };
+    _append_inline_spans(spans, cell_src, fsize, is_header);
+    let plain: text::Text = _plain_inline_text(cell_src);
+    let ta: vocab::TextAlign = _table_align(align);
+    let col: vocab::Color = if is_header { style::muted() } else { style::ink() };
+    let wt: vocab::FontWeight = if is_header { vocab::FontWeight::Semibold } else { vocab::FontWeight::Regular };
+    return @ui {
+        column {
+            label(plain.view(),
+            font_size: fsize,
+            font_weight: wt,
+            font_scales: false,
+            line_height: TABLE_LINE,
+            text_color: col,
+            text_align: ta,
+            line_break: vocab::LineBreak::WordWrap,
+            vertical_align: vocab::TextAlign::Start,
+            selectable: true,
+            formatted_text: spans)
+                .width_percent(100.0f64)
+        }
+        .grow(1.0f64)
+            .shrink(1.0f64)
+            .min_width(0.0f64)
+            .padding_edge(flex::Edge::Horizontal, 8.0f64)
+    };
+}
+
+fn _table_header_row(tbl: md::ParsedTable) -> core::Node {
+    let cols: i32 = tbl.headers.count() as i32;
+    return @ui {
+        hstack {
+            for ci in 0..cols {
+                _table_cell_node(
+                    match tbl.headers.at_ptr(ci as usize) { option::Option::Some(p) => (*p).view(), option::Option::None => "" },
+                    match tbl.aligns.at(ci as usize) { option::Option::Some(a) => a, option::Option::None => md::TableAlign::Left },
+                    true,
+                )
+            }
+        }
+        .width_percent(100.0f64)
+            .align(flex::Align::Start)
+            .padding_edge(flex::Edge::Horizontal, 4.0f64)
+            .padding_edge(flex::Edge::Vertical, 8.0f64)
+            .set_background_color(style::chip())
+    };
+}
+
+fn _table_body_row(tbl: md::ParsedTable, row_idx: usize) -> core::Node {
+    let cols: i32 = tbl.headers.count() as i32;
+    let is_odd: bool = (row_idx % (2 as usize)) == (1 as usize);
+    let row_bg: vocab::Color = if is_odd { vocab::Color::ink(0.025f64) } else { vocab::Color::clear() };
+    return @ui {
+        column {
+            style::rule()
+            hstack {
+                for ci in 0..cols {
+                    _table_cell_node(
+                        match tbl.rows.at_ptr(row_idx) {
+                            option::Option::Some(rp) => match (*rp).at_ptr(ci as usize) {
+                                option::Option::Some(cp) => (*cp).view(),
+                                option::Option::None => "",
+                            },
+                            option::Option::None => "",
+                        },
+                        match tbl.aligns.at(ci as usize) { option::Option::Some(a) => a, option::Option::None => md::TableAlign::Left },
+                        false,
+                    )
+                }
+            }
+            .width_percent(100.0f64)
+                .align(flex::Align::Start)
+                .padding_edge(flex::Edge::Horizontal, 4.0f64)
+                .padding_edge(flex::Edge::Vertical, 8.0f64)
+                .set_background_color(row_bg)
+        }
+        .width_percent(100.0f64)
+    };
+}
+
+fn _build_table_node(outer_key: str, raw: str) -> core::Node {
+    let tbl: md::ParsedTable = md::parse_table(raw);
+    let rcount: i32 = tbl.rows.count() as i32;
+    return @ui {
+        column(key: outer_key) {
+            bordered(stroke: vocab::Brush::solid(style::hairline()),
+            stroke_width: 1.0f64,
+            stroke_shape: vocab::Shape::rounded(10.0f64)) {
+                column {
+                    _table_header_row(tbl)
+                    for ri in 0..rcount {
+                        _table_body_row(tbl, ri as usize)
+                    }
+                }
+                .width_percent(100.0f64)
+            }
+            .width_percent(100.0f64)
+                .set_background_color(style::card())
+                .set_corner_radius(vocab::Corners::all(10.0f64))
+                .set_clip(vocab::Shape::rounded(10.0f64))
+        }
+        .width_percent(100.0f64)
+            .padding_edge(flex::Edge::Horizontal, 40.0f64)
+            .padding_edge(flex::Edge::Vertical, 8.0f64)
+    };
+}
+
 fn _flush_prose(ref out_rows: vec::Vec[DisplayRow], ref buf: text::Text, ref prev_list: bool) {
     if buf.is_empty() { return; }
     let local_u: text::Text = extract_localhost_url(buf.view());
@@ -804,6 +976,9 @@ impl ChatScreen {
                                 var row: DisplayRow = _empty_row(RowKind::AgentCode, (*mb).body.clone());
                                 row.lang = (*mb).lang.clone();
                                 let _ = out_rows.append(row);
+                            } else if (*mb).kind == md::BlockKind::Table {
+                                _flush_prose(out_rows, prose_buf, prose_prev_list);
+                                let _ = out_rows.append(_empty_row(RowKind::AgentTable, (*mb).body.clone()));
                             } else {
                                 // Emit each paragraph/heading as its own row so NSTableView
                                 // virtualizes long replies instead of putting 4KB+ in one
@@ -1029,14 +1204,14 @@ impl ChatScreen {
         let measured: f64 = match (*rp).kind {
             RowKind::LoadEarlier => 52.0f64,
             RowKind::UserMessage => {
-                let bubble_w: f64 = (avail * 0.72f64) - 44.0f64;
-                let mw: f64 = if bubble_w > 120.0f64 { bubble_w } else { 120.0f64 };
+                let raw_max: f64 = (avail * 0.72f64) - 36.0f64;
+                let max_w: f64 = if raw_max > 120.0f64 { raw_max } else { 120.0f64 };
                 let h: f64 = text_metrics::measure_height(
-                    (*rp).body.view(), mw,
+                    (*rp).body.view(), max_w,
                     font_size: BODY_SIZE, font_scales: false, line_height: BODY_LINE,
                 );
                 let extra: f64 = if (*rp).rewind_picking { 38.0f64 } else { 0.0f64 };
-                h + 56.0f64 + extra
+                h + 52.0f64 + extra
             }
             RowKind::AgentProse => {
                 let prose_txt: str = if (*rp).plain_prose.is_empty() {
@@ -1059,6 +1234,7 @@ impl ChatScreen {
                 );
                 h + 78.0f64
             }
+            RowKind::AgentTable => _measure_table_height((*rp).body.view(), avail),
             RowKind::ApprovalCard => {
                 if !(*rp).resolved_label.is_empty() {
                     40.0f64
@@ -1114,6 +1290,28 @@ impl ChatScreen {
                 let rw_all_key: text::Text = "chat:rw_all:${p_ord}";
                 let rw_conv_key: text::Text = "chat:rw_conv:${p_ord}";
                 let rw_files_key: text::Text = "chat:rw_files:${p_ord}";
+                let avail: f64 = if (*rp).cached_w > 120.0f64 { (*rp).cached_w } else { 520.0f64 };
+                let raw_max: f64 = (avail * 0.72f64) - 36.0f64;
+                let max_w: f64 = if raw_max > 120.0f64 { raw_max } else { 120.0f64 };
+                var nat_w: f64 = 0.0f64;
+                let u_lines: vec::Vec[str] = body_txt.view().split(separator: "\n");
+                var li: usize = 0 as usize;
+                while li < u_lines.count() {
+                    if let option::Option::Some(ul) = u_lines.at(li) {
+                        let lw: f64 = text_metrics::measure_width(ul, font_size: BODY_SIZE, font_scales: false);
+                        if lw > nat_w { nat_w = lw; }
+                    }
+                    li = li +% (1 as usize);
+                }
+                let txt_w: f64 = if nat_w + 4.0f64 < max_w {
+                    if nat_w + 4.0f64 > 24.0f64 { nat_w + 4.0f64 } else { 24.0f64 }
+                } else {
+                    max_w
+                };
+                let txt_h: f64 = text_metrics::measure_height(
+                    body_txt.view(), txt_w,
+                    font_size: BODY_SIZE, font_scales: false, line_height: BODY_LINE,
+                );
                 @ui {
                     column(key: outer_key.view()) {
                         hstack {
@@ -1129,14 +1327,16 @@ impl ChatScreen {
                                 line_height: BODY_LINE,
                                 text_color: style::ink(),
                                 line_break: vocab::LineBreak::WordWrap,
+                                vertical_align: vocab::TextAlign::Start,
                                 selectable: true)
-                                    .shrink(1.0f64)
+                                    .width(txt_w)
+                                    .height(txt_h + 4.0f64)
                             }
-                            .set_max_width_percent(72.0f64)
-                                .padding_edge(flex::Edge::Horizontal, 16.0f64)
+                            .padding_edge(flex::Edge::Horizontal, 16.0f64)
                                 .padding_edge(flex::Edge::Vertical, 12.0f64)
                                 .set_background_color(style::chip())
                                 .set_corner_radius(vocab::Corners::all(16.0f64))
+                                .shrink(0.0f64)
                         }
                         .width_percent(100.0f64)
                             .justify(flex::Justify::End)
@@ -1266,6 +1466,7 @@ impl ChatScreen {
                         .padding_edge(flex::Edge::Vertical, 8.0f64)
                 }
             }
+            RowKind::AgentTable => _build_table_node(outer_key.view(), body_txt.view()),
             RowKind::ApprovalCard => this._approval_row(index, outer_key.view()),
             RowKind::BrowserCard => {
                 let card_title: text::Text = (*rp).title.clone();
@@ -2236,14 +2437,23 @@ impl ChatScreen {
         this._sync_transcript();
     }
 
-    fn on_status_changed(ref this, _ev: engine::EngineStateEvent) {
+    fn on_status_changed(ref this, ev: engine::EngineStateEvent) {
+        let ch: engine::EngineChange = ev.change;
+        if ch == engine::EngineChange::Clock || ch == engine::EngineChange::Notifications {
+            return;
+        }
         let sid: text::Text = engine::active_session_id();
         if !sid.equals(this.rendered_sid.view()) {
             this._sync_transcript();
         } else {
             this._sync_status();
         }
-        this._sync_pickers();
+        if ch == engine::EngineChange::All
+            || ch == engine::EngineChange::Status
+            || ch == engine::EngineChange::Session
+            || ch == engine::EngineChange::Config {
+            this._sync_pickers();
+        }
     }
 
     fn on_load_earlier(ref this, _sender: *u8) {

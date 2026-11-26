@@ -14,6 +14,19 @@ enum BlockKind {
     Heading,
     ListItem,
     CodeBlock,
+    Table,
+}
+
+enum TableAlign {
+    Left,
+    Center,
+    Right,
+}
+
+struct ParsedTable {
+    aligns: vec::Vec[TableAlign],
+    headers: vec::Vec[text::Text],
+    rows: vec::Vec[vec::Vec[text::Text]],
 }
 
 struct MdBlock {
@@ -74,6 +87,151 @@ fn _is_ordered_list(s: str) -> bool {
     return dot && sp;
 }
 
+// Split a single GFM table line into trimmed cell texts.
+// Handles optional leading/trailing `|` and escaped `\|`.
+fn _split_table_row(line: str) -> vec::Vec[text::Text] {
+    var out: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var s: str = line.trim();
+    if s.has_prefix("|") {
+        if let option::Option::Some(sl) = s.slice(from: 1 as usize, to: s.count()) {
+            s = sl;
+        }
+    }
+    if s.has_suffix("|") && !s.has_suffix("\\|") {
+        if let option::Option::Some(sl) = s.slice(from: 0 as usize, to: s.count() -% (1 as usize)) {
+            s = sl;
+        }
+    }
+    let len: usize = s.count();
+    var cell: text::Text = text::new();
+    var i: usize = 0 as usize;
+    while i < len {
+        let b: u8 = match s.byte_at(i) {
+            option::Option::Some(v) => v,
+            option::Option::None => { break; }
+        };
+        if b == (92 as u8) && i +% (1 as usize) < len && _byte_is(s, i +% (1 as usize), 124 as u8) {
+            let _ = cell.append("|");
+            i = i +% (2 as usize);
+            continue;
+        }
+        if b == (124 as u8) {
+            let _ = out.append(text::from_str(cell.view().trim()));
+            cell = text::new();
+            i = i +% (1 as usize);
+            continue;
+        }
+        if let option::Option::Some(ch) = s.slice(from: i, to: i +% (1 as usize)) {
+            let _ = cell.append(ch);
+        }
+        i = i +% (1 as usize);
+    }
+    let _ = out.append(text::from_str(cell.view().trim()));
+    return out;
+}
+
+fn _is_table_separator(line: str) -> bool {
+    let trimmed: str = line.trim();
+    if trimmed.is_empty() || !trimmed.contains("-") || !trimmed.contains("|") {
+        return false;
+    }
+    let cells: vec::Vec[text::Text] = _split_table_row(trimmed);
+    if cells.count() == (0 as usize) { return false; }
+    var i: usize = 0 as usize;
+    while i < cells.count() {
+        if let option::Option::Some(cp) = cells.at_ptr(i) {
+            let cv: str = (*cp).view().trim();
+            if cv.is_empty() { return false; }
+            var dashes: usize = 0 as usize;
+            var j: usize = 0 as usize;
+            while j < cv.count() {
+                let b: u8 = match cv.byte_at(j) {
+                    option::Option::Some(v) => v,
+                    option::Option::None => { break; }
+                };
+                if b == (45 as u8) {
+                    dashes = dashes +% (1 as usize);
+                } else if b == (58 as u8) {
+                    if j != (0 as usize) && j != cv.count() -% (1 as usize) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+                j = j +% (1 as usize);
+            }
+            if dashes == (0 as usize) { return false; }
+        }
+        i = i +% (1 as usize);
+    }
+    return true;
+}
+
+fn _strip_cr(raw_line: str) -> str {
+    if raw_line.has_suffix("\r") {
+        if let option::Option::Some(sl) = raw_line.slice(from: 0 as usize, to: raw_line.count() -% (1 as usize)) {
+            return sl;
+        }
+    }
+    return raw_line;
+}
+
+fn parse_table(raw: str) -> ParsedTable {
+    var aligns: vec::Vec[TableAlign] = vec::new::[TableAlign]();
+    var headers: vec::Vec[text::Text] = vec::new::[text::Text]();
+    var rows: vec::Vec[vec::Vec[text::Text]] = vec::new::[vec::Vec[text::Text]]();
+    let lines: vec::Vec[str] = raw.split(separator: "\n");
+    if lines.count() < (2 as usize) {
+        return ParsedTable { aligns: aligns, headers: headers, rows: rows };
+    }
+    if let option::Option::Some(h_raw) = lines.at(0 as usize) {
+        headers = _split_table_row(_strip_cr(h_raw));
+    }
+    let sep_cells: vec::Vec[text::Text] = match lines.at(1 as usize) {
+        option::Option::Some(s_raw) => _split_table_row(_strip_cr(s_raw)),
+        option::Option::None => vec::new::[text::Text](),
+    };
+    let col_count: usize = if headers.count() >= sep_cells.count() { headers.count() } else { sep_cells.count() };
+    while headers.count() < col_count {
+        let _ = headers.append(text::from_str(""));
+    }
+    var ci: usize = 0 as usize;
+    while ci < col_count {
+        var al: TableAlign = TableAlign::Left;
+        if let option::Option::Some(sp) = sep_cells.at_ptr(ci) {
+            let sv: str = (*sp).view().trim();
+            let left_c: bool = sv.has_prefix(":");
+            let right_c: bool = sv.has_suffix(":");
+            if left_c && right_c {
+                al = TableAlign::Center;
+            } else if right_c {
+                al = TableAlign::Right;
+            }
+        }
+        let _ = aligns.append(al);
+        ci = ci +% (1 as usize);
+    }
+
+    var li: usize = 2 as usize;
+    while li < lines.count() {
+        if let option::Option::Some(r_raw) = lines.at(li) {
+            let rl: str = _strip_cr(r_raw).trim();
+            if !rl.is_empty() && rl.contains("|") {
+                var cells: vec::Vec[text::Text] = _split_table_row(rl);
+                while cells.count() < col_count {
+                    let _ = cells.append(text::from_str(""));
+                }
+                while cells.count() > col_count {
+                    let _ = cells.remove_last();
+                }
+                let _ = rows.append(cells);
+            }
+        }
+        li = li +% (1 as usize);
+    }
+    return ParsedTable { aligns: aligns, headers: headers, rows: rows };
+}
+
 fn parse_blocks(src: str) -> vec::Vec[MdBlock] {
     var out: vec::Vec[MdBlock] = vec::new::[MdBlock]();
     if src.is_empty() { return out; }
@@ -87,13 +245,7 @@ fn parse_blocks(src: str) -> vec::Vec[MdBlock] {
     var i: usize = 0 as usize;
     while i < lines.count() {
         if let option::Option::Some(raw_line) = lines.at(i) {
-            // Strip trailing \r if present.
-            var line: str = raw_line;
-            if line.has_suffix("\r") {
-                if let option::Option::Some(sl) = line.slice(from: 0 as usize, to: line.count() -% (1 as usize)) {
-                    line = sl;
-                }
-            }
+            let line: str = _strip_cr(raw_line);
             let trimmed: str = line.trim_start();
 
             if in_fence {
@@ -128,6 +280,37 @@ fn parse_blocks(src: str) -> vec::Vec[MdBlock] {
             } else if trimmed.is_empty() {
                 _push_paragraph(out, para.clone());
                 para = text::new();
+            } else if trimmed.contains("|") && i +% (1 as usize) < lines.count() && _is_table_separator(match lines.at(i +% (1 as usize)) { option::Option::Some(nl) => _strip_cr(nl), option::Option::None => "" }) {
+                _push_paragraph(out, para.clone());
+                para = text::new();
+                var tbuf: text::Text = text::from_str(line);
+                if let option::Option::Some(sep_l) = lines.at(i +% (1 as usize)) {
+                    let _ = tbuf.append("\n");
+                    let _ = tbuf.append(_strip_cr(sep_l));
+                }
+                var j: usize = i +% (2 as usize);
+                while j < lines.count() {
+                    var keep: bool = false;
+                    if let option::Option::Some(rl) = lines.at(j) {
+                        let r_clean: str = _strip_cr(rl);
+                        let r_trim: str = r_clean.trim();
+                        if !r_trim.is_empty() && r_trim.contains("|") && !r_trim.has_prefix("```") {
+                            let _ = tbuf.append("\n");
+                            let _ = tbuf.append(r_clean);
+                            keep = true;
+                        }
+                    }
+                    if !keep { break; }
+                    j = j +% (1 as usize);
+                }
+                let _ = out.append(MdBlock {
+                    kind: BlockKind::Table,
+                    level: 0 as i32,
+                    lang: text::from_str(""),
+                    body: tbuf,
+                });
+                i = j;
+                continue;
             } else if trimmed.has_prefix("### ") {
                 _push_paragraph(out, para.clone());
                 para = text::new();
@@ -385,4 +568,38 @@ fn parses_inline_bold_italic_code_and_link() {
     assert (*s5).text.equals("x");
     guard let option::Option::Some(s7) = spans.at_ptr(7 as usize) else { assert false; return; };
     assert (*s7).text.equals("Grok") && (*s7).url.equals("https://grok.com");
+}
+
+#[test]
+fn parses_gfm_tables_with_alignment_and_empty_cells() {
+    let md: str = "Intro\n\n| | Price | vs. $83 IPO | vs. $111.50 first trade |\n|---|---:|---:|:---:|\n| IPO price (Nov 18) | **$83.00** | — | — |\n| Close Nov 25 | $82.79 | -$0.21 | -$28.71 |\n\nOutro";
+    let blocks: vec::Vec[MdBlock] = parse_blocks(md);
+    assert blocks.count() == (3 as usize);
+
+    guard let option::Option::Some(b0) = blocks.at_ptr(0 as usize) else { assert false; return; };
+    assert (*b0).kind == BlockKind::Paragraph && (*b0).body.equals("Intro");
+
+    guard let option::Option::Some(b1) = blocks.at_ptr(1 as usize) else { assert false; return; };
+    assert (*b1).kind == BlockKind::Table;
+
+    guard let option::Option::Some(b2) = blocks.at_ptr(2 as usize) else { assert false; return; };
+    assert (*b2).kind == BlockKind::Paragraph && (*b2).body.equals("Outro");
+
+    let tbl: ParsedTable = parse_table((*b1).body.view());
+    assert tbl.headers.count() == (4 as usize);
+    assert tbl.aligns.count() == (4 as usize);
+    assert tbl.rows.count() == (2 as usize);
+
+    guard let option::Option::Some(h0) = tbl.headers.at_ptr(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(h1) = tbl.headers.at_ptr(1 as usize) else { assert false; return; };
+    assert (*h0).equals("") && (*h1).equals("Price");
+
+    guard let option::Option::Some(a0) = tbl.aligns.at(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(a1) = tbl.aligns.at(1 as usize) else { assert false; return; };
+    guard let option::Option::Some(a3) = tbl.aligns.at(3 as usize) else { assert false; return; };
+    assert a0 == TableAlign::Left && a1 == TableAlign::Right && a3 == TableAlign::Center;
+
+    guard let option::Option::Some(r0) = tbl.rows.at_ptr(0 as usize) else { assert false; return; };
+    guard let option::Option::Some(c1) = (*r0).at_ptr(1 as usize) else { assert false; return; };
+    assert (*c1).equals("**$83.00**");
 }
