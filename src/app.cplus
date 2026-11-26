@@ -439,6 +439,11 @@ fn parse_deep_link(raw_url: str) -> DeepLinkAction {
     return DeepLinkAction::None;
 }
 
+fn is_allowed_deep_link_browser_url(raw_target: str, cwd: str) -> bool {
+    let norm: text::Text = browser_pane::normalize_url(raw_target);
+    return browser_mcp::check_url_policy(norm.view(), cwd).is_empty();
+}
+
 fn _on_deep_link(raw_url: str, _ctx: *u8) {
     let act: DeepLinkAction = parse_deep_link(raw_url);
     match act {
@@ -474,7 +479,10 @@ fn _on_deep_link(raw_url: str, _ctx: *u8) {
             }
         }
         DeepLinkAction::OpenBrowser(target) => {
-            browser_pane::open_in_browser(target.view());
+            let cwd: text::Text = engine::active_cwd();
+            if is_allowed_deep_link_browser_url(target.view(), cwd.view()) {
+                browser_pane::open_in_browser(target.view());
+            }
         }
         DeepLinkAction::None => {}
     }
@@ -484,7 +492,6 @@ fn run(require_consent: bool = false) -> i32 {
     agent_consent::force_ask(require_consent);
     agent_consent::install();
     prefs::apply_browser(prefs::browser());
-    browser_mcp::set_policy_hooks(engine::active_cwd, engine::is_auto_approve, engine::active_session_id);
     let _ = browser_mcp::start();
     let _ = applinks::on_link(_on_deep_link, scheme: "desk420");
     agent::enable();
@@ -586,4 +593,8 @@ fn parse_deep_link_routes_chat_new_and_browser() {
         DeepLinkAction::None => {}
         _ => { assert false; }
     }
+    assert is_allowed_deep_link_browser_url("http://localhost:3000", "/tmp");
+    assert is_allowed_deep_link_browser_url("https://example.com", "/tmp");
+    assert !is_allowed_deep_link_browser_url("javascript:alert(1)", "/tmp");
+    assert !is_allowed_deep_link_browser_url("file:///etc/hosts", "/tmp");
 }

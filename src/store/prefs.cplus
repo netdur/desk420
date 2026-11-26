@@ -218,9 +218,9 @@ impl AgentAccessPref {
     }
 
     fn from_word(s: str) -> AgentAccessPref {
-        if s == "ask" { return AgentAccessPref::Ask; }
+        if s == "open" { return AgentAccessPref::Open; }
         if s == "off" { return AgentAccessPref::Off; }
-        return AgentAccessPref::Open;
+        return AgentAccessPref::Ask;
     }
 }
 
@@ -229,7 +229,7 @@ static _APPEARANCE: AppearancePref = #zero::[AppearancePref]();   // System — 
 static _BROWSER: BrowserPref = #zero::[BrowserPref]();            // System — the first variant
 static _SEND_KEY: SendKeyPref = #zero::[SendKeyPref]();           // Return — the first variant
 static _EXPAND_THINKING: bool = false;
-static _AGENT_ACCESS: AgentAccessPref = #zero::[AgentAccessPref](); // Open — the first variant
+static _AGENT_ACCESS: AgentAccessPref = #zero::[AgentAccessPref](); // initialized in _ensure() -> Ask by default
 static _PATH: text::Text = #zero::[text::Text]();
 
 fn _desk420_dir() -> text::Text {
@@ -264,7 +264,7 @@ impl Prefs {
             browser: BrowserPref::System,
             send_key: SendKeyPref::Return,
             expand_thinking: false,
-            agent_access: AgentAccessPref::Open,
+            agent_access: AgentAccessPref::Ask,
         };
     }
 }
@@ -303,7 +303,7 @@ fn _read(p: str) -> text::Text {
     };
 }
 
-fn render(a: AppearancePref, b: BrowserPref = BrowserPref::System, sk: SendKeyPref = SendKeyPref::Return, expand_think: bool = false, access: AgentAccessPref = AgentAccessPref::Open) -> text::Text {
+fn render(a: AppearancePref, b: BrowserPref = BrowserPref::System, sk: SendKeyPref = SendKeyPref::Return, expand_think: bool = false, access: AgentAccessPref = AgentAccessPref::Ask) -> text::Text {
     var m: vec::Vec[json::Member] = vec::new::[json::Member]();
     let _ = m.append(json::Member::new("appearance", json::Value::text(a.word())));
     let _ = m.append(json::Member::new("browser", json::Value::text(b.word())));
@@ -443,11 +443,13 @@ fn send_key_and_expand_thinking_round_trip_with_defaults() {
     let empty: Prefs = parse_prefs("");
     assert empty.send_key == SendKeyPref::Return;
     assert !empty.expand_thinking;
-    let saved: text::Text = render(AppearancePref::System, BrowserPref::System, SendKeyPref::CmdReturn, true, AgentAccessPref::Ask);
+    assert empty.agent_access == AgentAccessPref::Ask;
+    assert parse_prefs("{\"agent_access\":\"bogus\"}").agent_access == AgentAccessPref::Ask;
+    let saved: text::Text = render(AppearancePref::System, BrowserPref::System, SendKeyPref::CmdReturn, true, AgentAccessPref::Open);
     let p: Prefs = parse_prefs(saved.view());
     assert p.send_key == SendKeyPref::CmdReturn;
     assert p.expand_thinking;
-    assert p.agent_access == AgentAccessPref::Ask;
+    assert p.agent_access == AgentAccessPref::Open;
     assert SendKeyPref::from_index(SendKeyPref::CmdReturn.to_index()) == SendKeyPref::CmdReturn;
     assert AgentAccessPref::from_index(AgentAccessPref::Off.to_index()) == AgentAccessPref::Off;
 }

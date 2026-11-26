@@ -436,8 +436,7 @@ struct ConversationStore {
     sessions: vec::Vec[SessionState],
     _changes: events::Signal[StoreChange],
     batching: bool,
-    batch_dirty: bool,
-    batch_sidx: usize,
+    batch_dirty_sids: vec::Vec[usize],
 }
 
 impl ConversationStore {
@@ -446,32 +445,50 @@ impl ConversationStore {
             sessions: vec::new::[SessionState](),
             _changes: events::Signal[StoreChange]::new(),
             batching: false,
-            batch_dirty: false,
-            batch_sidx: 0 as usize,
+            batch_dirty_sids: vec::new::[usize](),
         };
     }
 
     fn begin_batch(ref this) {
         this.batching = true;
-        this.batch_dirty = false;
+        this.batch_dirty_sids.remove_all();
     }
 
     fn end_batch(ref this) {
         this.batching = false;
-        if this.batch_dirty {
-            this.batch_dirty = false;
-            this._changes.emit(StoreChange {
-                kind: ChangeKind::BlockUpdated,
-                session_index: this.batch_sidx,
-                block_index: 0 as usize,
-            });
+        if this.batch_dirty_sids.count() == (0 as usize) { return; }
+        var pending: vec::Vec[usize] = vec::new::[usize]();
+        var i: usize = 0 as usize;
+        while i < this.batch_dirty_sids.count() {
+            if let option::Option::Some(sp) = this.batch_dirty_sids.at_ptr(i) {
+                let _ = pending.append(*sp);
+            }
+            i = i +% (1 as usize);
+        }
+        this.batch_dirty_sids.remove_all();
+        var j: usize = 0 as usize;
+        while j < pending.count() {
+            if let option::Option::Some(sp) = pending.at_ptr(j) {
+                this._changes.emit(StoreChange {
+                    kind: ChangeKind::BlockUpdated,
+                    session_index: *sp,
+                    block_index: 0 as usize,
+                });
+            }
+            j = j +% (1 as usize);
         }
     }
 
     fn _emit(ref this, ch: StoreChange) {
         if this.batching {
-            this.batch_dirty = true;
-            this.batch_sidx = ch.session_index;
+            var i: usize = 0 as usize;
+            while i < this.batch_dirty_sids.count() {
+                if let option::Option::Some(sp) = this.batch_dirty_sids.at_ptr(i) {
+                    if *sp == ch.session_index { return; }
+                }
+                i = i +% (1 as usize);
+            }
+            let _ = this.batch_dirty_sids.append(ch.session_index);
             return;
         }
         this._changes.emit(ch);
@@ -1521,4 +1538,34 @@ fn fixture_mcp_tool_turn_decodes_cleanly() {
     guard let option::Option::Some(sp) = store.session_ptr(0 as usize) else { assert false; return; };
     assert !(*sp).all_agent_text().is_empty();
     assert (*sp).tool_call_count() == (2 as usize);
+}
+
+static _BATCH_TEST_MASK: u64 = 0 as u64;
+static _BATCH_TEST_COUNT: usize = 0 as usize;
+
+fn _on_batch_test_change(ch: StoreChange, _ctx: *u8) {
+    _BATCH_TEST_COUNT = _BATCH_TEST_COUNT +% (1 as usize);
+    if ch.session_index == (0 as usize) {
+        _BATCH_TEST_MASK = _BATCH_TEST_MASK | (1 as u64);
+    } else if ch.session_index == (1 as usize) {
+        _BATCH_TEST_MASK = _BATCH_TEST_MASK | (2 as u64);
+    }
+}
+
+#[test]
+fn batch_emits_notification_for_every_modified_session() {
+    _BATCH_TEST_MASK = 0 as u64;
+    _BATCH_TEST_COUNT = 0 as usize;
+    var store: ConversationStore = ConversationStore::new();
+    let _sub: events::SignalSubscription[StoreChange] = store._changes.on(_on_batch_test_change);
+
+    store.begin_batch();
+    store.begin_turn("s-alpha", "first");
+    store.begin_turn("s-beta", "second");
+    store.apply_turn_error("s-alpha", "err");
+    store.end_batch();
+
+    // Both session 0 and session 1 must be notified, with duplicates coalesced.
+    assert _BATCH_TEST_COUNT == (2 as usize);
+    assert _BATCH_TEST_MASK == (3 as u64);
 }

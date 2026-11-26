@@ -26,7 +26,7 @@ on:
       cplus_ref:
         description: "Branch, tag, or commit of netdur/cplus to build with"
         required: false
-        default: "main"
+        default: "1eb05ae158e12be3ba3e11472be5c412ba4f777e"
 
 permissions:
   contents: read
@@ -92,7 +92,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: netdur/cplus
-          ref: ${{ inputs.cplus_ref || 'main' }}
+          ref: ${{ inputs.cplus_ref || '1eb05ae158e12be3ba3e11472be5c412ba4f777e' }}
           path: _cplus
           persist-credentials: false
 

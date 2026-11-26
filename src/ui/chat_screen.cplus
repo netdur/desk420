@@ -217,6 +217,13 @@ fn _build_diff_spans(raw: str) -> vocab::Spans {
     return spans;
 }
 
+fn _on_git_discard_alert(index: i32, _ctx: *u8) {
+    engine::refocus_main_window();
+    if index == (0 as i32) {
+        engine::git_discard_all();
+    }
+}
+
 fn _same_row(a: *DisplayRow, b: *DisplayRow) -> bool {
     if (*a).kind != (*b).kind { return false; }
     if (*a).user_ordinal != (*b).user_ordinal { return false; }
@@ -2726,7 +2733,15 @@ impl ChatScreen {
     }
 
     fn on_git_discard(ref this, _sender: *u8) {
-        engine::git_discard_all();
+        let cwd: text::Text = engine::active_cwd();
+        if cwd.is_empty() || cwd.contains(".desk420/") { return; }
+        runtime::alert(
+            "Discard uncommitted changes?",
+            "This runs `git checkout -- .` in the current workspace and permanently discards all unstaged modifications.",
+            "Discard",
+            secondary: "Cancel",
+            on_answer: _on_git_discard_alert,
+        );
     }
 
     fn on_git_commit(ref this, _sender: *u8) {

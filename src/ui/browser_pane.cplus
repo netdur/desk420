@@ -95,9 +95,6 @@ struct _BrowserState {
     agent_driving: bool,
     taken_over: bool,
     hook_installed: bool,
-    pending_origin: text::Text,
-    origin_cb: fn(bool, *u8),
-    opaque origin_ctx: *u8,
 }
 
 static _STATE_LIVE: bool = false;
@@ -117,9 +114,6 @@ fn _ensure_state() {
             agent_driving: false,
             taken_over: false,
             hook_installed: false,
-            pending_origin: text::from_str(""),
-            origin_cb: #zero::[fn(bool, *u8)](),
-            origin_ctx: 0 as *u8,
         };
         _STATE_LIVE = true;
     }
@@ -143,11 +137,6 @@ fn _sync_view() {
     style::show("browser:empty", !_STATE.has_page);
     style::show("web:view", _STATE.has_page);
     style::show("web:agent_bar", _STATE.agent_driving || _STATE.taken_over);
-    style::show("web:origin_bar", !_STATE.pending_origin.is_empty());
-    if !_STATE.pending_origin.is_empty() {
-        let prompt_lbl: text::Text = "Allow Grok to open ${_STATE.pending_origin.view()}?";
-        style::set_label("web:origin_label", prompt_lbl.view());
-    }
     if _STATE.taken_over {
         style::set_label("web:agent_label", "You took over — Grok paused");
         if let option::Option::Some(btn) = m_text_button::find("web:takeover") {
@@ -326,19 +315,6 @@ fn _tabs_json() -> text::Text {
     return json::Value::array(items).to_text();
 }
 
-fn _resolve_origin(allowed: bool) {
-    _ensure_state();
-    let cb: fn(bool, *u8) = _STATE.origin_cb;
-    let ctx: *u8 = _STATE.origin_ctx;
-    _STATE.pending_origin = text::from_str("");
-    _STATE.origin_cb = #zero::[fn(bool, *u8)]();
-    _STATE.origin_ctx = 0 as *u8;
-    _sync_view();
-    if cb.is_not_null() {
-        cb(allowed, ctx);
-    }
-}
-
 struct BrowserPane {}
 
 impl BrowserPane {
@@ -468,43 +444,6 @@ impl BrowserPane {
                     .padding_edge(flex::Edge::Horizontal, 12.0f64)
                     .set_background_color(style::lime_wash())
 
-                hstack(key: "web:origin_bar") {
-                    symbol(icons::warning, size: 15.0f64, color: style::lime_text())
-                        .shrink(0.0f64)
-                    label("Allow Grok to open external site?", key: "web:origin_label",
-                    font_size: 12.0f64,
-                    font_weight: vocab::FontWeight::Medium,
-                    text_color: style::ink(),
-                    line_break: vocab::LineBreak::TailTruncation,
-                    max_lines: 1 as i64)
-                        .grow(1.0f64)
-                        .shrink(1.0f64)
-                    text_button("Allow", key: "web:origin_allow",
-                    font_size: 12.0f64,
-                    font_weight: vocab::FontWeight::Semibold,
-                    text_color: style::on_lime(),
-                    bordered: false,
-                    corner_radius: vocab::Corners::all(6.0f64),
-                    on_click: this.on_origin_allow)
-                        .padding_edge(flex::Edge::Horizontal, 9.0f64)
-                        .padding_edge(flex::Edge::Vertical, 4.0f64)
-                        .set_background_color(style::lime())
-                        .shrink(0.0f64)
-                    text_button("Deny", key: "web:origin_deny",
-                    font_size: 12.0f64,
-                    font_weight: vocab::FontWeight::Medium,
-                    text_color: style::muted(),
-                    bordered: false,
-                    on_click: this.on_origin_deny)
-                        .shrink(0.0f64)
-                }
-                .align(flex::Align::Center)
-                    .gap(8.0f64)
-                    .height(38.0f64)
-                    .shrink(0.0f64)
-                    .padding_edge(flex::Edge::Horizontal, 12.0f64)
-                    .set_background_color(style::chip())
-
                 column(key: "browser:empty") {
                     symbol(icons::language, size: 28.0f64, color: style::faint())
                         .set_input_transparent(true)
@@ -593,14 +532,6 @@ impl BrowserPane {
         _sync_view();
     }
 
-    fn on_origin_allow(ref this, _sender: *u8) {
-        _resolve_origin(true);
-    }
-
-    fn on_origin_deny(ref this, _sender: *u8) {
-        _resolve_origin(false);
-    }
-
     fn on_url_submit(ref this, _sender: *u8) {
         guard let option::Option::Some(tf) = m_text_field::find("web:url") else { return; };
         let entered: text::Text = text::from_str(tf.text());
@@ -682,23 +613,6 @@ fn is_loading() -> bool {
 fn has_active_browser() -> bool {
     _ensure_state();
     return _STATE.mounted;
-}
-
-fn request_origin_approval(origin: str, cb: fn(bool, *u8), ctx: *u8) {
-    _ensure_state();
-    if !_STATE.mounted {
-        cb(false, ctx);
-        return;
-    }
-    // Deny any previous stale prompt so its waiting thread never leaks.
-    if !_STATE.pending_origin.is_empty() {
-        _resolve_origin(false);
-    }
-    _show_browser_tab();
-    _STATE.pending_origin = text::from_str(origin);
-    _STATE.origin_cb = cb;
-    _STATE.origin_ctx = ctx;
-    _sync_view();
 }
 
 fn web_node() -> *core::Node {

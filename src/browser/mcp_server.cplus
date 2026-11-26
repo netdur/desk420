@@ -1,8 +1,9 @@
 // src/browser/mcp_server.cplus — loopback HTTP MCP server (`desk420-browser`).
 //
 // Exposes the Desk420 built-in Browser pane to `grok agent stdio` over
-// loopback HTTP (`http://127.0.0.1:<port>/mcp`) with a per-launch Bearer token,
-// following the exact HTTP MCP protocol recorded in `fixtures/acp/grok-1.0.92-main.jsonl`.
+// loopback HTTP (`http://127.0.0.1:<port>/mcp`) with per-session 192-bit
+// CSPRNG Bearer tokens binding every request to its originating session's
+// working directory.
 //
 // Tool execution hops to the main UI thread via `services::run_on_main`, drives
 // `BrowserPane` + `facet/web_driver`, and returns results over a one-shot
@@ -22,7 +23,6 @@ import "stdlib/net" as net;
 import "stdlib/option" as option;
 import "stdlib/process" as process;
 import "stdlib/result" as result;
-import "stdlib/string_set" as string_set;
 import "stdlib/text" as text;
 import "stdlib/thread" as thread;
 import "stdlib/time" as time;
@@ -31,16 +31,58 @@ import "stdlib/vec" as vec;
 
 import "../ui/browser_pane" as browser_pane;
 
-// ───────────────────────────── origin safety policy ─────────────────────────────
-
-fn _is_loopback_host(host: str) -> bool {
-    let low: text::Text = text::from_str(host).lowercased();
-    let h: str = low.view();
-    return h == "localhost" || h == "127.0.0.1" || h == "::1";
-}
+// ───────────────────────────── URL safety policy ─────────────────────────────
 
 fn _contains_parent_traversal(s: str) -> bool {
     return s.contains("/../") || s.has_suffix("/..") || s.has_prefix("../") || s == "..";
+}
+
+fn _strip_trailing_slashes(p: str) -> text::Text {
+    var end: usize = p.count();
+    while end > (1 as usize) {
+        let is_sl: bool = match p.byte_at(end -% (1 as usize)) {
+            option::Option::Some(b) => b == ('/' as u8),
+            option::Option::None => false,
+        };
+        if !is_sl { break; }
+        end = end -% (1 as usize);
+    }
+    if let option::Option::Some(sl) = p.slice(from: 0 as usize, to: end) {
+        return text::from_str(sl);
+    }
+    return text::from_str(p);
+}
+
+// Resolve `raw_path` to its canonical filesystem path (following symlinks and
+// collapsing `.` / `..`). Returns None if the path does not exist or cannot
+// be resolved (fail closed).
+fn _canonicalize_path(raw_path: str) -> option::Option[text::Text] {
+    if raw_path.is_empty() { return option::Option[text::Text]::None; }
+    var argv: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let _ = argv.append(text::from_str("/bin/realpath"));
+    let _ = argv.append(text::from_str("--"));
+    let _ = argv.append(text::from_str(raw_path));
+    let out: process::Output = process::capture(argv);
+    if out.code != (0 as i32) {
+        return option::Option[text::Text]::None;
+    }
+    let resolved: str = out.stdout.view().trim();
+    if resolved.is_empty() {
+        return option::Option[text::Text]::None;
+    }
+    return option::Option[text::Text]::Some(_strip_trailing_slashes(resolved));
+}
+
+// True iff canonical path `target` equals `root` or lies strictly inside `root/`.
+// Prevents sibling-directory prefix confusion (`/repo` vs `/repo-private`).
+fn _path_within_dir(target: str, root: str) -> bool {
+    let t: text::Text = _strip_trailing_slashes(target);
+    let r: text::Text = _strip_trailing_slashes(root);
+    if r.is_empty() || t.is_empty() { return false; }
+    if t.equals(r.view()) { return true; }
+    if r.equals("/") { return t.view().has_prefix("/"); }
+    let prefix: text::Text = "${r.view()}/";
+    return t.view().has_prefix(prefix.view());
 }
 
 // Return the normalized lowercased origin ("scheme://host[:port]") for an
@@ -65,10 +107,10 @@ fn extract_origin(raw_url: str) -> text::Text {
     return "${sch.view()}://${host_part.view()}";
 }
 
-// Check whether the agent may open `raw_url` under the current approval mode and
-// conversation working directory. Returns "" when allowed, or a human-readable
-// refusal reason when blocked.
-fn check_url_policy(raw_url: str, cwd: str, auto_approve: bool) -> text::Text {
+// Check whether `raw_url` may be opened in the isolated built-in browser under
+// the originating session's working directory `cwd`.
+// Returns "" when allowed, or a human-readable refusal reason when blocked.
+fn check_url_policy(raw_url: str, cwd: str) -> text::Text {
     let trimmed: str = raw_url.trim();
     if trimmed.is_empty() { return text::from_str("Refused: empty URL."); }
     let low: text::Text = text::from_str(trimmed).lowercased();
@@ -82,15 +124,23 @@ fn check_url_policy(raw_url: str, cwd: str, auto_approve: bool) -> text::Text {
         if cwd.is_empty() {
             return text::from_str("Refused: file:// URLs require an active project folder.");
         }
+        if !u.host.is_empty() && u.host != "localhost" {
+            return text::from_str("Refused: remote file:// hosts are not permitted.");
+        }
         if _contains_parent_traversal(trimmed) || _contains_parent_traversal(u.path) {
             return text::from_str("Refused: file:// path traversal is not permitted.");
         }
         let decoded_path: text::Text = url::decode(u.path);
-        if _contains_parent_traversal(decoded_path.view()) {
+        if decoded_path.is_empty() || _contains_parent_traversal(decoded_path.view()) {
             return text::from_str("Refused: file:// path traversal is not permitted.");
         }
-        let prefix: text::Text = "file://${cwd}";
-        if !trimmed.has_prefix(prefix.view()) {
+        guard let option::Option::Some(canon_cwd) = _canonicalize_path(cwd) else {
+            return text::from_str("Refused: project folder could not be resolved.");
+        };
+        guard let option::Option::Some(canon_target) = _canonicalize_path(decoded_path.view()) else {
+            return text::from_str("Refused: file:// target does not exist or could not be resolved.");
+        };
+        if !_path_within_dir(canon_target.view(), canon_cwd.view()) {
             return text::from_str("Refused: file:// URLs are restricted to the conversation's project folder.");
         }
         return text::from_str("");
@@ -100,8 +150,6 @@ fn check_url_policy(raw_url: str, cwd: str, auto_approve: bool) -> text::Text {
     }
     // The built-in browser runs in an isolated non-persistent WKWebsiteDataStore
     // (no Safari cookies or logins), so all standard http(s) URLs are allowed.
-    let _allow_auto: bool = auto_approve;
-    let _loopback: bool = _is_loopback_host(u.host);
     return text::from_str("");
 }
 
@@ -152,9 +200,6 @@ struct _ToolReply {
     ok: bool,
     is_image: bool,
     data: text::Text,
-    policy_cwd: text::Text,
-    policy_sid: text::Text,
-    policy_auto: bool,
 }
 
 fn _reply_text(ok: bool, data: str) -> _ToolReply {
@@ -162,22 +207,16 @@ fn _reply_text(ok: bool, data: str) -> _ToolReply {
         ok: ok,
         is_image: false,
         data: text::from_str(data),
-        policy_cwd: text::from_str(""),
-        policy_sid: text::from_str(""),
-        policy_auto: false,
     };
 }
 
 enum _MainOp {
     OpenUrl(text::Text, bool),           // url, new_tab
-    EvalJs(text::Text),                  // js
-    Screenshot,
+    EvalJs(text::Text, text::Text),      // js, session_cwd
+    Screenshot(text::Text),              // session_cwd
     CheckLoading,
     ResizeViewport(f64, f64),            // width, height
-    RequestOriginApproval(text::Text),   // origin
     TabsOp(text::Text, i64, text::Text), // action, index, url
-    ReadPolicy(text::Text),              // origin
-    RememberOrigin(text::Text, text::Text), // sid, origin
 }
 
 struct _MainWork {
@@ -203,16 +242,7 @@ fn _on_snap_reply(ok: bool, bytes: *u8, len: usize, raw_ctx: *u8) {
         ok: true,
         is_image: true,
         data: b64,
-        policy_cwd: text::from_str(""),
-        policy_sid: text::from_str(""),
-        policy_auto: false,
     });
-}
-
-fn _on_origin_decision(allowed: bool, raw_ctx: *u8) {
-    if raw_ctx.is_null() { return; }
-    let ch: channel::Channel[_ToolReply] = box::from_raw::[channel::Channel[_ToolReply]](raw_ctx).unwrap();
-    let _ = ch.send(_reply_text(allowed, if allowed { "allowed" } else { "denied" }));
 }
 
 fn _run_main_work(raw: *u8) {
@@ -222,25 +252,6 @@ fn _run_main_work(raw: *u8) {
         _MainOp::CheckLoading => {
             let loading: bool = browser_pane::is_loading();
             let _ = work.tx.send(_reply_text(true, if loading { "1" } else { "0" }));
-            return;
-        }
-        _MainOp::ReadPolicy(origin) => {
-            let cwd: text::Text = _current_cwd_main();
-            let sid: text::Text = _current_sid_main();
-            let auto_ok: bool = _current_auto_main() || _origin_allowed_main(sid.view(), origin.view());
-            let _ = work.tx.send(_ToolReply {
-                ok: true,
-                is_image: false,
-                data: text::from_str(""),
-                policy_cwd: cwd,
-                policy_sid: sid,
-                policy_auto: auto_ok,
-            });
-            return;
-        }
-        _MainOp::RememberOrigin(sid, origin) => {
-            _remember_origin_main(sid.view(), origin.view());
-            let _ = work.tx.send(_reply_text(true, "ok"));
             return;
         }
         _MainOp::OpenUrl(target_url, new_tab) => {
@@ -261,26 +272,6 @@ fn _run_main_work(raw: *u8) {
             let _ = work.tx.send(_reply_text(true, res_json.view()));
             return;
         }
-        _MainOp::RequestOriginApproval(origin) => {
-            if browser_pane::is_taken_over() {
-                let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
-                return;
-            }
-            browser_pane::show_for_agent();
-            if !browser_pane::has_active_browser() {
-                let _ = work.tx.send(_reply_text(false, "no_browser"));
-                return;
-            }
-            match box::new::[channel::Channel[_ToolReply]](work.tx.clone()) {
-                option::Option::Some(b) => {
-                    browser_pane::request_origin_approval(origin.view(), _on_origin_decision, b.into_raw() as *u8);
-                }
-                option::Option::None => {
-                    let _ = work.tx.send(_reply_text(false, "out of memory"));
-                }
-            }
-            return;
-        }
         _MainOp::ResizeViewport(w, h) => {
             if browser_pane::is_taken_over() {
                 let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
@@ -295,7 +286,7 @@ fn _run_main_work(raw: *u8) {
             let _ = work.tx.send(_reply_text(true, "resized"));
             return;
         }
-        _MainOp::EvalJs(js) => {
+        _MainOp::EvalJs(js, session_cwd) => {
             if browser_pane::is_taken_over() {
                 let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
                 return;
@@ -305,6 +296,14 @@ fn _run_main_work(raw: *u8) {
             if wn.is_null() {
                 let _ = work.tx.send(_reply_text(false, "No active conversation browser tab is mounted."));
                 return;
+            }
+            let live_url: text::Text = web_driver::current_url(wn);
+            if !live_url.is_empty() && !live_url.equals("about:blank") {
+                let refusal: text::Text = check_url_policy(live_url.view(), session_cwd.view());
+                if !refusal.is_empty() {
+                    let _ = work.tx.send(_reply_text(false, refusal.view()));
+                    return;
+                }
             }
             match box::new::[channel::Channel[_ToolReply]](work.tx.clone()) {
                 option::Option::Some(b) => {
@@ -316,7 +315,7 @@ fn _run_main_work(raw: *u8) {
             }
             return;
         }
-        _MainOp::Screenshot => {
+        _MainOp::Screenshot(session_cwd) => {
             if browser_pane::is_taken_over() {
                 let _ = work.tx.send(_reply_text(false, "The user took over the Browser tab. Pause and wait for them to hand control back."));
                 return;
@@ -326,6 +325,14 @@ fn _run_main_work(raw: *u8) {
             if wn.is_null() {
                 let _ = work.tx.send(_reply_text(false, "No active conversation browser tab is mounted."));
                 return;
+            }
+            let live_url: text::Text = web_driver::current_url(wn);
+            if !live_url.is_empty() && !live_url.equals("about:blank") {
+                let refusal: text::Text = check_url_policy(live_url.view(), session_cwd.view());
+                if !refusal.is_empty() {
+                    let _ = work.tx.send(_reply_text(false, refusal.view()));
+                    return;
+                }
             }
             match box::new::[channel::Channel[_ToolReply]](work.tx.clone()) {
                 option::Option::Some(b) => {
@@ -384,53 +391,6 @@ fn _wait_for_load_settle() {
         time::sleep(150 as u64).wait();
         waited = waited +% (150 as i32);
     }
-}
-
-// ───────────────────────────── policy context hooks (main thread only) ─────────────────────────────
-
-static CWD_FN: fn() -> text::Text = #zero::[fn() -> text::Text]();
-static AUTO_FN: fn() -> bool = #zero::[fn() -> bool]();
-static SID_FN: fn() -> text::Text = #zero::[fn() -> text::Text]();
-static _ALLOWED_ORIGINS: string_set::StringSet = #zero::[string_set::StringSet]();
-static _ALLOWED_INIT: bool = false;
-
-fn set_policy_hooks(cwd_fn: fn() -> text::Text, auto_fn: fn() -> bool, sid_fn: fn() -> text::Text) {
-    CWD_FN = cwd_fn;
-    AUTO_FN = auto_fn;
-    SID_FN = sid_fn;
-}
-
-fn _current_sid_main() -> text::Text {
-    let f: fn() -> text::Text = SID_FN;
-    if f.is_null() { return text::from_str(""); }
-    return f();
-}
-
-fn _origin_allowed_main(sid: str, origin: str) -> bool {
-    if !_ALLOWED_INIT || origin == "" { return false; }
-    let key: text::Text = "${sid}|${origin}";
-    return _ALLOWED_ORIGINS.contains(key.view());
-}
-
-fn _remember_origin_main(sid: str, origin: str) {
-    if origin == "" { return; }
-    if !_ALLOWED_INIT {
-        _ALLOWED_ORIGINS = string_set::new();
-        _ALLOWED_INIT = true;
-    }
-    let _ = _ALLOWED_ORIGINS.insert("${sid}|${origin}");
-}
-
-fn _current_cwd_main() -> text::Text {
-    let f: fn() -> text::Text = CWD_FN;
-    if f.is_null() { return text::from_str(""); }
-    return f();
-}
-
-fn _current_auto_main() -> bool {
-    let f: fn() -> bool = AUTO_FN;
-    if f.is_null() { return false; }
-    return f();
 }
 
 // ───────────────────────────── MCP JSON-RPC dispatch ─────────────────────────────
@@ -628,39 +588,24 @@ fn _image_content_result(b64_png: str) -> json::Value {
     return json::Value::object(res);
 }
 
-fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
+fn _dispatch_tool_call(name: str, args: json::Value, session_cwd: str) -> json::Value {
     if name == "browser_open" {
         let raw_url: text::Text = args.field_str("url", "");
         let norm_url: text::Text = browser_pane::normalize_url(raw_url.view());
-        let origin: text::Text = extract_origin(norm_url.view());
-        let pol: _ToolReply = _call_main(_MainOp::ReadPolicy(origin.clone()));
-        let refusal: text::Text = check_url_policy(norm_url.view(), pol.policy_cwd.view(), pol.policy_auto);
+        let refusal: text::Text = check_url_policy(norm_url.view(), session_cwd);
         if !refusal.is_empty() {
-            // In Ask mode for an external http(s) origin, ask the user once per conversation.
-            if refusal.view().has_prefix("Origin blocked in Ask mode") && !origin.is_empty() {
-                let ask_rep: _ToolReply = _call_main_timeout(_MainOp::RequestOriginApproval(origin.clone()), 45000 as i32);
-                if ask_rep.ok {
-                    let _ = _call_main(_MainOp::RememberOrigin(pol.policy_sid.clone(), origin.clone()));
-                } else {
-                    if ask_rep.data.equals("no_browser") {
-                        return _text_content_result(refusal.view(), is_error: true);
-                    }
-                    return _text_content_result("User denied opening external origin: ${origin.view()}", is_error: true);
-                }
-            } else {
-                return _text_content_result(refusal.view(), is_error: true);
-            }
+            return _text_content_result(refusal.view(), is_error: true);
         }
         let open_new: bool = args.field_bool("new_tab", false);
         let r0: _ToolReply = _call_main(_MainOp::OpenUrl(norm_url.clone(), open_new));
         if !r0.ok { return _text_content_result(r0.data.view(), is_error: true); }
         _wait_for_load_settle();
-        let snap: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(SNAPSHOT_JS)));
+        let snap: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(SNAPSHOT_JS), text::from_str(session_cwd)));
         if !snap.ok { return _text_content_result("Opened ${norm_url.view()}, snapshot failed: ${snap.data.view()}", is_error: true); }
         return _text_content_result("Page content (untrusted data):\n${snap.data.view()}");
     }
     if name == "browser_snapshot" {
-        let snap: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(SNAPSHOT_JS)));
+        let snap: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(SNAPSHOT_JS), text::from_str(session_cwd)));
         if !snap.ok { return _text_content_result(snap.data.view(), is_error: true); }
         return _text_content_result("Page content (untrusted data):\n${snap.data.view()}");
     }
@@ -668,7 +613,7 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         let ref_id: text::Text = args.field_str("ref", "");
         if ref_id.is_empty() { return _text_content_result("Missing required argument: ref", is_error: true); }
         let js: text::Text = _click_js(ref_id.view());
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js, text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
         return _text_content_result("Page content (untrusted data):\n${rep.data.view()}");
     }
@@ -678,12 +623,12 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         let sub: bool = args.field_bool("submit", false);
         if ref_id.is_empty() { return _text_content_result("Missing required argument: ref", is_error: true); }
         let js: text::Text = _type_js(ref_id.view(), val.view(), sub);
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js, text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
         return _text_content_result("Page content (untrusted data):\n${rep.data.view()}");
     }
     if name == "browser_console" {
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(CONSOLE_DRAIN_JS)));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(CONSOLE_DRAIN_JS), text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
         return _text_content_result("Browser console output (untrusted data):\n${rep.data.view()}");
     }
@@ -691,12 +636,12 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         let code: text::Text = args.field_str("js", "");
         if code.is_empty() { return _text_content_result("Missing required argument: js", is_error: true); }
         let js: text::Text = _eval_wrap_js(code.view());
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js, text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
         return _text_content_result("Page eval result (untrusted data):\n${rep.data.view()}");
     }
     if name == "browser_screenshot" {
-        let rep: _ToolReply = _call_main(_MainOp::Screenshot);
+        let rep: _ToolReply = _call_main(_MainOp::Screenshot(text::from_str(session_cwd)));
         if !rep.ok || !rep.is_image { return _text_content_result(rep.data.view(), is_error: true); }
         return _image_content_result(rep.data.view());
     }
@@ -704,7 +649,7 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         let key_name: text::Text = args.field_str("key", "");
         if key_name.is_empty() { return _text_content_result("Missing required argument: key", is_error: true); }
         let js: text::Text = _press_js(key_name.view());
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(js, text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
         return _text_content_result("Page content (untrusted data):\n${rep.data.view()}");
     }
@@ -720,7 +665,7 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         let check_js: text::Text = _contains_text_js(needle.view());
         var elapsed: i64 = 0 as i64;
         while elapsed <= ms {
-            let rep: _ToolReply = _call_main(_MainOp::EvalJs(check_js.clone()));
+            let rep: _ToolReply = _call_main(_MainOp::EvalJs(check_js.clone(), text::from_str(session_cwd)));
             if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
             if rep.data.equals("1") {
                 return _text_content_result("Text appeared after ${elapsed} ms: ${needle.view()}");
@@ -731,7 +676,7 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         return _text_content_result("Timed out after ${ms} ms waiting for text: ${needle.view()}", is_error: true);
     }
     if name == "browser_network" {
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(NETWORK_DRAIN_JS)));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(NETWORK_DRAIN_JS), text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result(rep.data.view(), is_error: true); }
         return _text_content_result("Browser network log (untrusted data):\n${rep.data.view()}");
     }
@@ -743,7 +688,7 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         let r0: _ToolReply = _call_main(_MainOp::ResizeViewport(w as f64, h as f64));
         if !r0.ok { return _text_content_result(r0.data.view(), is_error: true); }
         time::sleep(120 as u64).wait();
-        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(VIEWPORT_SIZE_JS)));
+        let rep: _ToolReply = _call_main(_MainOp::EvalJs(text::from_str(VIEWPORT_SIZE_JS), text::from_str(session_cwd)));
         if !rep.ok { return _text_content_result("Resized viewport to ${w}x${h}"); }
         return _text_content_result("Viewport resized:\n${rep.data.view()}");
     }
@@ -755,9 +700,7 @@ fn _dispatch_tool_call(name: str, args: json::Value) -> json::Value {
         var norm_u: text::Text = text::from_str("");
         if act.equals("new") && !raw_u.is_empty() {
             norm_u = browser_pane::normalize_url(raw_u.view());
-            let orig: text::Text = extract_origin(norm_u.view());
-            let pol: _ToolReply = _call_main(_MainOp::ReadPolicy(orig.clone()));
-            let ref_msg: text::Text = check_url_policy(norm_u.view(), pol.policy_cwd.view(), pol.policy_auto);
+            let ref_msg: text::Text = check_url_policy(norm_u.view(), session_cwd);
             if !ref_msg.is_empty() { return _text_content_result(ref_msg.view(), is_error: true); }
         }
         let rep: _ToolReply = _call_main(_MainOp::TabsOp(act.clone(), idx, norm_u.clone()));
@@ -789,7 +732,7 @@ fn _err_envelope(take id_val: json::Value, code: i64, msg: str) -> text::Text {
 
 // Dispatch one JSON-RPC MCP message. Returns `None` for notifications (no `id`),
 // which the HTTP layer answers with 202 Accepted.
-fn handle_jsonrpc(raw: str) -> option::Option[text::Text] {
+fn handle_jsonrpc(raw: str, session_cwd: str = "") -> option::Option[text::Text] {
     guard let result::Result::Ok(msg) = json::Value::parse(source: raw) else {
         return option::Option[text::Text]::Some(
             _err_envelope(json::Value::null(), -32700 as i64, "Parse error"),
@@ -811,7 +754,7 @@ fn handle_jsonrpc(raw: str) -> option::Option[text::Text] {
         let _ = caps.append(json::Member::new("tools", json::Value::object(vec::new::[json::Member]())));
         var info: vec::Vec[json::Member] = vec::new::[json::Member]();
         let _ = info.append(json::Member::new("name", json::Value::text("desk420-browser")));
-        let _ = info.append(json::Member::new("version", json::Value::text("0.1.1")));
+        let _ = info.append(json::Member::new("version", json::Value::text("0.1.2")));
         var r: vec::Vec[json::Member] = vec::new::[json::Member]();
         let _ = r.append(json::Member::new("protocolVersion", json::Value::text(proto.view())));
         let _ = r.append(json::Member::new("capabilities", json::Value::object(caps)));
@@ -837,7 +780,7 @@ fn handle_jsonrpc(raw: str) -> option::Option[text::Text] {
             option::Option::Some(av) => av,
             option::Option::None => json::Value::object(vec::new::[json::Member]()),
         };
-        return option::Option[text::Text]::Some(_ok_envelope(id_val, _dispatch_tool_call(tname.view(), args)));
+        return option::Option[text::Text]::Some(_ok_envelope(id_val, _dispatch_tool_call(tname.view(), args, session_cwd)));
     }
     return option::Option[text::Text]::Some(
         _err_envelope(id_val, -32601 as i64, "Method not found"),
@@ -870,7 +813,25 @@ fn _write_http(ref stream: net::TcpStream, status_line: str, body: str) {
     let _ = stream.write_all(bytes);
 }
 
-fn _serve_conn(ref stream: net::TcpStream, expected_auth: str) {
+struct _SessionGrant {
+    auth_hdr: text::Text,
+    cwd: text::Text,
+}
+
+fn _match_grant(grants: vec::Vec[_SessionGrant], auth_val: str) -> option::Option[text::Text] {
+    var i: usize = 0 as usize;
+    while i < grants.count() {
+        if let option::Option::Some(gp) = grants.at_ptr(i) {
+            if _auth_equals(auth_val, (*gp).auth_hdr.view()) {
+                return option::Option[text::Text]::Some((*gp).cwd.clone());
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    return option::Option[text::Text]::None;
+}
+
+fn _serve_conn(ref stream: net::TcpStream, grants: vec::Vec[_SessionGrant]) {
     var chunk: [u8; 4096] = #zero::[[u8; 4096]]();
 
     var buf: vec::Vec[u8] = vec::new::[u8]();
@@ -933,10 +894,10 @@ fn _serve_conn(ref stream: net::TcpStream, expected_auth: str) {
         _write_http(stream, "400 Bad Request", "{\"error\":\"malformed request\"}");
         return;
     }
-    if !_auth_equals(auth_val.view(), expected_auth) {
+    guard let option::Option::Some(grant_cwd) = _match_grant(grants, auth_val.view()) else {
         _write_http(stream, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
         return;
-    }
+    };
     if method.equals("GET") {
         _write_http(stream, "405 Method Not Allowed", "");
         return;
@@ -958,7 +919,7 @@ fn _serve_conn(ref stream: net::TcpStream, expected_auth: str) {
             body_txt = text::from_str(bs);
         }
     }
-    match handle_jsonrpc(body_txt.view()) {
+    match handle_jsonrpc(body_txt.view(), session_cwd: grant_cwd.view()) {
         option::Option::Some(reply) => {
             _write_http(stream, "200 OK", reply.view());
         }
@@ -976,17 +937,35 @@ fn _auth_equals(a: str, b: str) -> bool {
 
 struct _ServerArgs {
     listener: net::TcpListener,
-    auth: text::Text,
+    grant_rx: channel::Channel[_SessionGrant],
+}
+
+fn _drain_grants(rx: channel::Channel[_SessionGrant], ref grants: vec::Vec[_SessionGrant]) {
+    loop {
+        match rx.try_receive() {
+            channel::TryReceiveResult::Value(g) => {
+                // Keep grant list bounded to prevent unbounded memory growth in
+                // very long-running sessions.
+                if grants.count() >= (256 as usize) {
+                    let _ = grants.remove(at: 0 as usize);
+                }
+                let _ = grants.append(g);
+            }
+            _ => { break; }
+        }
+    }
 }
 
 fn _server_main(take args: _ServerArgs) -> i32 {
     var srv: _ServerArgs = args;
+    var grants: vec::Vec[_SessionGrant] = vec::new::[_SessionGrant]();
     loop {
         if thread::cancelled() { break; }
         match srv.listener.accept() {
             result::Result::Ok(stream) => {
+                _drain_grants(srv.grant_rx, grants);
                 var st: net::TcpStream = stream;
-                _serve_conn(st, srv.auth.view());
+                _serve_conn(st, grants);
                 st.close();
             }
             result::Result::Err(_e) => {
@@ -1003,13 +982,13 @@ fn _server_main(take args: _ServerArgs) -> i32 {
 
 static _RUNNING: bool = false;
 static _PORT: u16 = 0u16;
-static _TOKEN: text::Text = #zero::[text::Text]();
+static _GRANT_TX_LIVE: bool = false;
+static _GRANT_TX: channel::Channel[_SessionGrant] = #zero::[channel::Channel[_SessionGrant]]();
 
 fn start() -> bool {
     if _RUNNING { return true; }
-    // Generate a 192-bit CSPRNG bearer token first; refuse to start if the
-    // platform RNG fails rather than falling back to a guessable token.
-    guard let option::Option::Some(tok) = crypto::random_hex(24 as usize) else {
+    // Verify platform CSPRNG works up front; refuse to start if it fails.
+    guard let option::Option::Some(probe_tok) = crypto::random_hex(24 as usize) else {
         return false;
     };
     let pid: i32 = process::current_id();
@@ -1031,10 +1010,18 @@ fn start() -> bool {
     }
     guard let option::Option::Some(listener) = bound else { return false; };
     _PORT = chosen;
-    _TOKEN = tok;
-    let auth_hdr: text::Text = "Bearer ${_TOKEN.view()}";
+
+    guard let option::Option::Some(grant_ch) = channel::new::[_SessionGrant]() else { return false; };
+    _GRANT_TX = grant_ch.clone();
+    _GRANT_TX_LIVE = true;
+
     if let option::Option::Some(info_path) = env::var("DESK420_BROWSER_MCP_INFO") {
         if !info_path.is_empty() {
+            let auth_hdr: text::Text = "Bearer ${probe_tok.view()}";
+            let _ = _GRANT_TX.send(_SessionGrant {
+                auth_hdr: auth_hdr.clone(),
+                cwd: text::from_str(""),
+            });
             var m: vec::Vec[json::Member] = vec::new::[json::Member]();
             let u: text::Text = "http://127.0.0.1:${_PORT}/mcp";
             let _ = m.append(json::Member::new("url", json::Value::text(u.view())));
@@ -1043,7 +1030,7 @@ fn start() -> bool {
         }
     }
     let _h: thread::JoinHandle[i32] = thread::spawn_with::[_ServerArgs, i32](
-        _ServerArgs { listener: listener, auth: auth_hdr },
+        _ServerArgs { listener: listener, grant_rx: grant_ch },
         _server_main,
     );
     _RUNNING = true;
@@ -1057,17 +1044,22 @@ fn mcp_url() -> text::Text {
     return "http://127.0.0.1:${_PORT}/mcp";
 }
 
-fn auth_header() -> text::Text {
-    if !_RUNNING { return text::from_str(""); }
-    return "Bearer ${_TOKEN.view()}";
-}
+// Build a session-scoped ACP `mcpServers` JSON entry for `desk420-browser`,
+// minting a fresh 192-bit CSPRNG bearer token bound specifically to `cwd`.
+fn acp_mcp_server_entry_for(cwd: str) -> option::Option[json::Value] {
+    if !_RUNNING || !_GRANT_TX_LIVE { return option::Option[json::Value]::None; }
+    guard let option::Option::Some(tok) = crypto::random_hex(24 as usize) else {
+        return option::Option[json::Value]::None;
+    };
+    let auth_hdr: text::Text = "Bearer ${tok.view()}";
+    let _ = _GRANT_TX.send(_SessionGrant {
+        auth_hdr: auth_hdr.clone(),
+        cwd: text::from_str(cwd),
+    });
 
-// Build the ACP `mcpServers` JSON array entry for `desk420-browser`.
-fn acp_mcp_server_entry() -> option::Option[json::Value] {
-    if !_RUNNING { return option::Option[json::Value]::None; }
     var hdr: vec::Vec[json::Member] = vec::new::[json::Member]();
     let _ = hdr.append(json::Member::new("name", json::Value::text("Authorization")));
-    let _ = hdr.append(json::Member::new("value", json::Value::text(auth_header().view())));
+    let _ = hdr.append(json::Member::new("value", json::Value::text(auth_hdr.view())));
     var hdrs: vec::Vec[json::Value] = vec::new::[json::Value]();
     let _ = hdrs.append(json::Value::object(hdr));
 
@@ -1082,22 +1074,64 @@ fn acp_mcp_server_entry() -> option::Option[json::Value] {
 // ───────────────────────────── tests ─────────────────────────────
 
 #[test]
-fn url_policy_allows_web_and_confines_file_urls() {
-    assert check_url_policy("http://localhost:3000", "/repo", false).is_empty();
-    assert check_url_policy("http://127.0.0.1:8080/app", "/repo", false).is_empty();
-    assert check_url_policy("http://[::1]:3000/app", "/repo", false).is_empty();
-    assert check_url_policy("https://finance.yahoo.com/quote/ANT/", "/repo", false).is_empty();
-    assert check_url_policy("https://example.com", "/repo", false).is_empty();
-    assert check_url_policy("https://example.com", "/repo", true).is_empty();
+fn url_policy_allows_web_and_confines_file_urls_canonically() {
+    // Web URLs are allowed inside the isolated browser.
+    assert check_url_policy("http://localhost:3000", "").is_empty();
+    assert check_url_policy("http://127.0.0.1:8080/app", "").is_empty();
+    assert check_url_policy("http://[::1]:3000/app", "").is_empty();
+    assert check_url_policy("https://finance.yahoo.com/quote/ANT/", "").is_empty();
     assert extract_origin("https://Example.COM:8443/path?a=1").equals("https://example.com:8443");
     assert extract_origin("http://127.0.0.1:3000/app#top").equals("http://127.0.0.1:3000");
-    assert extract_origin("http://[::1]:3000/app").equals("http://[::1]:3000");
-    assert check_url_policy("file:///repo/index.html", "/repo", false).is_empty();
-    assert !check_url_policy("file:///etc/passwd", "/repo", true).is_empty();
-    assert !check_url_policy("file:///repo/../etc/passwd", "/repo", true).is_empty();
-    assert !check_url_policy("javascript:alert(1)", "/repo", true).is_empty();
-    assert !check_url_policy("data:text/html,hi", "/repo", true).is_empty();
-    assert !check_url_policy("ftp://example.com/file", "/repo", true).is_empty();
+
+    // Dangerous / unsupported schemes are always refused.
+    assert !check_url_policy("javascript:alert(1)", "/tmp").is_empty();
+    assert !check_url_policy("data:text/html,hi", "/tmp").is_empty();
+    assert !check_url_policy("ftp://example.com/file", "/tmp").is_empty();
+
+    // Real filesystem confinement tests: sibling prefix & symlink escape.
+    let base: str = "/tmp/desk420-policy-repo";
+    let sibling: str = "/tmp/desk420-policy-repo-private";
+    let _ = fs::create_dir_all(base);
+    let _ = fs::create_dir_all(sibling);
+    let _ = fs::write_string("/tmp/desk420-policy-repo/index.html", "ok");
+    let _ = fs::write_string("/tmp/desk420-policy-repo-private/secrets.txt", "secret");
+    let _ = fs::remove_file("/tmp/desk420-policy-repo/escape.txt");
+    let _ = process::run(["/bin/ln", "-s", "/tmp/desk420-policy-repo-private/secrets.txt", "/tmp/desk420-policy-repo/escape.txt"]);
+
+    // Inside project -> allowed.
+    assert check_url_policy("file:///tmp/desk420-policy-repo/index.html", base).is_empty();
+    // Sibling directory sharing the prefix -> REFUSED!
+    assert !check_url_policy("file:///tmp/desk420-policy-repo-private/secrets.txt", base).is_empty();
+    // Symlink inside project pointing to sibling -> REFUSED!
+    assert !check_url_policy("file:///tmp/desk420-policy-repo/escape.txt", base).is_empty();
+    // Parent traversal & outside files -> REFUSED!
+    assert !check_url_policy("file:///etc/hosts", base).is_empty();
+    assert !check_url_policy("file:///tmp/desk420-policy-repo/../etc/hosts", base).is_empty();
+    // Missing file -> fail closed.
+    assert !check_url_policy("file:///tmp/desk420-policy-repo/does-not-exist.html", base).is_empty();
+    // Empty cwd -> REFUSED.
+    assert !check_url_policy("file:///tmp/desk420-policy-repo/index.html", "").is_empty();
+
+    // Per-session grant matching isolates credentials by session cwd.
+    var grants: vec::Vec[_SessionGrant] = vec::new::[_SessionGrant]();
+    let _ = grants.append(_SessionGrant { auth_hdr: text::from_str("Bearer tok-a"), cwd: text::from_str("/work/a") });
+    let _ = grants.append(_SessionGrant { auth_hdr: text::from_str("Bearer tok-b"), cwd: text::from_str("/work/b") });
+    match _match_grant(grants, "Bearer tok-a") {
+        option::Option::Some(c) => { assert c.equals("/work/a"); }
+        option::Option::None => { assert false; }
+    }
+    match _match_grant(grants, "Bearer tok-b") {
+        option::Option::Some(c) => { assert c.equals("/work/b"); }
+        option::Option::None => { assert false; }
+    }
+    match _match_grant(grants, "Bearer wrong") {
+        option::Option::Some(_c) => { assert false; }
+        option::Option::None => {}
+    }
+
+    let _ = fs::remove_file("/tmp/desk420-policy-repo/escape.txt");
+    let _ = fs::remove_file("/tmp/desk420-policy-repo/index.html");
+    let _ = fs::remove_file("/tmp/desk420-policy-repo-private/secrets.txt");
 }
 
 #[test]

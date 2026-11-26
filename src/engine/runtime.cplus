@@ -14,6 +14,7 @@ import "json/json" as json;
 import "notifications/notifications" as notifications;
 import "permissions/permissions" as permissions;
 import "stdlib/channel" as channel;
+import "stdlib/crypto" as crypto;
 import "stdlib/env" as env;
 import "stdlib/fs" as fs;
 import "stdlib/option" as option;
@@ -130,7 +131,7 @@ enum _EngineCmd {
     DeleteSessions(vec::Vec[DeleteTarget]), // batch delete
     SearchSessions(text::Text),             // query
     SetConfigOption(text::Text, text::Text), // config_id, value
-    SetApprovalMode(ApprovalMode),
+    SetApprovalMode(text::Text, ApprovalMode), // session_id (empty = default for next new chat), mode
     RespondPermission(text::Text, wire::JsonRpcId, text::Text, text::Text), // sid, rpc_id, tool_call_id, option_id
     RewindTo(i64, RewindMode),              // prompt_ordinal (-1 = last), mode
     RefreshGitStatus,
@@ -194,10 +195,71 @@ struct _WorkerArgs {
 
 // ───────────────────────────── main-thread state ─────────────────────────────
 
+struct _SessionMode {
+    session_id: text::Text,
+    mode: ApprovalMode,
+}
+
+fn _has_session_mode(modes: vec::Vec[_SessionMode], sid: str) -> bool {
+    var i: usize = 0 as usize;
+    while i < modes.count() {
+        if let option::Option::Some(mp) = modes.at_ptr(i) {
+            if (*mp).session_id.equals(sid) { return true; }
+        }
+        i = i +% (1 as usize);
+    }
+    return false;
+}
+
+fn _get_session_mode(modes: vec::Vec[_SessionMode], sid: str, fallback: ApprovalMode) -> ApprovalMode {
+    var i: usize = 0 as usize;
+    while i < modes.count() {
+        if let option::Option::Some(mp) = modes.at_ptr(i) {
+            if (*mp).session_id.equals(sid) { return (*mp).mode; }
+        }
+        i = i +% (1 as usize);
+    }
+    return fallback;
+}
+
+fn _set_session_mode(ref modes: vec::Vec[_SessionMode], sid: str, mode: ApprovalMode) {
+    if sid.is_empty() { return; }
+    var i: usize = 0 as usize;
+    while i < modes.count() {
+        if let option::Option::Some(mp) = modes.at_ptr(i) {
+            if (*mp).session_id.equals(sid) {
+                (*mp).mode = mode;
+                return;
+            }
+        }
+        i = i +% (1 as usize);
+    }
+    let _ = modes.append(_SessionMode {
+        session_id: text::from_str(sid),
+        mode: mode,
+    });
+}
+
+fn _remove_session_mode(ref modes: vec::Vec[_SessionMode], sid: str) {
+    var i: usize = 0 as usize;
+    while i < modes.count() {
+        var matched: bool = false;
+        if let option::Option::Some(mp) = modes.at_ptr(i) {
+            matched = (*mp).session_id.equals(sid);
+        }
+        if matched {
+            let _ = modes.remove(at: i);
+            return;
+        }
+        i = i +% (1 as usize);
+    }
+}
+
 struct _EngineState {
     started: bool,
     status: StatusKind,
-    approval_mode: ApprovalMode,
+    default_approval_mode: ApprovalMode,
+    session_modes: vec::Vec[_SessionMode],
     detail: text::Text,
     active_sid: text::Text,
     active_cwd: text::Text,
@@ -228,7 +290,8 @@ fn _ensure() {
         _STATE = _EngineState {
             started: false,
             status: StatusKind::Starting,
-            approval_mode: ApprovalMode::Ask,
+            default_approval_mode: ApprovalMode::Ask,
+            session_modes: vec::new::[_SessionMode](),
             detail: text::from_str("Starting Grok…"),
             active_sid: text::from_str(""),
             active_cwd: text::from_str(""),
@@ -323,9 +386,9 @@ fn _on_notification_tap(payload: str, _action: str, _ctx: *u8) {
     load_session(payload, cwd.view(), title: title.view());
 }
 
-fn _session_mcp_servers() -> vec::Vec[json::Value] {
+fn _session_mcp_servers(cwd: str) -> vec::Vec[json::Value] {
     var out: vec::Vec[json::Value] = vec::new::[json::Value]();
-    if let option::Option::Some(entry) = browser_mcp::acp_mcp_server_entry() {
+    if let option::Option::Some(entry) = browser_mcp::acp_mcp_server_entry_for(cwd) {
         let _ = out.append(entry);
     }
     return out;
@@ -344,8 +407,14 @@ fn _chats_root_dir() -> text::Text {
 
 fn _make_chat_cwd(chats_root: str, ref chat_seq: u64) -> text::Text {
     chat_seq = chat_seq +% (1 as u64);
-    let pid: i32 = process::current_id();
-    let id: text::Text = "chat-${pid}-${chat_seq}";
+    let id: text::Text = match crypto::random_hex(8 as usize) {
+        option::Option::Some(h) => "chat-${h.view()}",
+        option::Option::None => {
+            let pid: i32 = process::current_id();
+            let now_s: i64 = time::now();
+            "chat-${pid}-${now_s}-${chat_seq}"
+        }
+    };
     let dir: text::Text = path::join(base: chats_root, child: id.view());
     let _ = fs::create_dir_all(dir.view());
     return dir;
@@ -393,6 +462,10 @@ fn _drain_ui_on_main(_ctx: *u8) {
                         _STATE.active_sid = sid.clone();
                         _STATE.active_cwd = cwd.clone();
                         if !sid.is_empty() {
+                            if !_has_session_mode(_STATE.session_modes, sid.view()) {
+                                _set_session_mode(_STATE.session_modes, sid.view(), _STATE.default_approval_mode);
+                                _STATE.default_approval_mode = ApprovalMode::Ask;
+                            }
                             let _ = conversation::ensure_session(sid.view(), cwd: cwd.view());
                             conversation::mark_read(sid.view());
                             sessions::upsert_live_session(sid.view(), cwd: cwd.view());
@@ -487,6 +560,7 @@ fn _drain_ui_on_main(_ctx: *u8) {
                         sessions::set_search_hits(hits);
                     }
                     _UiUpdate::SessionDeleted(sid) => {
+                        _remove_session_mode(_STATE.session_modes, sid.view());
                         if _STATE.active_sid.equals(sid.view()) {
                             _STATE.active_sid = text::from_str("");
                             _STATE.active_cwd = text::from_str("");
@@ -774,79 +848,149 @@ fn _fetch_session_list(ref sups: vec::Vec[supervisor::Supervisor], ui_tx: channe
     }
 }
 
-// True when `word` appears as a standalone shell command token in `s`
-// (bounded on both sides by start/end, whitespace, or shell punctuation), so
-// "confirm" or "perform" never match "rm" while "rm", "rm -rf /", and "a && rm" do.
-fn _is_token_sep(b: u8) -> bool {
-    return b == (32 as u8) || b == (9 as u8) || b == (10 as u8) || b == (13 as u8)
-        || b == (59 as u8) || b == (124 as u8) || b == (38 as u8) || b == (40 as u8)
-        || b == (41 as u8) || b == (96 as u8) || b == (34 as u8) || b == (39 as u8)
-        || b == (47 as u8);
-}
-
-fn _has_cmd_token(s: str, token: str) -> bool {
+// Reject any shell metacharacter that could chain commands, redirect output,
+// expand variables, or invoke subshells.
+fn _has_shell_meta(s: str) -> bool {
     let n: usize = s.count();
-    let tn: usize = token.count();
-    if tn == (0 as usize) || n < tn { return false; }
-    var pos: usize = 0 as usize;
-    while pos +% tn <= n {
-        guard let option::Option::Some(rest) = s.slice(from: pos, to: n) else { break; };
-        guard let option::Option::Some(rel) = rest.find(token) else { break; };
-        let at: usize = pos +% rel;
-        let left_ok: bool = if at == (0 as usize) {
-            true
-        } else {
-            match s.byte_at(at -% (1 as usize)) {
-                option::Option::Some(b) => _is_token_sep(b),
-                option::Option::None => true,
+    var i: usize = 0 as usize;
+    while i < n {
+        if let option::Option::Some(b) = s.byte_at(i) {
+            if b == (0 as u8) || b == (10 as u8) || b == (13 as u8)
+                || b == (36 as u8) // $
+            || b == (38 as u8) // &
+            || b == (40 as u8) // (
+            || b == (41 as u8) // )
+            || b == (59 as u8) // ;
+            || b == (60 as u8) // <
+            || b == (62 as u8) // >
+            || b == (92 as u8) // \
+            || b == (96 as u8) // `
+            || b == (123 as u8) // {
+            || b == (124 as u8) // |
+            || b == (125 as u8) // }
+            {
+                return true;
             }
-        };
-        let end: usize = at +% tn;
-        let right_ok: bool = if end >= n {
-            true
-        } else {
-            match s.byte_at(end) {
-                option::Option::Some(b) => _is_token_sep(b),
-                option::Option::None => true,
-            }
-        };
-        if left_ok && right_ok { return true; }
-        pos = at +% (1 as usize);
+        }
+        i = i +% (1 as usize);
     }
     return false;
 }
 
-fn _looks_destructive(text_s: str) -> bool {
-    let low: text::Text = text::from_str(text_s).lowercased();
-    let s: str = low.view();
-    return _has_cmd_token(s, "rm")
-        || _has_cmd_token(s, "sudo")
-        || _has_cmd_token(s, "dd")
-        || _has_cmd_token(s, "mkfs")
-        || _has_cmd_token(s, "kill")
-        || _has_cmd_token(s, "killall")
-        || _has_cmd_token(s, "chmod")
-        || _has_cmd_token(s, "chown")
-        || s.contains("git push --force")
-        || s.contains("git push -f")
-        || s.contains("git reset --hard")
-        || s.contains("git clean -f");
+fn _split_ascii_tokens(s: str) -> vec::Vec[text::Text] {
+    var out: vec::Vec[text::Text] = vec::new::[text::Text]();
+    let n: usize = s.count();
+    var i: usize = 0 as usize;
+    while i < n {
+        while i < n {
+            let b: u8 = match s.byte_at(i) {
+                option::Option::Some(v) => v,
+                option::Option::None => 0 as u8,
+            };
+            if b != (32 as u8) && b != (9 as u8) { break; }
+            i = i +% (1 as usize);
+        }
+        if i >= n { break; }
+        let start: usize = i;
+        while i < n {
+            let b: u8 = match s.byte_at(i) {
+                option::Option::Some(v) => v,
+                option::Option::None => 0 as u8,
+            };
+            if b == (32 as u8) || b == (9 as u8) { break; }
+            i = i +% (1 as usize);
+        }
+        if let option::Option::Some(tok) = s.slice(from: start, to: i) {
+            let _ = out.append(text::from_str(tok));
+        }
+    }
+    return out;
+}
+
+fn _is_allowlisted_readonly_bin(bin: str) -> bool {
+    return bin == "ls" || bin == "pwd" || bin == "cat" || bin == "head"
+        || bin == "tail" || bin == "wc" || bin == "stat" || bin == "file"
+        || bin == "which" || bin == "uname" || bin == "whoami" || bin == "id"
+        || bin == "date" || bin == "echo" || bin == "grep" || bin == "egrep"
+        || bin == "fgrep" || bin == "tree" || bin == "du" || bin == "df"
+        || bin == "diff" || bin == "cmp" || bin == "nl" || bin == "dirname"
+        || bin == "basename" || bin == "realpath" || bin == "readlink"
+        || bin == "ps" || bin == "sw_vers" || bin == "arch" || bin == "shasum";
+}
+
+fn _is_allowlisted_git_subcmd(sub: str) -> bool {
+    return sub == "status" || sub == "diff" || sub == "log" || sub == "show"
+        || sub == "rev-parse" || sub == "ls-files" || sub == "blame"
+        || sub == "describe" || sub == "shortlog" || sub == "merge-base"
+        || sub == "cat-file" || sub == "ls-tree";
+}
+
+// Strict read-only command allowlist for Custom approval mode:
+// - Rejects any shell metacharacters (pipes, redirects, subshells, chaining).
+// - Allows only explicitly read-only commands and read-only git subcommands.
+// - Rejects flags that can write files or run external helpers (`--output`,
+//   `--pre`, `--ext-diff`, `--textconv`, `-c`).
+fn _is_safe_readonly_command(raw_cmd: str) -> bool {
+    let trimmed: str = raw_cmd.trim();
+    if trimmed.is_empty() || _has_shell_meta(trimmed) { return false; }
+    let toks: vec::Vec[text::Text] = _split_ascii_tokens(trimmed);
+    if toks.count() == (0 as usize) { return false; }
+    guard let option::Option::Some(p0) = toks.at_ptr(0 as usize) else { return false; };
+    let cmd0: str = (*p0).view();
+
+    if cmd0 == "rg" {
+        var i: usize = 1 as usize;
+        while i < toks.count() {
+            if let option::Option::Some(ap) = toks.at_ptr(i) {
+                let a: str = (*ap).view();
+                if a == "--pre" || a.has_prefix("--pre=") || a == "--pre-glob" || a.has_prefix("--pre-glob=") {
+                    return false;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return true;
+    }
+
+    if cmd0 == "git" {
+        if toks.count() < (2 as usize) { return false; }
+        guard let option::Option::Some(p1) = toks.at_ptr(1 as usize) else { return false; };
+        if !_is_allowlisted_git_subcmd((*p1).view()) { return false; }
+        var i: usize = 2 as usize;
+        while i < toks.count() {
+            if let option::Option::Some(ap) = toks.at_ptr(i) {
+                let a: str = (*ap).view();
+                if a == "-o" || a == "--output" || a.has_prefix("--output=")
+                    || a == "-c" || a.has_prefix("-c")
+                    || a == "--ext-diff" || a == "--textconv"
+                    || a == "--exec-path" || a.has_prefix("--exec-path=") {
+                    return false;
+                }
+            }
+            i = i +% (1 as usize);
+        }
+        return true;
+    }
+
+    return _is_allowlisted_readonly_bin(cmd0);
 }
 
 // Approval policy:
 // - Ask: never auto-approve.
-// - AutoApprove: auto-approve every request.
-// - Custom: auto-approve Read, Search, and Edit tools; for Execute, Other, or
-//   Unknown tools, prompt on destructive commands (checked with token
-//   boundaries across both command and title).
+// - AutoApprove: auto-approve every request in that conversation.
+// - Custom: strict read-only allowlist — auto-approve Read and Search tools,
+//   and Execute tools whose command is on the shell-metacharacter-free
+//   read-only allowlist. File edits and all other tools/commands prompt.
 fn _should_auto_approve(mode: ApprovalMode, pr: types::PermissionRequest) -> bool {
     if mode == ApprovalMode::AutoApprove { return true; }
     if mode != ApprovalMode::Custom { return false; }
     return match pr.kind {
         types::ToolKind::Read => true,
         types::ToolKind::Search => true,
-        types::ToolKind::Edit => true,
-        _ => !_looks_destructive(pr.command.view()) && !_looks_destructive(pr.title.view()),
+        types::ToolKind::Execute => _is_safe_readonly_command(pr.command.view()),
+        types::ToolKind::Edit => false,
+        types::ToolKind::Other => false,
+        types::ToolKind::Unknown(_) => false,
     };
 }
 
@@ -876,7 +1020,7 @@ fn _pick_allow_option(pr: types::PermissionRequest) -> text::Text {
 
 fn _drain_supervisor_events(ref sups: vec::Vec[supervisor::Supervisor],
 ui_tx: channel::Channel[_UiUpdate],
-mode: ApprovalMode,
+session_modes: vec::Vec[_SessionMode],
 defer_flush: bool = false) -> usize {
     guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else { return 0 as usize; };
     var disconnected: bool = false;
@@ -892,7 +1036,8 @@ defer_flush: bool = false) -> usize {
                         queued = queued +% (1 as usize);
                     }
                     client::ClientEvent::PermissionRequest(pr) => {
-                        if _should_auto_approve(mode, pr) {
+                        let req_mode: ApprovalMode = _get_session_mode(session_modes, pr.session_id.view(), ApprovalMode::Ask);
+                        if _should_auto_approve(req_mode, pr) {
                             let opt_id: text::Text = _pick_allow_option(pr);
                             let _ = (*sp).send_response(pr.rpc_id.clone(), types::result_permission_selected(opt_id.view()));
                         } else {
@@ -990,13 +1135,46 @@ fn _send_set_config_option(sp: *supervisor::Supervisor, sid: str, config_id: str
     }
 }
 
+fn _delete_session_rpc(
+    ref sups: vec::Vec[supervisor::Supervisor],
+    sid: str,
+    cwd: str,
+    ui_tx: channel::Channel[_UiUpdate],
+) -> bool {
+    guard let option::Option::Some(sp) = sups.at_ptr(0 as usize) else {
+        _post_ui(ui_tx, _UiUpdate::TurnError(text::from_str(sid), text::from_str("Could not delete conversation: Grok engine is not running")));
+        return false;
+    };
+    guard let option::Option::Some(pd) = (*sp).send_request("_x.ai/session/delete", types::params_session_delete(sid, cwd)) else {
+        _post_ui(ui_tx, _UiUpdate::TurnError(text::from_str(sid), text::from_str("Could not send delete request to Grok")));
+        return false;
+    };
+    var ok: bool = false;
+    match pd.wait_timeout(5000 as i64) {
+        client::WaitOutcome::Response(resp) => {
+            if let option::Option::Some(e) = resp.error {
+                _post_ui(ui_tx, _UiUpdate::TurnError(text::from_str(sid), "Could not delete conversation: ${e.message.view()}"));
+            } else {
+                ok = true;
+            }
+        }
+        client::WaitOutcome::TimedOut => {
+            _post_ui(ui_tx, _UiUpdate::TurnError(text::from_str(sid), text::from_str("Timed out deleting conversation")));
+        }
+        client::WaitOutcome::Disconnected => {
+            _post_ui(ui_tx, _UiUpdate::TurnError(text::from_str(sid), text::from_str("Grok agent disconnected while deleting conversation")));
+        }
+    }
+    return ok;
+}
+
 fn _execute_rewind(
     ref sups: vec::Vec[supervisor::Supervisor],
     sid: str,
     cwd: str,
     ordinal: i64,
     mode: RewindMode,
-    approval_mode: ApprovalMode,
+    session_modes: vec::Vec[_SessionMode],
     ui_tx: channel::Channel[_UiUpdate],
 ) {
     if sid == "" { return; }
@@ -1028,9 +1206,36 @@ fn _execute_rewind(
                         }
                         if mode != RewindMode::Files {
                             _post_ui(ui_tx, _UiUpdate::SessionResetForLoad(text::from_str(sid), text::from_str(cwd), text::from_str("")));
-                            if let option::Option::Some(pl) = (*sp).send_request("session/load", types::params_session_load_with_mcp(sid, cwd, _session_mcp_servers())) {
-                                let _ = pl.wait_timeout(5000 as i64);
-                                let _ = _drain_supervisor_events(sups, ui_tx, approval_mode);
+                            if let option::Option::Some(pl) = (*sp).send_request("session/load", types::params_session_load_with_mcp(sid, cwd, _session_mcp_servers(cwd))) {
+                                let load_out: client::WaitOutcome = pl.wait_timeout(15000 as i64);
+                                let _ = _drain_supervisor_events(sups, ui_tx, session_modes, defer_flush: true);
+                                match load_out {
+                                    client::WaitOutcome::Response(lresp) => {
+                                        var lerr: text::Text = text::from_str("");
+                                        if let option::Option::Some(e) = lresp.error {
+                                            lerr = e.message.clone();
+                                        }
+                                        if !lerr.is_empty() {
+                                            _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(text::from_str(sid), lerr));
+                                        } else {
+                                            if let option::Option::Some(lrv) = lresp.result {
+                                                if let option::Option::Some(co) = lrv.value(for_key: "configOptions") {
+                                                    _queue_ui(ui_tx, _UiUpdate::ConfigOptionsUpdated(text::from_str(sid), types::decode_config_options(co)));
+                                                }
+                                            }
+                                            _queue_ui(ui_tx, _UiUpdate::SessionLoadFinished(text::from_str(sid)));
+                                        }
+                                    }
+                                    client::WaitOutcome::Disconnected => {
+                                        _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(text::from_str(sid), text::from_str("Grok agent disconnected while reloading rewound conversation")));
+                                    }
+                                    client::WaitOutcome::TimedOut => {
+                                        _queue_ui(ui_tx, _UiUpdate::SessionLoadFailed(text::from_str(sid), text::from_str("Timed out reloading rewound conversation")));
+                                    }
+                                }
+                                _flush_ui();
+                            } else {
+                                _post_ui(ui_tx, _UiUpdate::SessionLoadFailed(text::from_str(sid), text::from_str("Could not send session/load to Grok")));
                             }
                         }
                         _fetch_git_status(sups, sid, ui_tx);
@@ -1057,7 +1262,8 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
     // its first prompt. Pairs of (config id, value).
     var pending_cfg_ids: vec::Vec[text::Text] = vec::new::[text::Text]();
     var pending_cfg_vals: vec::Vec[text::Text] = vec::new::[text::Text]();
-    var approval_mode: ApprovalMode = ApprovalMode::Ask;
+    var default_approval_mode: ApprovalMode = ApprovalMode::Ask;
+    var session_modes: vec::Vec[_SessionMode] = vec::new::[_SessionMode]();
     var last_billing_ts: i64 = time::now();
     var last_clock_ts: i64 = time::now();
     var prompts_since_billing: i32 = 0 as i32;
@@ -1079,7 +1285,9 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
             }
         }
 
+        var had_cmd: bool = false;
         if let option::Option::Some(cmd) = got_cmd {
+            had_cmd = true;
             match cmd {
                 _EngineCmd::Start => {
                     if sups.count() == (0 as usize) {
@@ -1189,15 +1397,15 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                     _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, text::from_str("Signed out")));
                 }
                 _EngineCmd::RewindTo(ordinal, rw_mode) => {
-                    _execute_rewind(sups, current_sid.view(), pending_cwd.view(), ordinal, rw_mode, approval_mode, ui_tx);
+                    _execute_rewind(sups, current_sid.view(), pending_cwd.view(), ordinal, rw_mode, session_modes, ui_tx);
                 }
                 _EngineCmd::SignIn => {
                     let _ = _ensure_supervisor(sups, chats_root.view(), ui_tx);
                     if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
                         _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Authenticating, text::from_str("Complete sign-in in your browser…")));
                         if let option::Option::Some(pa) = (*sp).send_request("authenticate", types::params_authenticate_grok()) {
-                            match pa.wait() {
-                                option::Option::Some(resp) => {
+                            match pa.wait_timeout(120000 as i64) {
+                                client::WaitOutcome::Response(resp) => {
                                     var auth_err: text::Text = text::from_str("");
                                     if let option::Option::Some(e) = resp.error {
                                         auth_err = e.message.clone();
@@ -1212,7 +1420,10 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                                         _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, auth_err));
                                     }
                                 }
-                                option::Option::None => {
+                                client::WaitOutcome::TimedOut => {
+                                    _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, text::from_str("Sign-in timed out — click Sign in to try again")));
+                                }
+                                client::WaitOutcome::Disconnected => {
                                     _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::NeedsAuth, text::from_str("Sign-in did not complete")));
                                 }
                             }
@@ -1247,7 +1458,7 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                     if !already_loading {
                         _post_ui(ui_tx, _UiUpdate::SessionResetForLoad(sid.clone(), cwd.clone(), title));
                         if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
-                            if let option::Option::Some(pl) = (*sp).send_request("session/load", types::params_session_load_with_mcp(sid.view(), cwd.view(), _session_mcp_servers())) {
+                            if let option::Option::Some(pl) = (*sp).send_request("session/load", types::params_session_load_with_mcp(sid.view(), cwd.view(), _session_mcp_servers(cwd.view()))) {
                                 let _ = in_flight_loads.append(_InFlightLoad {
                                     session_id: sid,
                                     pending: pl,
@@ -1262,8 +1473,12 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                         }
                     }
                 }
-                _EngineCmd::SetApprovalMode(m) => {
-                    approval_mode = m;
+                _EngineCmd::SetApprovalMode(target_sid, m) => {
+                    if target_sid.is_empty() {
+                        default_approval_mode = m;
+                    } else {
+                        _set_session_mode(session_modes, target_sid.view(), m);
+                    }
                 }
                 _EngineCmd::SetConfigOption(config_id, value) => {
                     if current_sid.is_empty() {
@@ -1305,15 +1520,15 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                     _fetch_session_list(sups, ui_tx);
                 }
                 _EngineCmd::DeleteSession(sid, cwd) => {
-                    if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
-                        if let option::Option::Some(pd) = (*sp).send_request("_x.ai/session/delete", types::params_session_delete(sid.view(), cwd.view())) {
-                            let _ = pd.wait_timeout(3000 as i64);
+                    if _delete_session_rpc(sups, sid.view(), cwd.view(), ui_tx) {
+                        _remove_session_mode(session_modes, sid.view());
+                        if current_sid.equals(sid.view()) {
+                            current_sid = text::from_str("");
                         }
+                        _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
+                    } else {
+                        _fetch_session_list(sups, ui_tx);
                     }
-                    if current_sid.equals(sid.view()) {
-                        current_sid = text::from_str("");
-                    }
-                    _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
                 }
                 _EngineCmd::DeleteSessions(items) => {
                     var di: usize = 0 as usize;
@@ -1321,15 +1536,13 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                         if let option::Option::Some(tp) = items.at_ptr(di) {
                             let sid: text::Text = (*tp).session_id.clone();
                             let cwd: text::Text = (*tp).cwd.clone();
-                            if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
-                                if let option::Option::Some(pd) = (*sp).send_request("_x.ai/session/delete", types::params_session_delete(sid.view(), cwd.view())) {
-                                    let _ = pd.wait_timeout(3000 as i64);
+                            if _delete_session_rpc(sups, sid.view(), cwd.view(), ui_tx) {
+                                _remove_session_mode(session_modes, sid.view());
+                                if current_sid.equals(sid.view()) {
+                                    current_sid = text::from_str("");
                                 }
+                                _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
                             }
-                            if current_sid.equals(sid.view()) {
-                                current_sid = text::from_str("");
-                            }
-                            _post_ui(ui_tx, _UiUpdate::SessionDeleted(sid));
                         }
                         di = di +% (1 as usize);
                     }
@@ -1370,9 +1583,9 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                             } else {
                                 pending_cwd.clone()
                             };
-                            if let option::Option::Some(pn) = (*sp).send_request("session/new", types::params_session_new_with_mcp(use_cwd.view(), _session_mcp_servers())) {
-                                match pn.wait() {
-                                    option::Option::Some(rn) => {
+                            if let option::Option::Some(pn) = (*sp).send_request("session/new", types::params_session_new_with_mcp(use_cwd.view(), _session_mcp_servers(use_cwd.view()))) {
+                                match pn.wait_timeout(15000 as i64) {
+                                    client::WaitOutcome::Response(rn) => {
                                         var auth_needed: bool = false;
                                         var err_msg: text::Text = text::from_str("");
                                         if let option::Option::Some(e) = rn.error {
@@ -1389,6 +1602,8 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                                             if let option::Option::Some(rv) = rn.result {
                                                 if let option::Option::Some(sn) = types::decode_session_new(rv) {
                                                     current_sid = sn.session_id.clone();
+                                                    _set_session_mode(session_modes, current_sid.view(), default_approval_mode);
+                                                    default_approval_mode = ApprovalMode::Ask;
                                                     _post_ui(ui_tx, _UiUpdate::ActiveSession(current_sid.clone(), use_cwd));
                                                     if let option::Option::Some(co) = rv.value(for_key: "configOptions") {
                                                         _post_ui(ui_tx, _UiUpdate::ConfigOptionsUpdated(current_sid.clone(), types::decode_config_options(co)));
@@ -1408,7 +1623,10 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                                             }
                                         }
                                     }
-                                    option::Option::None => {
+                                    client::WaitOutcome::TimedOut => {
+                                        _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Failed, text::from_str("Timed out creating conversation — try again")));
+                                    }
+                                    client::WaitOutcome::Disconnected => {
                                         _post_ui(ui_tx, _UiUpdate::StatusChanged(StatusKind::Failed, text::from_str("Agent disconnected")));
                                     }
                                 }
@@ -1450,7 +1668,7 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
         let is_loading: bool = in_flight_loads.count() > (0 as usize);
         var drained_n: usize = 0 as usize;
         if sups.count() > (0 as usize) {
-            drained_n = _drain_supervisor_events(sups, ui_tx, approval_mode, defer_flush: is_loading);
+            drained_n = _drain_supervisor_events(sups, ui_tx, session_modes, defer_flush: is_loading);
         }
 
         // 2b. Poll non-blocking session/load requests; flush UI sparingly (first paint + completion)
@@ -1489,7 +1707,7 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
                 option::Option::Some(outcome) => {
                     if let option::Option::Some(entry) = in_flight_loads.remove(at: li) {
                         if sups.count() > (0 as usize) {
-                            let _ = _drain_supervisor_events(sups, ui_tx, approval_mode, defer_flush: true);
+                            let _ = _drain_supervisor_events(sups, ui_tx, session_modes, defer_flush: true);
                         }
                         match outcome {
                             client::WaitOutcome::Response(resp) => {
@@ -1534,7 +1752,7 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
             match done_outcome {
                 option::Option::Some(out) => {
                     if sups.count() > (0 as usize) {
-                        let _ = _drain_supervisor_events(sups, ui_tx, approval_mode);
+                        let _ = _drain_supervisor_events(sups, ui_tx, session_modes);
                     }
                     if let option::Option::Some(entry) = in_flight.remove(at: pi) {
                         match out {
@@ -1600,7 +1818,13 @@ fn _worker_main(take args: _WorkerArgs) -> i32 {
             }
         }
 
-        time::sleep(10 as u64).wait();
+        let poll_ms: u64 = if !had_cmd && drained_n == (0 as usize)
+            && in_flight.count() == (0 as usize) && in_flight_loads.count() == (0 as usize) {
+            60 as u64
+        } else {
+            10 as u64
+        };
+        time::sleep(poll_ms).wait();
     }
 
     if let option::Option::Some(sp) = sups.at_ptr(0 as usize) {
@@ -1839,17 +2063,24 @@ fn set_config_option(config_id: str, value: str) {
 }
 fn set_approval_mode(mode: ApprovalMode) {
     _ensure();
-    _STATE.approval_mode = mode;
-    _send_cmd(_EngineCmd::SetApprovalMode(mode));
+    let sid: text::Text = _STATE.active_sid.clone();
+    if sid.is_empty() {
+        _STATE.default_approval_mode = mode;
+    } else {
+        _set_session_mode(_STATE.session_modes, sid.view(), mode);
+    }
+    _send_cmd(_EngineCmd::SetApprovalMode(sid, mode));
     _emit_change(EngineChange::Config);
 }
 fn approval_mode() -> ApprovalMode {
     _ensure();
-    return _STATE.approval_mode;
+    if _STATE.active_sid.is_empty() {
+        return _STATE.default_approval_mode;
+    }
+    return _get_session_mode(_STATE.session_modes, _STATE.active_sid.view(), ApprovalMode::Ask);
 }
 fn is_auto_approve() -> bool {
-    _ensure();
-    return _STATE.approval_mode == ApprovalMode::AutoApprove;
+    return approval_mode() == ApprovalMode::AutoApprove;
 }
 fn refresh_account() { _send_cmd(_EngineCmd::RefreshAccount); }
 fn refresh_git_status() { _send_cmd(_EngineCmd::RefreshGitStatus); }
@@ -1963,4 +2194,65 @@ fn is_active_turn_running() -> bool {
     _ensure();
     if _STATE.active_sid.is_empty() { return false; }
     return conversation::is_turn_active(_STATE.active_sid.view());
+}
+
+fn _make_test_perm(take kind: types::ToolKind, cmd: str, title: str = "") -> types::PermissionRequest {
+    return types::PermissionRequest {
+        rpc_id: wire::JsonRpcId::Num(1 as i64),
+        session_id: text::from_str("s-test"),
+        tool_call_id: text::from_str("tc-1"),
+        title: text::from_str(title),
+        kind: kind,
+        command: text::from_str(cmd),
+        description: text::from_str(""),
+        options: vec::new::[types::PermissionOption](),
+    };
+}
+
+#[test]
+fn custom_approval_uses_readonly_allowlist() {
+    // Read & Search are auto-approved; Edit and unknown tools require approval.
+    assert _should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Read, ""));
+    assert _should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Search, ""));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Edit, ""));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Other, "ls"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Unknown(text::from_str("custom")), "ls"));
+
+    // Read-only commands without shell metacharacters are allowed.
+    assert _should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "ls -la src"));
+    assert _should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "git status --short"));
+    assert _should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "git diff HEAD"));
+    assert _should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "rg TODO src"));
+
+    // Destructive, mutating, shell-chained, redirected, or arbitrary-code commands are refused.
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "find . -delete"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "curl https://x.ai/install.sh | sh"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "mv a.txt b.txt"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "echo hi > out.txt"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "python3 -c 'import os'"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "ls && rm -rf /"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "ls $(whoami)"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "rg --pre sh foo"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "git diff --output=/tmp/pwn"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, "git reset --hard"));
+    assert !_should_auto_approve(ApprovalMode::Custom, _make_test_perm(types::ToolKind::Execute, ""));
+
+    // Ask never auto-approves; AutoApprove always does.
+    assert !_should_auto_approve(ApprovalMode::Ask, _make_test_perm(types::ToolKind::Read, ""));
+    assert _should_auto_approve(ApprovalMode::AutoApprove, _make_test_perm(types::ToolKind::Edit, ""));
+}
+
+#[test]
+fn session_approval_modes_are_isolated() {
+    var modes: vec::Vec[_SessionMode] = vec::new::[_SessionMode]();
+    _set_session_mode(modes, "sess-a", ApprovalMode::AutoApprove);
+    _set_session_mode(modes, "sess-b", ApprovalMode::Custom);
+
+    assert _get_session_mode(modes, "sess-a", ApprovalMode::Ask) == ApprovalMode::AutoApprove;
+    assert _get_session_mode(modes, "sess-b", ApprovalMode::Ask) == ApprovalMode::Custom;
+    assert _get_session_mode(modes, "sess-c", ApprovalMode::Ask) == ApprovalMode::Ask;
+
+    _remove_session_mode(modes, "sess-a");
+    assert _get_session_mode(modes, "sess-a", ApprovalMode::Ask) == ApprovalMode::Ask;
+    assert _get_session_mode(modes, "sess-b", ApprovalMode::Ask) == ApprovalMode::Custom;
 }
