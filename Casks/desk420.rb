@@ -1,6 +1,6 @@
 cask "desk420" do
-  version "0.1.1"
-  sha256 "3afed9d8a918849d68f2dbbfc2942a1c627181eaab6a2bc93a84eb1aaa9b2365"
+  version "0.1.2"
+  sha256 "c2fad9eb5cd26070a43d8072559ba85099986bd382dae16dc992228cbb572852"
 
   url "https://github.com/netdur/desk420/releases/download/v#{version}/Desk420-#{version}-arm64.dmg"
   name "Desk420"
